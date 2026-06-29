@@ -1,0 +1,56 @@
+schema: spec-driven
+
+context: |
+  Project: ultratimonel — MCP Mission Server
+  Stack: Python 3.13.5, MCP Python SDK (not yet installed), SQLite3 (sqlite3 3.46.1 bundled)
+  Framework: None (vanilla Python MCP server)
+  Persistence: SQLite3 via standard library sqlite3 module
+  Transport: MCP stdio transport (default for MCP Python SDK)
+  Domain: Mission orchestration — create, query, update, track missions via MCP tools and resources
+  Protocol: Model Context Protocol (MCP) via mcp package
+
+strict_tdd: false
+
+rules:
+  proposal:
+    - Include rollback plan for risky schema changes
+    - Identify affected MCP tools/resources
+  specs:
+    - Use Given/When/Then format for tool scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Define MCP tool input/output schemas explicitly
+  design:
+    - Include module dependency diagrams
+    - Document MCP tool registration flow
+    - Document SQLite schema design decisions
+  tasks:
+    - Group tasks by phase (infrastructure, implementation, testing)
+    - Use hierarchical numbering (1.1, 1.2, etc.)
+    - Keep tasks small enough to complete in one session
+  apply:
+    - Follow existing Python conventions (PEP 8)
+    - Use type hints throughout
+    - Keep MCP protocol compliance as priority
+  verify:
+    - Compare implementation against every spec scenario
+    - Verify MCP handshake response matches spec
+    - Run full test suite before completion
+  archive:
+    - Warn before merging destructive deltas (schema migrations)
+
+testing:
+  strict_tdd: false
+  test_runner:
+    framework: null    # pytest not installed yet (greenfield)
+    command: null
+  layers:
+    unit: { available: false, tool: null }
+    integration: { available: false, tool: null }
+    e2e: { available: false, tool: null }
+  coverage:
+    available: false
+    command: null
+  quality:
+    linter: { available: false, command: null }
+    type_checker: { available: false, command: null }
+    formatter: { available: false, command: null }

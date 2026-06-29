@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ultratimonel"
+version = "1.0.0"
+description = "Pre-flight gate enforcement MCP server for Hermes Agent"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "erniomaldo"},
+]
+dependencies = [
+    "fastmcp",
+    "httpx",
+]
+keywords = ["mcp", "hermes", "gate", "preflight", "agent"]
+
+[project.urls]
+Homepage = "https://github.com/erniomaldo/ultratimonel"
+
+[tool.setuptools]
+packages = ["ultratimonel"]
