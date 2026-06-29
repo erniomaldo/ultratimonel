@@ -14,7 +14,7 @@ authors = [
 ]
 dependencies = [
     "fastmcp",
-    "httpx",
+    "httpx",  # solo para Deck gate (HTTP MCP remoto); agentmemory/checkpoint usan stdio
 ]
 keywords = ["mcp", "hermes", "gate", "preflight", "agent"]
 

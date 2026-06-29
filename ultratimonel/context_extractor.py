@@ -31,6 +31,7 @@ KNOWN_PROJECTS: dict[str, str] = {
     r"\bagentcheckpoint\b": "agentcheckpoint",
     r"\bpictomcp\b": "pictomcp",
     r"\bpuppetablechar\w*mcp\b|\bpuppetmcp\b": "puppetablecharmcp",
+    r"\bchatwoot\b": "chatwoot-mcp",
 }
 
 # Project → Nextcloud Collective ID mapping (for gate 1c)
@@ -46,6 +47,25 @@ PROJECT_COLLECTIVE_MAP: dict[str, int] = {
     "agentcheckpoint": 13,
     "pictomcp": 14,
     "puppetablecharmcp": 15,
+    "chatwoot-mcp": 16,
+}
+
+# Project → Nextcloud Deck board ID mapping (for gate 1e)
+# Replaces the old substring-search-over-all-boards approach.
+# Only boards with deletedAt === 0 are mapped here.
+PROJECT_DECK_MAP: dict[str, int] = {
+    "voy-rojo": 7,
+    "kgd-solar": 8,
+    "quickintegratia": 9,
+    "lectura-rapida": 10,
+    "quiero-codigo": 11,
+    "quickflorence": 13,
+    "agenda-sencilla": 14,
+    "agentcheckpoint": 15,
+    "pictomcp": 16,
+    "puppetablecharmcp": 17,
+    "chatwoot-mcp": 18,
+    "mi-mundo": 20,
 }
 
 # Priority-ordered regex: first match wins
