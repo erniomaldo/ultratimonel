@@ -320,7 +320,14 @@ class _MCPConnection:
             # Don't close on timeout — the connection may still be healthy
             return None, "timeout"
 
-        return _parse_response(call_resp)
+        try:
+            return _parse_response(call_resp)
+        except Exception as exc:
+            logger.warning(
+                "Parse error on %s/%s response: %s",
+                self.server_name, tool_name, exc,
+            )
+            return None, "unavailable"
 
     def close(self) -> None:
         """Graceful shutdown: send shutdown + exit, then wait."""

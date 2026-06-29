@@ -251,7 +251,7 @@ def _call_deck_impl(context: dict) -> GateResult:
         )
 
     if stacks is None:
-        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board {board_id} found but stacks unavailable: {stack_error}"
+        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board {board_id} (project '{project}') found but stacks unavailable: {stack_error}"
         return GateResult(
             name="1e",
             state=WARN,
@@ -315,7 +315,7 @@ def _call_deck_impl(context: dict) -> GateResult:
         return GateResult(
             name="1e",
             state=BLOCK,
-            message=f"Board {board_id} has {len(overdue_cards)} overdue card(s): {', '.join(overdue_cards[:3])}",
+            message=f"Board {board_id} (project '{project}') has {len(overdue_cards)} overdue card(s): {', '.join(overdue_cards[:3])}",
             result_data={"deck_cards": cards},
         )
 
@@ -323,14 +323,14 @@ def _call_deck_impl(context: dict) -> GateResult:
         return GateResult(
             name="1e",
             state=WARN,
-            message=f"Board {board_id} has no cards",
+            message=f"Board {board_id} (project '{project}') has no cards",
             result_data={"deck_cards": []},
         )
 
     return GateResult(
         name="1e",
         state=PASS,
-        message=f"{len(cards)} cards in board {board_id}",
+        message=f"{len(cards)} cards in board {board_id} (project '{project}')",
         result_data={"deck_cards": cards},
     )
 
