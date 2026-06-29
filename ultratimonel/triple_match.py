@@ -1,91 +1,24 @@
-"""
-triple_match.py — Coordinated 1a (AgentMemory) → 1b (Checkpoint) → 1e (Deck)
+"""triple_match.py — Coordinated 1a (AgentMemory) → 1b (Checkpoint) → 1e (Deck)
 sequential execution with error isolation.
 
-Each gate calls external MCP tools via HTTP JSON-RPC with 2s timeout.
-All calls wrapped in try/except → SKIP/WARN fallback.  Ultratimonel
-never crashes from an external tool failure.
+Each gate calls external MCP tools via **stdio** (same transport Hermes uses),
+NOT HTTP.  Previously used HTTP JSON-RPC on hardcoded ports that didn't exist,
+causing false-positive WARN states after gateway restarts.
 """
 
 import json
 import logging
+import os
 import time
 from typing import Any, Optional
 
-import httpx
-
 from .gate_engine import GateConfig, GateResult, PASS, SKIP, WARN, BLOCK
+from .mcp_client import call_mcp_tool, TOOL_NAMES
+from .context_extractor import PROJECT_COLLECTIVE_MAP
 
 logger = logging.getLogger(__name__)
 
-# ── MCP server endpoint configuration ───────────────────────────────────
-# Override via env vars: ULTRATIMONEL_MEMORY_URL, ULTRATIMONEL_CHECKPOINT_URL,
-# ULTRATIMONEL_DECK_URL
-
-import os
-
-MCP_ENDPOINTS: dict[str, str] = {
-    "memory": os.environ.get(
-        "ULTRATIMONEL_MEMORY_URL", "http://localhost:8085/json-rpc"
-    ),
-    "checkpoint": os.environ.get(
-        "ULTRATIMONEL_CHECKPOINT_URL", "http://localhost:8086/json-rpc"
-    ),
-    "deck": os.environ.get(
-        "ULTRATIMONEL_DECK_URL", "http://localhost:8087/json-rpc"
-    ),
-}
-
-HTTP_TIMEOUT = 2.0  # per-gate timeout
-
-
-# ── JSON-RPC client ─────────────────────────────────────────────────────
-
-
-def _json_rpc_call(
-    endpoint: str,
-    method: str,
-    params: Optional[dict] = None,
-    timeout: float = HTTP_TIMEOUT,
-) -> tuple[Optional[dict], Optional[str]]:
-    """Make a JSON-RPC 2.0 call to an MCP server.
-
-    Args:
-        endpoint: http(s)://host:port/path for JSON-RPC
-        method:   MCP tool method name
-        params:   dict of parameters
-        timeout:  seconds before raising
-
-    Returns:
-        Tuple of (parsed_result, error_type):
-          - (result, None) on success
-          - (None, "timeout") on timeout
-          - (None, "unavailable") on connection or protocol error
-    """
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params or {},
-        }
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(endpoint, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            if "error" in data:
-                logger.warning(
-                    "JSON-RPC error from %s/%s: %s",
-                    endpoint, method, data["error"],
-                )
-                return None, "unavailable"
-            return data.get("result"), None
-    except httpx.TimeoutException:
-        logger.warning("Timeout (%.1fs) calling %s/%s", timeout, endpoint, method)
-        return None, "timeout"
-    except Exception as exc:
-        logger.warning("Failed to call %s/%s: %s", endpoint, method, exc)
-        return None, "unavailable"
+HTTP_TIMEOUT = 8.0  # overall timeout per gate (stdio spawn + handshake + call)
 
 
 # ── Domain helpers ──────────────────────────────────────────────────────
@@ -94,16 +27,20 @@ def _json_rpc_call(
 def _call_agentmemory(context: dict) -> GateResult:
     """Gate 1a: recall AgentMemory via smart_search.
 
+    Uses MCP stdio transport to call the agentmemory MCP server directly,
+    matching how Hermes connects to it (npx -y @agentmemory/mcp).
+
     Query = sender + " " + topic, limit=10.
     """
     query = f"{context.get('sender', '')} {context.get('topic', '')}".strip()
     if not query:
         query = context.get("project", "general")
 
-    result, error = _json_rpc_call(
-        MCP_ENDPOINTS["memory"],
-        "mcp_agentmemory_memory_smart_search",
+    result, error = call_mcp_tool(
+        "agentmemory",
+        TOOL_NAMES["agentmemory"]["smart_search"],
         {"query": query, "limit": 10},
+        timeout=HTTP_TIMEOUT,
     )
 
     if result is None:
@@ -116,6 +53,11 @@ def _call_agentmemory(context: dict) -> GateResult:
         )
 
     snippets = result if isinstance(result, list) else result.get("results", [])
+    # The agentmemory MCP server may wrap results differently
+    if not snippets and isinstance(result, dict):
+        # Try common response shapes
+        snippets = result.get("data", result.get("memories", []))
+
     if not snippets:
         return GateResult(
             name="1a",
@@ -137,20 +79,21 @@ def _call_agentmemory(context: dict) -> GateResult:
 def _call_checkpoint(context: dict) -> GateResult:
     """Gate 1b: get checkpoint state for the project key.
 
+    Uses MCP stdio transport to call the checkpoint MCP server directly.
     Key = project name.  If missing, create default.
     """
     project = context.get("project", "general")
     key = project
 
-    result, error = _json_rpc_call(
-        MCP_ENDPOINTS["checkpoint"],
-        "mcp_checkpoint_get_state",
+    result, error = call_mcp_tool(
+        "checkpoint",
+        TOOL_NAMES["checkpoint"]["get_state"],
         {"key": key},
+        timeout=HTTP_TIMEOUT,
     )
 
     if result is None:
         if error == "timeout":
-            # Timeout → WARN, don't attempt fallback
             return GateResult(
                 name="1b",
                 state=WARN,
@@ -159,10 +102,11 @@ def _call_checkpoint(context: dict) -> GateResult:
             )
 
         # Unavailable — try to create default checkpoint
-        create_result, create_error = _json_rpc_call(
-            MCP_ENDPOINTS["checkpoint"],
-            "mcp_checkpoint_set_state",
+        create_result, create_error = call_mcp_tool(
+            "checkpoint",
+            TOOL_NAMES["checkpoint"]["set_state"],
             {"key": key, "value": json.dumps({"status": "new"})},
+            timeout=HTTP_TIMEOUT,
         )
         if create_result is None:
             return GateResult(
@@ -187,34 +131,138 @@ def _call_checkpoint(context: dict) -> GateResult:
     )
 
 
-def _call_deck(context: dict) -> GateResult:
-    """Gate 1e: scan Deck boards for project match, then get stacks/cards.
+# ── Steering documents to fetch from each collective ────────────────────
 
-    Filtering: case-insensitive substring match of board title against project.
+STEERING_DOC_TITLES = {
+    "visión", "vision",
+    "decisions",
+    "arquitectura", "architecture",
+    "roadmap",
+    "página de inicio",
+}
+
+
+def _call_collective(context: dict) -> GateResult:
+    """Gate 1c: fetch steering doc references from the project's collective.
+
+    Looks up the matched project in PROJECT_COLLECTIVE_MAP, fetches the
+    page list from the corresponding Nextcloud Collective, and returns
+    the IDs + titles of steering docs (Visión, Decisions, Arquitectura,
+    Roadmap, Home).
+
+    The agent can then fetch content on demand via
+    ``mcp_nextcloud_collectives_get_page``.
     """
-    project = context.get("project", "").lower()
+    project = context.get("project", "")
+    collective_id = PROJECT_COLLECTIVE_MAP.get(project)
+    if collective_id is None:
+        return GateResult(
+            name="1c",
+            state=SKIP,
+            message=f"No collective mapped for project '{project}'",
+            result_data={"steering_docs": []},
+        )
 
-    boards, error = _json_rpc_call(
-        MCP_ENDPOINTS["deck"],
-        "mcp_nextcloud_deck_get_boards",
+    pages, error = call_mcp_tool(
+        "nextcloud",
+        TOOL_NAMES["nextcloud"]["collectives_get_pages"],
+        {"collective_id": collective_id},
+        timeout=HTTP_TIMEOUT,
     )
 
-    if boards is None:
-        state = WARN if error == "timeout" else SKIP
-        msg = (
-            "Deck scan timeout"
-            if error == "timeout"
-            else "Deck scan unavailable (server not reachable)"
+    if pages is None:
+        return GateResult(
+            name="1c",
+            state=WARN,
+            message=f"Collective {collective_id} unavailable: {error}",
+            result_data={"steering_docs": []},
         )
+
+    page_list = pages if isinstance(pages, list) else pages.get("pages", [])
+
+    # Filter for steering docs by title (case-insensitive)
+    steering = []
+    for page in page_list:
+        title = page.get("title", "")
+        title_lower = title.lower().strip()
+        if title_lower in STEERING_DOC_TITLES:
+            steering.append({
+                "page_id": page["id"],
+                "title": page.get("title"),
+                "collective_id": collective_id,
+            })
+
+    return GateResult(
+        name="1c",
+        state=PASS if steering else WARN,
+        message=f"{len(steering)} steering doc(s) found in collective {collective_id}",
+        result_data={"steering_docs": steering},
+    )
+
+
+def _call_deck(context: dict) -> GateResult:
+    """Gate 1e: scan Deck boards for project match, then get stacks/cards.
+    """
+    try:
+        return _call_deck_impl(context)
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("_call_deck unhandled exception:\n%s", tb)
+        return GateResult(
+            name="1e", state=WARN,
+            message=f"Deck error: {exc}",
+            result_data={"deck_cards": []},
+        )
+
+
+def _call_deck_impl(context: dict) -> GateResult:
+    """Internal implementation of gate 1e."""
+    project = context.get("project", "").lower()
+
+    # 1. Get all boards via stdio MCP client
+    try:
+        boards, error = call_mcp_tool(
+            "nextcloud",
+            TOOL_NAMES["nextcloud"]["deck_get_boards"],
+            {},
+            timeout=HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.exception("_call_deck call_mcp_tool failed")
+        return GateResult(
+            name="1e", state=WARN,
+            message=f"Deck boards call failed: {exc}",
+            result_data={"deck_cards": []},
+        )
+
+    if boards is None:
+        msg = "Deck scan timeout" if error == "timeout" else f"Deck scan unavailable: {error}"
         return GateResult(
             name="1e",
-            state=state,
+            state=WARN,
             message=msg,
             result_data={"deck_cards": []},
         )
 
-    # boards may be a list or dict with 'boards' key
-    board_list = boards if isinstance(boards, list) else boards.get("boards", [])
+    # boards may be a list or a dict with a list key
+    if isinstance(boards, dict):
+        # Try common response keys
+        for key in ("boards", "result", "data", "items"):
+            if key in boards and isinstance(boards[key], list):
+                board_list = boards[key]
+                break
+        else:
+            board_list = []
+    elif isinstance(boards, list):
+        board_list = boards
+    else:
+        logger.warning("_call_deck unexpected boards type=%s: %s", type(boards), str(boards)[:200])
+        return GateResult(
+            name="1e", state=SKIP,
+            message="Unable to parse boards response",
+            result_data={"deck_cards": []},
+        )
 
     # Find matching board
     matched = None
@@ -232,15 +280,24 @@ def _call_deck(context: dict) -> GateResult:
             result_data={"deck_cards": []},
         )
 
-    # Get stacks for matched board
-    stacks, stack_error = _json_rpc_call(
-        MCP_ENDPOINTS["deck"],
-        "mcp_nextcloud_deck_get_stacks",
-        {"board_id": matched["id"], "include_cards": True},
-    )
+    # 2. Get stacks for matched board via stdio MCP client
+    try:
+        stacks, stack_error = call_mcp_tool(
+            "nextcloud",
+            TOOL_NAMES["nextcloud"]["deck_get_stacks"],
+            {"board_id": matched["id"], "include_cards": True},
+            timeout=HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.exception("_call_deck stacks call_mcp_tool failed")
+        return GateResult(
+            name="1e", state=WARN,
+            message=f"Deck stacks call failed: {exc}",
+            result_data={"deck_cards": []},
+        )
 
     if stacks is None:
-        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board '{matched.get('title')}' found but stacks unavailable"
+        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board '{matched.get('title')}' found but stacks unavailable: {stack_error}"
         return GateResult(
             name="1e",
             state=WARN,
@@ -248,24 +305,41 @@ def _call_deck(context: dict) -> GateResult:
             result_data={"deck_cards": []},
         )
 
+    # stacks may be a list or a dict with a list key
+    if isinstance(stacks, dict):
+        for key in ("stacks", "result", "data", "items"):
+            if key in stacks and isinstance(stacks[key], list):
+                stack_list = stacks[key]
+                break
+        else:
+            stack_list = []
+    elif isinstance(stacks, list):
+        stack_list = stacks
+    else:
+        logger.warning("_call_deck unexpected stacks type=%s", type(stacks))
+        return GateResult(
+            name="1e", state=WARN,
+            message="Unable to parse stacks response",
+            result_data={"deck_cards": []},
+        )
+
     # Extract cards from stacks
-    stack_list = stacks if isinstance(stacks, list) else stacks.get("stacks", [])
     cards = []
     for stack in stack_list:
         stack_name = stack.get("title", "")
-        for card in stack.get("cards", []):
+        for card in (stack.get("cards") or []):
             card_info = {
                 "id": card.get("id"),
                 "title": card.get("title"),
                 "stack": stack_name,
                 "description": card.get("description", ""),
                 "duedate": card.get("duedate"),
-                "labels": [l.get("title", "") for l in card.get("labels", [])],
+                "labels": [l.get("title", "") for l in (card.get("labels") or [])],
             }
             cards.append(card_info)
 
     # Sort by duedate (cards with duedate first)
-    cards.sort(key=lambda c: (c["duedate"] or "") if c["duedate"] else "9999-12-31")
+    cards.sort(key=lambda c: (c.get("duedate") or "") if c.get("duedate") else "9999-12-31")
 
     # Check for overdue cards (past duedate → BLOCK per Design.md §5)
     from datetime import date, datetime
@@ -276,13 +350,12 @@ def _call_deck(context: dict) -> GateResult:
         dd = c.get("duedate")
         if dd:
             try:
-                # Handle various date formats (ISO 8601 date or datetime)
                 dd_date = dd[:10] if len(dd) >= 10 else dd
                 due = datetime.strptime(dd_date, "%Y-%m-%d").date()
                 if due < today:
                     overdue_cards.append(c["title"])
             except (ValueError, IndexError):
-                pass  # unparseable duedate — ignore
+                pass
 
     if overdue_cards:
         return GateResult(
@@ -313,6 +386,7 @@ def _call_deck(context: dict) -> GateResult:
 GATE_EXECUTORS: dict[str, callable] = {
     "1a": _call_agentmemory,
     "1b": _call_checkpoint,
+    "1c": _call_collective,
     "1e": _call_deck,
 }
 
@@ -331,7 +405,7 @@ def run_triple_match(context: dict) -> list[GateResult]:
     """
     results: list[GateResult] = []
 
-    for gate_name in ("1a", "1b", "1e"):
+    for gate_name in ("1a", "1b", "1c", "1e"):
         start = time.monotonic()
         try:
             executor = GATE_EXECUTORS.get(gate_name)
@@ -378,6 +452,8 @@ def build_context_envelope(results: list[GateResult]) -> dict:
             envelope["memory_snippets"] = rd.get("memory_snippets", [])
         elif r.name == "1b":
             envelope["checkpoint_state"] = rd.get("checkpoint_state", {})
+        elif r.name == "1c":
+            envelope["steering_docs"] = rd.get("steering_docs", [])
         elif r.name == "1e":
             envelope["deck_cards"] = rd.get("deck_cards", [])
 

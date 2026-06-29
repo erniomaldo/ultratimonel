@@ -68,6 +68,12 @@ DEFAULT_GATES: list[GateConfig] = [
         timeout_s=2.0,
     ),
     GateConfig(
+        name="1c",
+        source="mcp_nextcloud_collectives_get_pages",
+        mandatory=False,
+        timeout_s=2.0,
+    ),
+    GateConfig(
         name="1e",
         source="mcp_nextcloud_deck_get_boards",
         mandatory=True,
@@ -116,7 +122,7 @@ def run_gate(
             result.message = "Gate not executed (no executor)"
     except Exception as exc:
         logger.warning("Gate %s failed: %s", config.name, exc)
-        result.state = SKIP
+        result.state = WARN if config.mandatory else SKIP
         result.message = f"Gate {config.name} unavailable: {exc}"
         result.result_data = None
 

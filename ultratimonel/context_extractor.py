@@ -19,6 +19,33 @@ KNOWN_PROJECTS: dict[str, str] = {
     r"\bmessagens\b": "messagens",
     r"\bhermes\b": "hermes",
     r"\bopenspec\b": "openspec",
+    # Collectives
+    r"\blecutra\s+r[áa]pida\b|\blecutra\b": "lectura-rapida",
+    r"\bvoy\s+rojo\b": "voy-rojo",
+    r"\bkgd\b|\bsolar\b": "kgd-solar",
+    r"\bquickintegratia\b|\bqia\b": "quickintegratia",
+    r"\bquiero\s+c[oó]digo\b": "quiero-codigo",
+    r"\bquickflorence\b": "quickflorence",
+    r"\bagenda\s+sencilla\b": "agenda-sencilla",
+    r"\bmi\s+mundo\b": "mi-mundo",
+    r"\bagentcheckpoint\b": "agentcheckpoint",
+    r"\bpictomcp\b": "pictomcp",
+    r"\bpuppetablechar\w*mcp\b|\bpuppetmcp\b": "puppetablecharmcp",
+}
+
+# Project → Nextcloud Collective ID mapping (for gate 1c)
+PROJECT_COLLECTIVE_MAP: dict[str, int] = {
+    "lectura-rapida": 1,
+    "voy-rojo": 6,
+    "kgd-solar": 7,
+    "quickintegratia": 8,
+    "quiero-codigo": 9,
+    "quickflorence": 10,
+    "agenda-sencilla": 11,
+    "mi-mundo": 12,
+    "agentcheckpoint": 13,
+    "pictomcp": 14,
+    "puppetablecharmcp": 15,
 }
 
 # Priority-ordered regex: first match wins
