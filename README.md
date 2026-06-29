@@ -119,4 +119,4 @@ failures. See the [SDD](openspec/) for detailed error scenarios.
 
 ## License
 
-MIT — © Nous Research
+MIT
