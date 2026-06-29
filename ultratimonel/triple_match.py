@@ -14,11 +14,11 @@ from typing import Any, Optional
 
 from .gate_engine import GateConfig, GateResult, PASS, SKIP, WARN, BLOCK
 from .mcp_client import call_mcp_tool, TOOL_NAMES
-from .context_extractor import PROJECT_COLLECTIVE_MAP
+from .context_extractor import PROJECT_COLLECTIVE_MAP, PROJECT_DECK_MAP
 
 logger = logging.getLogger(__name__)
 
-HTTP_TIMEOUT = 8.0  # overall timeout per gate (stdio spawn + handshake + call)
+HTTP_TIMEOUT = 40.0  # overall timeout per gate (stdio spawn + handshake + call)
 
 
 # ── Domain helpers ──────────────────────────────────────────────────────
@@ -217,75 +217,29 @@ def _call_deck(context: dict) -> GateResult:
 
 
 def _call_deck_impl(context: dict) -> GateResult:
-    """Internal implementation of gate 1e."""
+    """Gate 1e: look up board by PROJECT_DECK_MAP, then fetch stacks/cards.
+
+    Uses the explicit PROJECT_DECK_MAP instead of scanning all boards
+    and doing substring matching — faster and avoids false matches.
+    """
     project = context.get("project", "").lower()
 
-    # 1. Get all boards via stdio MCP client
-    try:
-        boards, error = call_mcp_tool(
-            "nextcloud",
-            TOOL_NAMES["nextcloud"]["deck_get_boards"],
-            {},
-            timeout=HTTP_TIMEOUT,
-        )
-    except Exception as exc:
-        logger.exception("_call_deck call_mcp_tool failed")
-        return GateResult(
-            name="1e", state=WARN,
-            message=f"Deck boards call failed: {exc}",
-            result_data={"deck_cards": []},
-        )
-
-    if boards is None:
-        msg = "Deck scan timeout" if error == "timeout" else f"Deck scan unavailable: {error}"
-        return GateResult(
-            name="1e",
-            state=WARN,
-            message=msg,
-            result_data={"deck_cards": []},
-        )
-
-    # boards may be a list or a dict with a list key
-    if isinstance(boards, dict):
-        # Try common response keys
-        for key in ("boards", "result", "data", "items"):
-            if key in boards and isinstance(boards[key], list):
-                board_list = boards[key]
-                break
-        else:
-            board_list = []
-    elif isinstance(boards, list):
-        board_list = boards
-    else:
-        logger.warning("_call_deck unexpected boards type=%s: %s", type(boards), str(boards)[:200])
-        return GateResult(
-            name="1e", state=SKIP,
-            message="Unable to parse boards response",
-            result_data={"deck_cards": []},
-        )
-
-    # Find matching board
-    matched = None
-    for b in board_list:
-        title = b.get("title", "").lower()
-        if project and project in title:
-            matched = b
-            break
-
-    if matched is None:
+    # 1. Look up board ID directly from the map
+    board_id = PROJECT_DECK_MAP.get(project)
+    if board_id is None:
         return GateResult(
             name="1e",
             state=SKIP,
-            message=f"No Deck board found for project '{context.get('project')}'",
+            message=f"No Deck board mapped for project '{context.get('project')}'",
             result_data={"deck_cards": []},
         )
 
-    # 2. Get stacks for matched board via stdio MCP client
+    # 2. Get stacks for the known board (includes cards)
     try:
         stacks, stack_error = call_mcp_tool(
             "nextcloud",
             TOOL_NAMES["nextcloud"]["deck_get_stacks"],
-            {"board_id": matched["id"], "include_cards": True},
+            {"board_id": board_id, "include_cards": True},
             timeout=HTTP_TIMEOUT,
         )
     except Exception as exc:
@@ -297,7 +251,7 @@ def _call_deck_impl(context: dict) -> GateResult:
         )
 
     if stacks is None:
-        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board '{matched.get('title')}' found but stacks unavailable: {stack_error}"
+        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board {board_id} (project '{project}') found but stacks unavailable: {stack_error}"
         return GateResult(
             name="1e",
             state=WARN,
@@ -361,7 +315,7 @@ def _call_deck_impl(context: dict) -> GateResult:
         return GateResult(
             name="1e",
             state=BLOCK,
-            message=f"Board '{matched.get('title')}' has {len(overdue_cards)} overdue card(s): {', '.join(overdue_cards[:3])}",
+            message=f"Board {board_id} (project '{project}') has {len(overdue_cards)} overdue card(s): {', '.join(overdue_cards[:3])}",
             result_data={"deck_cards": cards},
         )
 
@@ -369,14 +323,14 @@ def _call_deck_impl(context: dict) -> GateResult:
         return GateResult(
             name="1e",
             state=WARN,
-            message=f"Board '{matched.get('title')}' has no cards",
+            message=f"Board {board_id} (project '{project}') has no cards",
             result_data={"deck_cards": []},
         )
 
     return GateResult(
         name="1e",
         state=PASS,
-        message=f"{len(cards)} cards in '{matched.get('title')}'",
+        message=f"{len(cards)} cards in board {board_id} (project '{project}')",
         result_data={"deck_cards": cards},
     )
 
