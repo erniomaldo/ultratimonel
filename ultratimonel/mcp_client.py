@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -38,19 +39,19 @@ MCP_SERVER_CONFIGS: dict[str, dict] = {
         "command": (
             os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_COMMAND",
-                "/home/ernesto-personal/Proyectos/ultratimonel/.venv/bin/python3",
+                shutil.which("python3") or sys.executable,
             )
         ),
         "args": [
             os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_ARGS",
-                "/home/ernesto-personal/Proyectos/http-to-stdio/http_to_stdio_mcp.py",
+                "",
             )
         ],
         "env": {
             "UPSTREAM_MCP_URL": os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_URL",
-                "https://mcpnextcloud.agendasencilla.com/mcp",
+                "http://localhost:2993/mcp",
             ),
             "UPSTREAM_MCP_HEADERS": os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_HEADERS",
@@ -65,15 +66,20 @@ def _get_checkpoint_config() -> dict:
     """Return checkpoint server config, reading env override if set."""
     command = os.environ.get(
         "ULTRATIMONEL_CHECKPOINT_COMMAND",
-        "/home/ernesto-personal/.hermes/mcp-servers/checkpoint-server/.venv/bin/python3",
+        "agentcheckpoint",
     )
     args_env = os.environ.get(
         "ULTRATIMONEL_CHECKPOINT_ARGS",
-        "/home/ernesto-personal/.hermes/mcp-servers/checkpoint-server/main.py",
+        "",
     )
+    # Filter out empty args so agentcheckpoint runs without spurious ""
+    args_list: list[str] = []
+    raw = args_env.strip()
+    if raw:
+        args_list = raw.split(",") if "," in raw else [raw]
     return {
         "command": command,
-        "args": args_env.split(",") if "," in args_env else [args_env],
+        "args": args_list,
     }
 
 
@@ -202,7 +208,7 @@ class _MCPConnection:
     def _connect(self, config: dict) -> None:
         """Spawn subprocess and perform initialize handshake."""
         command = config["command"]
-        args = config.get("args", [])
+        args = [a for a in config.get("args", []) if a]  # filter out empty strings
         proc_env = self._build_env(config)
 
         logger.info(

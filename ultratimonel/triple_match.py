@@ -18,7 +18,7 @@ from .context_extractor import PROJECT_COLLECTIVE_MAP, PROJECT_DECK_MAP
 
 logger = logging.getLogger(__name__)
 
-HTTP_TIMEOUT = 40.0  # overall timeout per gate (stdio spawn + handshake + call)
+HTTP_TIMEOUT = 120.0  # overall timeout per gate (stdio spawn + handshake + call)
 
 
 # ── Domain helpers ──────────────────────────────────────────────────────

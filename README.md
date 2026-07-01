@@ -70,6 +70,13 @@ ultratimonel/
 │   ├── gate_engine.py      # State machine (PASS/SKIP/WARN/BLOCK)
 │   ├── triple_match.py     # 1a→1b→1e orchestration
 │   └── bridge.py           # mcp-capabilities bridge stub
+├── docs/
+│   ├── 01-plan-general.md
+│   ├── 02-triple-match.md
+│   ├── 03-mcp-capabilities.md
+│   ├── 04-soul-enforcement.md
+│   ├── 05-preflight-flow.md
+│   └── 06-initialization-guide.md  # Auto-discovery & population
 ├── scripts/
 │   └── deploy_soul.sh      # SOUL.md rule injection
 └── tests/
@@ -103,6 +110,21 @@ into `~/.hermes/SOUL.md`. The script:
 2. Checks for the `## Protocolo Pre-flight (OBLIGATORIO)` section
 3. Updates in-place or appends as needed
 4. Supports `--force`, `--dry-run` flags
+
+## Initialization (Auto-Discovery)
+
+After installing ultratimonel, run the initialization guide to auto-discover
+the user's projects, create Deck boards, populate checkpoints and AgentMemory,
+and verify every gate passes:
+
+```bash
+# Hand this to a fresh Hermes Agent (or follow manually):
+cat docs/06-initialization-guide.md
+```
+
+See [`docs/06-initialization-guide.md`](docs/06-initialization-guide.md) for
+the full step-by-step auto-discovery protocol. It is **agnostic** — works with
+any Nextcloud Deck ecosystem without modification.
 
 ## Error Handling
 

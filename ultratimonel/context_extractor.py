@@ -66,6 +66,7 @@ PROJECT_DECK_MAP: dict[str, int] = {
     "puppetablecharmcp": 17,
     "chatwoot-mcp": 18,
     "mi-mundo": 20,
+    "ultratimonel": 21,
 }
 
 # Priority-ordered regex: first match wins
