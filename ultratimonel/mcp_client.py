@@ -42,12 +42,11 @@ MCP_SERVER_CONFIGS: dict[str, dict] = {
                 sys.executable or shutil.which("python3"),
             )
         ),
-        "args": [
-            os.environ.get(
-                "ULTRATIMONEL_NEXTCLOUD_ARGS",
-                "",
-            )
-        ],
+        "args": (
+            (a := os.environ.get("ULTRATIMONEL_NEXTCLOUD_ARGS", "").strip())
+            and [a]
+            or []
+        ),
         "env": {
             "UPSTREAM_MCP_URL": os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_URL",
@@ -55,7 +54,7 @@ MCP_SERVER_CONFIGS: dict[str, dict] = {
             ),
             "UPSTREAM_MCP_HEADERS": os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_HEADERS",
-                '{"Authorization": "Bearer oieojknfaoibnfasoinfasoinasdopinasdoiasnd"}',
+                "",
             ),
         },
     },
