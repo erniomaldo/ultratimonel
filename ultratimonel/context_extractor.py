@@ -91,7 +91,7 @@ PROJECT_COLLECTIVE_MAP: dict[str, int] = {
     "puppetablecharmcp": 15,
     "chatwoot-mcp": 16,
 }
-PROJECT_COLLECTIVE_MAP.update(_USER_MAPS.get("collectives", {}))
+PROJECT_COLLECTIVE_MAP.update(_USER_MAPS.get("collectives") or {})
 
 # ── Deck Boards ─────────────────────────────────────────────────────────
 
@@ -112,7 +112,7 @@ PROJECT_DECK_MAP: dict[str, int] = {
     # NOTE: "ultratimonel": 21 was removed from inline defaults in
     #       PR #3 feedback — it belongs in project_maps.json.
 }
-PROJECT_DECK_MAP.update(_USER_MAPS.get("decks", {}))
+PROJECT_DECK_MAP.update(_USER_MAPS.get("decks") or {})
 
 # Remove any keys with falsy (non-positive) values  # guard against bad data
 PROJECT_COLLECTIVE_MAP = {k: v for k, v in PROJECT_COLLECTIVE_MAP.items() if v}
