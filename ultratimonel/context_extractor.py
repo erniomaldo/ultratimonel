@@ -7,12 +7,15 @@ Extraction rules per SDD design §6:
   - project:  matched via known-project regex dict; falls back to topic
 """
 
+import json
 import logging
+import os
 import re
 
 logger = logging.getLogger(__name__)
 
 # Known project patterns (case-insensitive)
+# These are generic regex patterns — NOT machine-specific data.
 KNOWN_PROJECTS: dict[str, str] = {
     r"\bultratimonel\b": "ultratimonel",
     r"\bnocturno\b": "nocturno",
@@ -24,7 +27,7 @@ KNOWN_PROJECTS: dict[str, str] = {
     r"\bvoy\s+rojo\b": "voy-rojo",
     r"\bkgd\b|\bsolar\b": "kgd-solar",
     r"\bquickintegratia\b|\bqia\b": "quickintegratia",
-    r"\bquiero\s+c[oó]digo\b": "quiero-codigo",
+    r"\bquiero\s+c[óo]digo\b": "quiero-codigo",
     r"\bquickflorence\b": "quickflorence",
     r"\bagenda\s+sencilla\b": "agenda-sencilla",
     r"\bmi\s+mundo\b": "mi-mundo",
@@ -34,7 +37,46 @@ KNOWN_PROJECTS: dict[str, str] = {
     r"\bchatwoot\b": "chatwoot-mcp",
 }
 
-# Project → Nextcloud Collective ID mapping (for gate 1c)
+# ── Project Map Loading ────────────────────────────────────────────────
+# PROJECT_DECK_MAP and PROJECT_COLLECTIVE_MAP contain Nextcloud IDs that
+# are specific to the user's instance.  They live in a gitignored JSON
+# file (project_maps.json at the repo root) so the repo stays portable.
+#
+# Inline defaults are provided for backward compatibility — existing
+# installs continue to work.  New projects should be added ONLY to the
+# JSON file, never to the inline dicts.
+
+_PROJECT_MAPS_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "project_maps.json"
+)
+
+
+def _load_project_maps() -> dict:
+    """Load user-specific project maps from gitignored JSON file.
+
+    Returns dict with keys "collectives" and "decks", each being a
+    ``{slug: id}`` dict.  Returns empty dicts if the file doesn't exist.
+    """
+    maps: dict = {"collectives": {}, "decks": {}}
+    if not os.path.exists(_PROJECT_MAPS_PATH):
+        return maps
+    try:
+        with open(_PROJECT_MAPS_PATH) as f:
+            user_maps = json.load(f)
+        if isinstance(user_maps, dict):
+            maps.update(user_maps)
+        else:
+            logger.warning("project_maps.json: expected dict, got %s", type(user_maps))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to load project_maps.json: %s", exc)
+    return maps
+
+
+_USER_MAPS = _load_project_maps()
+
+# ── Collectives ─────────────────────────────────────────────────────────
+
+# Inline defaults for existing installs.  Overridden by project_maps.json.
 PROJECT_COLLECTIVE_MAP: dict[str, int] = {
     "lectura-rapida": 1,
     "voy-rojo": 6,
@@ -49,10 +91,11 @@ PROJECT_COLLECTIVE_MAP: dict[str, int] = {
     "puppetablecharmcp": 15,
     "chatwoot-mcp": 16,
 }
+PROJECT_COLLECTIVE_MAP.update(_USER_MAPS.get("collectives") or {})
 
-# Project → Nextcloud Deck board ID mapping (for gate 1e)
-# Replaces the old substring-search-over-all-boards approach.
-# Only boards with deletedAt === 0 are mapped here.
+# ── Deck Boards ─────────────────────────────────────────────────────────
+
+# Inline defaults for existing installs.  Overridden by project_maps.json.
 PROJECT_DECK_MAP: dict[str, int] = {
     "voy-rojo": 7,
     "kgd-solar": 8,
@@ -66,7 +109,14 @@ PROJECT_DECK_MAP: dict[str, int] = {
     "puppetablecharmcp": 17,
     "chatwoot-mcp": 18,
     "mi-mundo": 20,
+    # NOTE: "ultratimonel": 21 was removed from inline defaults in
+    #       PR #3 feedback — it belongs in project_maps.json.
 }
+PROJECT_DECK_MAP.update(_USER_MAPS.get("decks") or {})
+
+# Remove any keys with falsy (non-positive) values  # guard against bad data
+PROJECT_COLLECTIVE_MAP = {k: v for k, v in PROJECT_COLLECTIVE_MAP.items() if v}
+PROJECT_DECK_MAP = {k: v for k, v in PROJECT_DECK_MAP.items() if v}
 
 # Priority-ordered regex: first match wins
 _PROJECT_PATTERNS = [

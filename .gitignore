@@ -15,3 +15,6 @@ build/
 .ruff_cache/
 __pycache__/
 *.egg
+
+# Machine-specific project maps (see project_maps.json.template)
+project_maps.json

@@ -30,14 +30,16 @@ class TestTripleMatch:
             "session_id": "sess-001",
         }
         results = run_triple_match(context)
-        assert len(results) == 3
+        assert len(results) == 4
         assert results[0].name == "1a"
         assert results[1].name == "1b"
-        assert results[2].name == "1e"
+        assert results[2].name == "1c"
+        assert results[3].name == "1e"
 
     def test_gate_executors_registered(self):
         assert "1a" in GATE_EXECUTORS
         assert "1b" in GATE_EXECUTORS
+        assert "1c" in GATE_EXECUTORS
         assert "1e" in GATE_EXECUTORS
 
     def test_one_failure_does_not_block_others(self):
@@ -50,10 +52,10 @@ class TestTripleMatch:
         }
         results = run_triple_match(context)
         # All gates should execute (even if some fail externally, they get SKIP)
-        assert len(results) == 3
+        assert len(results) == 4
         # Each result must have a name
         for r in results:
-            assert r.name in ("1a", "1b", "1e")
+            assert r.name in ("1a", "1b", "1c", "1e")
 
     def test_all_results_have_duration(self):
         context = {
@@ -75,22 +77,24 @@ class TestTripleMatch:
             "session_id": "sess-empty",
         }
         results = run_triple_match(context)
-        assert len(results) == 3
+        assert len(results) == 4
 
 
 class TestContextEnvelope:
     def test_envelope_has_all_keys(self):
-        """Even with empty results, envelope should have all three sections."""
+        """Even with empty results, envelope should have all four sections."""
         from ultratimonel.gate_engine import GateResult
 
         results = [
             GateResult(name="1a", state=PASS, result_data={"memory_snippets": []}),
             GateResult(name="1b", state=PASS, result_data={"checkpoint_state": {"status": "new"}}),
+            GateResult(name="1c", state=SKIP, result_data={"steering_docs": []}),
             GateResult(name="1e", state=SKIP, result_data={"deck_cards": []}),
         ]
         envelope = build_context_envelope(results)
         assert "memory_snippets" in envelope
         assert "checkpoint_state" in envelope
+        assert "steering_docs" in envelope
         assert "deck_cards" in envelope
 
     def test_envelope_includes_data(self):
@@ -114,6 +118,11 @@ class TestContextEnvelope:
                 },
             ),
             GateResult(
+                name="1c",
+                state=SKIP,
+                result_data={"steering_docs": []},
+            ),
+            GateResult(
                 name="1e",
                 state=PASS,
                 result_data={
@@ -125,6 +134,7 @@ class TestContextEnvelope:
         assert len(envelope["memory_snippets"]) == 1
         assert envelope["memory_snippets"][0]["content"] == "hello"
         assert envelope["checkpoint_state"]["key"] == "proj"
+        assert envelope["steering_docs"] == []
         assert len(envelope["deck_cards"]) == 1
 
     def test_envelope_with_no_result_data(self):
@@ -133,11 +143,13 @@ class TestContextEnvelope:
         results = [
             GateResult(name="1a", state=SKIP, result_data=None),
             GateResult(name="1b", state=SKIP, result_data=None),
+            GateResult(name="1c", state=SKIP, result_data=None),
             GateResult(name="1e", state=SKIP, result_data=None),
         ]
         envelope = build_context_envelope(results)
         assert envelope["memory_snippets"] == []
         assert envelope["checkpoint_state"] == {}
+        assert envelope["steering_docs"] == []
         assert envelope["deck_cards"] == []
 
 
