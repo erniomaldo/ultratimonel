@@ -49,28 +49,49 @@ Give this prompt to a **fresh Hermes Agent** that just had ultratimonel installe
 > Record each stack's `id`, `title`, and every card's `title`, `description`,
 > `archived`, `duedate`, and `labels`.
 >
-> ### Step 2 — Sync maps with code
->
-> Open `ultratimonel/context_extractor.py` and read the three maps:
->
-> | Map | Purpose | Example entry |
-> |-----|---------|---------------|
-> | `KNOWN_PROJECTS` | Regex to detect project in user messages | `r"\\bvoy\\s+rojo\\b": "voy-rojo"` |
-> | `PROJECT_DECK_MAP` | Slug → Deck board ID | `"voy-rojo": 7` |
-> | `PROJECT_COLLECTIVE_MAP` | Slug → Nextcloud Collective ID | `"voy-rojo": 6` |
->
-> **Slug rules:** lower-case title, spaces → hyphens, strip special chars.
->
-> Compare against the real boards from Step 1. For every active board that
-> is **not yet in** `PROJECT_DECK_MAP`:
->
-> 1. Derive a slug from the board title
-> 2. Add an entry to `KNOWN_PROJECTS` (regex)
-> 3. Add an entry to `PROJECT_DECK_MAP` (slug → board_id)
-> 4. If a matching Nextcloud Collective exists, add to `PROJECT_COLLECTIVE_MAP`
->
-> > **Note:** Changes to `context_extractor.py` take effect after the MCP
-> > server restarts (next session or `/reload-mcp`).
+### Step 2 — Sync maps via `project_maps.json`
+
+Machine-specific project maps now live in **`project_maps.json`** (gitignored)
+at the repo root, not in Python code.  A template is available at
+`project_maps.json.template`.
+
+Open or create `project_maps.json` and populate it with your boards and
+collectives:
+
+```json
+{
+  "collectives": {
+    "<slug>": <collective_id>
+  },
+  "decks": {
+    "<slug>": <board_id>
+  }
+}
+```
+
+| Map section | Purpose | Example entry |
+|-------------|---------|---------------|
+| `collectives` | Slug → Nextcloud Collective ID | `"voy-rojo": 6` |
+| `decks` | Slug → Deck board ID | `"voy-rojo": 7` |
+
+The regex patterns in `KNOWN_PROJECTS` (inside `context_extractor.py`)
+still detect the project name from user messages — you only need to add
+a pattern there if the board/collective slug is not already covered.
+
+**Slug rules:** lower-case title, spaces → hyphens, strip special chars.
+
+Compare against the real boards from Step 1. For every active board that
+is **not yet mapped** in `project_maps.json`:
+
+1. Derive a slug from the board title
+2. If no regex matches it yet, add an entry to `KNOWN_PROJECTS`
+   in `context_extractor.py`
+3. Add an entry to the `decks` section of `project_maps.json`
+4. If a matching Nextcloud Collective exists, add to the `collectives` section
+
+> **Note:** Changes to `project_maps.json` and `context_extractor.py` both
+> take effect after the MCP server restarts (next session or `/reload-mcp`).
+> The JSON file is gitignored — each machine has its own.
 >
 > ### Step 3 — Populate Checkpoints (Gate 1b)
 >
@@ -151,7 +172,7 @@ When the user needs to onboard a new project:
 1. **Create board**: `deck_create_board(title, color)` if it doesn't exist
 2. **Create stacks**: `deck_create_stack(board_id, title, order)` for columns
 3. **Add cards**: `deck_create_card(board_id, stack_id, title, description)`
-4. **Sync maps**: edit `context_extractor.py` (KNOWN_PROJECTS, PROJECT_DECK_MAP, PROJECT_COLLECTIVE_MAP)
+4. **Sync maps**: add to `project_maps.json` (decks + collectives) and optionally `KNOWN_PROJECTS` in `context_extractor.py` if a new regex is needed
 5. **Checkpoint**: `mcp_checkpoint_force_set_state(key="ultratimonel:<slug>", ...)`
 6. **Memory**: `mcp_agentmemory_memory_save(content=..., type="project", ...)`
 7. **Verify**: `assert_gates(message="<slug>", session_id="verify-<slug>")`
@@ -163,7 +184,7 @@ When the user needs to onboard a new project:
 | Pitfall | Symptom | Fix |
 |---------|---------|-----|
 | Board is soft-deleted | `deletedAt !== 0` | Skip — board doesn't exist |
-| Maps out of sync | Gate 1e returns SKIP | Sync `PROJECT_DECK_MAP` with real boards |
+| Maps out of sync | Gate 1e returns SKIP | Sync `project_maps.json` with real boards |
 | No checkpoint | Gate 1b returns WARN | Run Step 3 |
 | No memory | Gate 1a returns WARN | Run Step 4 |
 | Context extractor stale | Project not detected | Restart MCP server after editing |
@@ -175,6 +196,7 @@ When the user needs to onboard a new project:
 
 | File | Purpose |
 |------|---------|
-| `ultratimonel/context_extractor.py` | Project maps (KNOWN_PROJECTS, PROJECT_DECK_MAP, PROJECT_COLLECTIVE_MAP) |
+| `project_maps.json` | Machine-specific project→board/collective mappings (gitignored) |
+| `ultratimonel/context_extractor.py` | Project regex patterns (KNOWN_PROJECTS) and map loader |
 | `~/.hermes/ultratimonel.db` | Gate state persistence (SQLite) |
 | `~/.hermes/config.yaml` | MCP server registration |

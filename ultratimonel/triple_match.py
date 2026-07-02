@@ -18,7 +18,13 @@ from .context_extractor import PROJECT_COLLECTIVE_MAP, PROJECT_DECK_MAP
 
 logger = logging.getLogger(__name__)
 
-HTTP_TIMEOUT = 120.0  # overall timeout per gate (stdio spawn + handshake + call)
+HTTP_TIMEOUT = float(
+    os.environ.get("ULTRATIMONEL_TIMEOUT", "80.0")
+)
+# NOTE: raised from 40s → 80s after initial PR feedback.
+# Previous jump to 120s was uninstrumented (no p99 measurement).
+# Set ULTRATIMONEL_TIMEOUT env var to override after measuring
+# actual http-to-stdio bridge startup on your machine.
 
 
 # ── Domain helpers ──────────────────────────────────────────────────────

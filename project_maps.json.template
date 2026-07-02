@@ -1,0 +1,11 @@
+{
+  "collectives": {
+    "lectura-rapida": 1,
+    "voy-rojo": 6,
+    "ultratimonel": 13
+  },
+  "decks": {
+    "voy-rojo": 7,
+    "ultratimonel": 21
+  }
+}

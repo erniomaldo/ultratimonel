@@ -39,7 +39,7 @@ MCP_SERVER_CONFIGS: dict[str, dict] = {
         "command": (
             os.environ.get(
                 "ULTRATIMONEL_NEXTCLOUD_COMMAND",
-                shutil.which("python3") or sys.executable,
+                sys.executable or shutil.which("python3"),
             )
         ),
         "args": [
@@ -72,11 +72,14 @@ def _get_checkpoint_config() -> dict:
         "ULTRATIMONEL_CHECKPOINT_ARGS",
         "",
     )
-    # Filter out empty args so agentcheckpoint runs without spurious ""
-    args_list: list[str] = []
+    # Split by comma, strip whitespace, discard empty tokens.
+    # An empty/blank env var produces [] — no silent ["\"\"] anymore.
+    # Edge case "a,,b" or "," is handled gracefully (empties filtered).
     raw = args_env.strip()
-    if raw:
-        args_list = raw.split(",") if "," in raw else [raw]
+    if not raw:
+        args_list: list[str] = []
+    else:
+        args_list = [a.strip() for a in raw.split(",") if a.strip()]
     return {
         "command": command,
         "args": args_list,
