@@ -4,6 +4,10 @@ sequential execution with error isolation.
 Each gate calls external MCP tools via **stdio** (same transport Hermes uses),
 NOT HTTP.  Previously used HTTP JSON-RPC on hardcoded ports that didn't exist,
 causing false-positive WARN states after gateway restarts.
+
+⛔ ANTIPATRÓN: No hardcodees IDs de boards o collectives aquí.
+Los mapas se cargan desde project_maps.json en tiempo de ejecución.
+Usa las tools MCP map_add() / map_setup() para gestionar proyectos.
 """
 
 import json
@@ -14,17 +18,15 @@ from typing import Any, Optional
 
 from .gate_engine import GateConfig, GateResult, PASS, SKIP, WARN, BLOCK
 from .mcp_client import call_mcp_tool, TOOL_NAMES
-from .context_extractor import PROJECT_COLLECTIVE_MAP, PROJECT_DECK_MAP
+from .context_extractor import reload_project_maps, is_known_project, get_project_maps
 
 logger = logging.getLogger(__name__)
 
-HTTP_TIMEOUT = float(
-    os.environ.get("ULTRATIMONEL_TIMEOUT", "80.0")
-)
-# NOTE: raised from 40s → 80s after initial PR feedback.
-# Previous jump to 120s was uninstrumented (no p99 measurement).
-# Set ULTRATIMONEL_TIMEOUT env var to override after measuring
-# actual http-to-stdio bridge startup on your machine.
+HTTP_TIMEOUT = 300.0  # overall timeout per gate (stdio spawn + handshake + call)
+# NOTE: raised from 40s → 300s on 2026-07-23.
+# Rationale: planning to onboard many projects soon. Observed: 20 projects in
+# 74.5s of sync_all (avg ~3.7s per project). 300s gives headroom for 50+ projects
+# or slow nextcloud responses. Override per env: ULTRATIMONEL_TIMEOUT.
 
 
 # ── Domain helpers ──────────────────────────────────────────────────────
@@ -160,7 +162,8 @@ def _call_collective(context: dict) -> GateResult:
     ``mcp_nextcloud_collectives_get_page``.
     """
     project = context.get("project", "")
-    collective_id = PROJECT_COLLECTIVE_MAP.get(project)
+    maps = get_project_maps()
+    collective_id = maps.get(project, {}).get("collective_id")
     if collective_id is None:
         return GateResult(
             name="1c",
@@ -230,8 +233,9 @@ def _call_deck_impl(context: dict) -> GateResult:
     """
     project = context.get("project", "").lower()
 
-    # 1. Look up board ID directly from the map
-    board_id = PROJECT_DECK_MAP.get(project)
+    # 1. Look up board ID from project maps
+    maps = get_project_maps()
+    board_id = maps.get(project, {}).get("deck_board_id")
     if board_id is None:
         return GateResult(
             name="1e",
@@ -257,7 +261,7 @@ def _call_deck_impl(context: dict) -> GateResult:
         )
 
     if stacks is None:
-        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board {board_id} (project '{project}') found but stacks unavailable: {stack_error}"
+        msg = "Board found but stacks timeout" if stack_error == "timeout" else f"Board {board_id} found but stacks unavailable: {stack_error}"
         return GateResult(
             name="1e",
             state=WARN,
@@ -321,7 +325,7 @@ def _call_deck_impl(context: dict) -> GateResult:
         return GateResult(
             name="1e",
             state=BLOCK,
-            message=f"Board {board_id} (project '{project}') has {len(overdue_cards)} overdue card(s): {', '.join(overdue_cards[:3])}",
+            message=f"Board {board_id} has {len(overdue_cards)} overdue card(s): {', '.join(overdue_cards[:3])}",
             result_data={"deck_cards": cards},
         )
 
@@ -329,14 +333,14 @@ def _call_deck_impl(context: dict) -> GateResult:
         return GateResult(
             name="1e",
             state=WARN,
-            message=f"Board {board_id} (project '{project}') has no cards",
+            message=f"Board {board_id} has no cards",
             result_data={"deck_cards": []},
         )
 
     return GateResult(
         name="1e",
         state=PASS,
-        message=f"{len(cards)} cards in board {board_id} (project '{project}')",
+        message=f"{len(cards)} cards in board {board_id}",
         result_data={"deck_cards": cards},
     )
 

@@ -24,14 +24,20 @@ import pytest
 
 class TestGateConfig:
     def test_default_gates_loaded(self):
-        assert len(DEFAULT_GATES) == 3
+        assert len(DEFAULT_GATES) == 4
         names = [g.name for g in DEFAULT_GATES]
         assert "1a" in names
         assert "1b" in names
+        assert "1c" in names
         assert "1e" in names
 
-    def test_default_gates_all_mandatory(self):
-        assert all(g.mandatory for g in DEFAULT_GATES)
+    def test_default_gates_all_mandatory_except_1c(self):
+        """Gate 1c (collectives) is optional; all others are mandatory."""
+        mandatory = [g for g in DEFAULT_GATES if g.mandatory]
+        optional = [g for g in DEFAULT_GATES if not g.mandatory]
+        assert len(mandatory) == 3
+        assert len(optional) == 1
+        assert optional[0].name == "1c"
 
     def test_default_gates_timeout_2s(self):
         assert all(g.timeout_s == 2.0 for g in DEFAULT_GATES)
@@ -140,13 +146,13 @@ class TestRunGate:
         assert result.state == PASS
         assert result.message == "ok"
 
-    def test_executor_exception_falls_to_skip(self):
+    def test_executor_exception_falls_to_warn_if_mandatory(self):
         def broken_exec(cfg, ctx):
             raise RuntimeError("connection refused")
 
         config = GateConfig(name="1a")
         result = run_gate(config, {}, executor=broken_exec)
-        assert result.state == SKIP
+        assert result.state == WARN
         assert "connection refused" in result.message
 
     def test_duration_tracked(self):

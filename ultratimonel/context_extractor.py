@@ -4,125 +4,72 @@ context_extractor.py — Parse sender, topic, project from a message string.
 Extraction rules per SDD design §6:
   - sender:   passed through from session / tool arg (default: "user")
   - topic:    first sentence or leading noun phrase of the message
-  - project:  matched via known-project regex dict; falls back to topic
+  - project:  matched via project_maps.json patterns; falls back to topic
+
+⛔ ANTIPATRÓN: No agregues proyectos aquí.
+Los proyectos se configuran en project_maps.json (o via env var ULTRATIMONEL_PROJECT_MAPS).
+Usa las tools MCP: map_add() / map_setup()
+Editar este archivo para agregar proyectos es un error de diseño.
 """
 
-import json
 import logging
-import os
 import re
+from typing import Any
+
+from .config_loader import load_project_maps
 
 logger = logging.getLogger(__name__)
 
-# Known project patterns (case-insensitive)
-# These are generic regex patterns — NOT machine-specific data.
-KNOWN_PROJECTS: dict[str, str] = {
-    r"\bultratimonel\b": "ultratimonel",
-    r"\bnocturno\b": "nocturno",
-    r"\bmessagens\b": "messagens",
-    r"\bhermes\b": "hermes",
-    r"\bopenspec\b": "openspec",
-    # Collectives
-    r"\blecutra\s+r[áa]pida\b|\blecutra\b": "lectura-rapida",
-    r"\bvoy\s+rojo\b": "voy-rojo",
-    r"\bkgd\b|\bsolar\b": "kgd-solar",
-    r"\bquickintegratia\b|\bqia\b": "quickintegratia",
-    r"\bquiero\s+c[óo]digo\b": "quiero-codigo",
-    r"\bquickflorence\b": "quickflorence",
-    r"\bagenda\s+sencilla\b": "agenda-sencilla",
-    r"\bmi\s+mundo\b": "mi-mundo",
-    r"\bagentcheckpoint\b": "agentcheckpoint",
-    r"\bpictomcp\b": "pictomcp",
-    r"\bpuppetablechar\w*mcp\b|\bpuppetmcp\b": "puppetablecharmcp",
-    r"\bchatwoot\b": "chatwoot-mcp",
-}
+# ── Load project maps from external JSON ──────────────────────────────────
+# These are loaded once at import time. They can be reloaded via
+# reload_project_maps() if the JSON changes at runtime.
 
-# ── Project Map Loading ────────────────────────────────────────────────
-# PROJECT_DECK_MAP and PROJECT_COLLECTIVE_MAP contain Nextcloud IDs that
-# are specific to the user's instance.  They live in a gitignored JSON
-# file (project_maps.json at the repo root) so the repo stays portable.
-#
-# Inline defaults are provided for backward compatibility — existing
-# installs continue to work.  New projects should be added ONLY to the
-# JSON file, never to the inline dicts.
-
-_PROJECT_MAPS_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "project_maps.json"
-)
+_project_maps: dict[str, dict[str, Any]] = {}
+_project_patterns: list[tuple[re.Pattern, str]] = []
 
 
-def _load_project_maps() -> dict:
-    """Load user-specific project maps from gitignored JSON file.
+def reload_project_maps(path: str | None = None) -> None:
+    """Reload project maps from the JSON file.
 
-    Returns dict with keys "collectives" and "decks", each being a
-    ``{slug: id}`` dict.  Returns empty dicts if the file doesn't exist.
+    Call this after modifying project_maps.json to pick up changes
+    without restarting the server.
     """
-    maps: dict = {"collectives": {}, "decks": {}}
-    if not os.path.exists(_PROJECT_MAPS_PATH):
-        return maps
-    try:
-        with open(_PROJECT_MAPS_PATH) as f:
-            user_maps = json.load(f)
-        if isinstance(user_maps, dict):
-            maps.update(user_maps)
-        else:
-            logger.warning("project_maps.json: expected dict, got %s", type(user_maps))
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to load project_maps.json: %s", exc)
-    return maps
+    global _project_maps, _project_patterns
+    _project_maps = load_project_maps(path)
+
+    # Build regex patterns from each project's patterns list
+    _project_patterns = []
+    for project_name, config in _project_maps.items():
+        raw_patterns = config.get("patterns", [])
+        for pat in raw_patterns:
+            # Escape to word-boundary regex (case-insensitive)
+            regex = r"\b" + re.escape(pat.lower()) + r"\b"
+            try:
+                compiled = re.compile(regex, re.IGNORECASE)
+                _project_patterns.append((compiled, project_name))
+            except re.error as exc:
+                logger.warning("Invalid pattern '%s' for project '%s': %s", pat, project_name, exc)
+
+    logger.info("Loaded %d project(s) with %d pattern(s)", len(_project_maps), len(_project_patterns))
 
 
-_USER_MAPS = _load_project_maps()
+# Load on import
+reload_project_maps()
 
-# ── Collectives ─────────────────────────────────────────────────────────
 
-# Inline defaults for existing installs.  Overridden by project_maps.json.
-PROJECT_COLLECTIVE_MAP: dict[str, int] = {
-    "lectura-rapida": 1,
-    "voy-rojo": 6,
-    "kgd-solar": 7,
-    "quickintegratia": 8,
-    "quiero-codigo": 9,
-    "quickflorence": 10,
-    "agenda-sencilla": 11,
-    "mi-mundo": 12,
-    "agentcheckpoint": 13,
-    "pictomcp": 14,
-    "puppetablecharmcp": 15,
-    "chatwoot-mcp": 16,
-}
-PROJECT_COLLECTIVE_MAP.update(_USER_MAPS.get("collectives") or {})
+# ── Public helpers for map access ─────────────────────────────────────────
 
-# ── Deck Boards ─────────────────────────────────────────────────────────
+def get_project_maps() -> dict[str, dict[str, Any]]:
+    """Return the current project maps."""
+    return _project_maps
 
-# Inline defaults for existing installs.  Overridden by project_maps.json.
-PROJECT_DECK_MAP: dict[str, int] = {
-    "voy-rojo": 7,
-    "kgd-solar": 8,
-    "quickintegratia": 9,
-    "lectura-rapida": 10,
-    "quiero-codigo": 11,
-    "quickflorence": 13,
-    "agenda-sencilla": 14,
-    "agentcheckpoint": 15,
-    "pictomcp": 16,
-    "puppetablecharmcp": 17,
-    "chatwoot-mcp": 18,
-    "mi-mundo": 20,
-    # NOTE: "ultratimonel": 21 was removed from inline defaults in
-    #       PR #3 feedback — it belongs in project_maps.json.
-}
-PROJECT_DECK_MAP.update(_USER_MAPS.get("decks") or {})
 
-# Remove any keys with falsy (non-positive) values  # guard against bad data
-PROJECT_COLLECTIVE_MAP = {k: v for k, v in PROJECT_COLLECTIVE_MAP.items() if v}
-PROJECT_DECK_MAP = {k: v for k, v in PROJECT_DECK_MAP.items() if v}
+def is_known_project(project: str) -> bool:
+    """Check if a project name is in the known project maps."""
+    return project in _project_maps
 
-# Priority-ordered regex: first match wins
-_PROJECT_PATTERNS = [
-    (re.compile(pattern, re.IGNORECASE), name)
-    for pattern, name in KNOWN_PROJECTS.items()
-]
+
+# ── Context extraction ────────────────────────────────────────────────────
 
 
 def extract_context(
@@ -155,9 +102,10 @@ def extract_context(
         topic = "general"
 
     # Project: match known patterns in the full message
-    project = topic  # fallback
+    # ⛔ Si no hay match, project se queda como "unknown" (no topic)
+    project = "unknown"
     lowest_pos = len(message)
-    for pattern, proj in _PROJECT_PATTERNS:
+    for pattern, proj in _project_patterns:
         match = pattern.search(message)
         if match and match.start() < lowest_pos:
             lowest_pos = match.start()

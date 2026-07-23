@@ -21,10 +21,29 @@ ULTRATIMONEL_DB_PATH=/tmp/test.db python main.py
 
 # Deploy SOUL.md rules
 ./scripts/deploy_soul.sh
-
+```bash
 # Run tests
 pytest tests/ -v
 ```
+
+## 🚫 Antipatrón: No edites código para configurar proyectos
+
+Ultratimonel **no se configura editando archivos Python**. Toda la configuración
+de proyectos vive en `project_maps.json` (por defecto en `~/.hermes/ultratimonel/project_maps.json`,
+configurable via `ULTRATIMONEL_PROJECT_MAPS`).
+
+Usa las tools MCP para gestionar proyectos:
+
+| Tool | Acción |
+|------|--------|
+| `map_list()` | Listar proyectos configurados |
+| `map_add(project, patterns, ...)` | Agregar o actualizar un proyecto |
+| `map_remove(project)` | Eliminar un proyecto |
+| `map_setup()` | Descubrir boards/collectives disponibles |
+| `map_sync()` | Verificar que los IDs de boards sigan existiendo |
+
+**Editar `context_extractor.py`, `server.py` o cualquier `.py` para agregar
+proyectos es un error de diseño.** Usa las tools MCP en su lugar.
 
 ## Tools
 
@@ -70,13 +89,6 @@ ultratimonel/
 │   ├── gate_engine.py      # State machine (PASS/SKIP/WARN/BLOCK)
 │   ├── triple_match.py     # 1a→1b→1e orchestration
 │   └── bridge.py           # mcp-capabilities bridge stub
-├── docs/
-│   ├── 01-plan-general.md
-│   ├── 02-triple-match.md
-│   ├── 03-mcp-capabilities.md
-│   ├── 04-soul-enforcement.md
-│   ├── 05-preflight-flow.md
-│   └── 06-initialization-guide.md  # Auto-discovery & population
 ├── scripts/
 │   └── deploy_soul.sh      # SOUL.md rule injection
 └── tests/
@@ -110,21 +122,6 @@ into `~/.hermes/SOUL.md`. The script:
 2. Checks for the `## Protocolo Pre-flight (OBLIGATORIO)` section
 3. Updates in-place or appends as needed
 4. Supports `--force`, `--dry-run` flags
-
-## Initialization (Auto-Discovery)
-
-After installing ultratimonel, run the initialization guide to auto-discover
-the user's projects, create Deck boards, populate checkpoints and AgentMemory,
-and verify every gate passes:
-
-```bash
-# Hand this to a fresh Hermes Agent (or follow manually):
-cat docs/06-initialization-guide.md
-```
-
-See [`docs/06-initialization-guide.md`](docs/06-initialization-guide.md) for
-the full step-by-step auto-discovery protocol. It is **agnostic** — works with
-any Nextcloud Deck ecosystem without modification.
 
 ## Error Handling
 

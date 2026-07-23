@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ULTRATIMONEL — Gestor de Misiones</title>
+
+  <!-- nes.css — retro NES aesthetic -->
+  <link rel="stylesheet" href="https://unpkg.com/nes.css@2.3.0/css/nes.min.css">
+  <!-- Google Font for pixel-ish text -->
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+
+  <style>
+    /* ── Reset / Base ───────────────────────────────────────────── */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: 'Press Start 2P', 'Courier New', monospace;
+      font-size: 10px;
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    a { color: #e0e0e0; text-decoration: none; }
+
+    /* ── Header ─────────────────────────────────────────────────── */
+    .header {
+      background: #16213e;
+      border-bottom: 4px solid #0f3460;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .header-title {
+      font-size: 14px;
+      color: #e94560;
+      letter-spacing: 2px;
+    }
+    .header-title .crystal {
+      color: #5dade2;
+    }
+    .header-subtitle {
+      font-size: 7px;
+      color: #7f8c8d;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────── */
+    .app-layout {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ────────────────────────────────────────────────── */
+    .sidebar {
+      width: 240px;
+      background: #16213e;
+      border-right: 4px solid #0f3460;
+      padding: 12px 0;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }
+
+    .sidebar-title {
+      font-size: 9px;
+      color: #7f8c8d;
+      padding: 8px 16px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      border-bottom: 2px solid #0f3460;
+      margin-bottom: 4px;
+    }
+
+    .project-item {
+      padding: 10px 16px;
+      cursor: pointer;
+      border-left: 4px solid transparent;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 9px;
+    }
+
+    .project-item:hover {
+      background: #1a1a3e;
+      border-left-color: #e94560;
+    }
+
+    .project-item.active {
+      background: #1a1a3e;
+      border-left-color: #e94560;
+      color: #e94560;
+    }
+
+    .project-item .badge {
+      font-size: 6px;
+      background: #e94560;
+      color: #fff;
+      padding: 1px 6px;
+      border-radius: 0;
+      margin-left: auto;
+    }
+
+    .project-item .badge.active-badge {
+      background: #27ae60;
+    }
+
+    /* ── Main Content ───────────────────────────────────────────── */
+    .content {
+      flex: 1;
+      padding: 20px;
+      overflow-y: auto;
+    }
+
+    .content-header {
+      font-size: 12px;
+      color: #e94560;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #0f3460;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .content-header .top-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .content-header .sub {
+      font-size: 7px;
+      color: #7f8c8d;
+    }
+
+    .breadcrumb {
+      font-size: 7px;
+      color: #636e72;
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+
+    .breadcrumb-link {
+      color: #5dade2;
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+
+    .breadcrumb-link:hover {
+      color: #e94560;
+    }
+
+    .breadcrumb-current {
+      color: #e0e0e0;
+    }
+
+    .back-btn {
+      font-size: 7px;
+      color: #5dade2;
+      cursor: pointer;
+      margin-bottom: 8px;
+      display: inline-block;
+    }
+
+    .back-btn:hover {
+      color: #e94560;
+    }
+
+    /* ── Mission Card ───────────────────────────────────────────── */
+    .mission-card {
+      background: #16213e;
+      border: 3px solid #0f3460;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .mission-card:hover {
+      border-color: #e94560;
+      transform: translateX(2px);
+    }
+
+    .mission-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .mission-card-title {
+      font-size: 10px;
+      color: #e0e0e0;
+    }
+
+    .mission-card-title .session-label {
+      font-size: 7px;
+      color: #7f8c8d;
+    }
+
+    /* Status badges */
+    .status-badge {
+      font-size: 7px;
+      padding: 2px 8px;
+      border: 2px solid;
+    }
+    .status-active {
+      border-color: #27ae60;
+      color: #27ae60;
+    }
+    .status-completed {
+      border-color: #5dade2;
+      color: #5dade2;
+    }
+    .status-failed {
+      border-color: #e94560;
+      color: #e94560;
+    }
+    .status-aborted {
+      border-color: #7f8c8d;
+      color: #7f8c8d;
+    }
+
+    /* Progress bar (nes.css style) */
+    .progress-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 4px;
+    }
+    .progress-row .nes-progress {
+      flex: 1;
+      height: 20px;
+    }
+    .progress-label {
+      font-size: 7px;
+      color: #7f8c8d;
+      white-space: nowrap;
+    }
+
+    .mission-meta {
+      font-size: 7px;
+      color: #636e72;
+      margin-top: 6px;
+    }
+
+    /* ── Empty state ────────────────────────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #636e72;
+    }
+    .empty-state .nes-icon {
+      margin-bottom: 16px;
+    }
+    .empty-state h3 {
+      font-size: 10px;
+      color: #7f8c8d;
+      margin-bottom: 8px;
+    }
+
+    /* ── Detail Panel ───────────────────────────────────────────── */
+    .detail-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.8);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .detail-overlay.open {
+      display: flex;
+    }
+
+    .detail-panel {
+      background: #1a1a2e;
+      border: 4px solid #0f3460;
+      width: 90%;
+      max-width: 700px;
+      max-height: 85vh;
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    .detail-panel .close-btn {
+      float: right;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .detail-panel .close-btn:hover {
+      color: #e94560;
+    }
+
+    .detail-section-title {
+      font-size: 9px;
+      color: #5dade2;
+      margin: 16px 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #0f3460;
+    }
+
+    .gate-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid #0f3460;
+      font-size: 8px;
+    }
+    .gate-row:last-child {
+      border-bottom: none;
+    }
+
+    .gate-name {
+      font-weight: bold;
+      width: 40px;
+      color: #e94560;
+    }
+    .gate-state {
+      width: 50px;
+    }
+    .gate-msg {
+      flex: 1;
+      color: #b2bec3;
+    }
+    .gate-duration {
+      font-size: 6px;
+      color: #636e72;
+    }
+
+    /* ── Gate state colors ───────────────────────────────────────────── */
+    .gate-pass { color: #27ae60; }
+    .gate-warn { color: #f39c12; }
+    .gate-block { color: #e94560; }
+    .gate-skip { color: #636e72; }
+
+    /* ── Status colors ──────────────────────────────────────────────── */
+    .status-pending { border-color: #f39c12; color: #f39c12; }
+    .status-active { border-color: #27ae60; color: #27ae60; }
+    .status-completed { border-color: #5dade2; color: #5dade2; }
+    .status-failed { border-color: #e94560; color: #e94560; }
+    .status-blocked { border-color: #636e72; color: #636e72; }
+
+    /* ── Checklist preview inside mission card ──────────────────────── */
+    .checklist-preview {
+      margin: 6px 0;
+      padding: 4px 0;
+      border-top: 1px solid #0f3460;
+      border-bottom: 1px solid #0f3460;
+    }
+    .checklist-preview-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 7px;
+      padding: 3px 0;
+    }
+    .checklist-preview-item .checklist-text {
+      flex: 1;
+      color: #b2bec3;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .intento-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    /* ── Mission list (clean) ─────────────────────────────────────── */
+    .mission-desc {
+      font-size: 7px;
+      color: #7f8c8d;
+      margin: 4px 0;
+      line-height: 1.4;
+    }
+
+    /* ── Checklist Item Card ────────────────────────────────────────── */
+    .checklist-item-card {
+      background: #16213e;
+      border: 3px solid #0f3460;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .checklist-item-card:hover {
+      border-color: #e94560;
+      transform: translateX(2px);
+    }
+    .checklist-item-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .checklist-item-text {
+      font-size: 9px;
+      color: #e0e0e0;
+    }
+    .checklist-item-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 7px;
+      color: #636e72;
+      margin-left: 22px;
+    }
+
+    /* ── Intento Card ───────────────────────────────────────────────── */
+    .intento-card {
+      background: #16213e;
+      border: 3px solid #0f3460;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .intento-card:hover {
+      border-color: #e94560;
+      transform: translateX(2px);
+    }
+    .intento-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .intento-card-title {
+      font-size: 9px;
+      color: #e0e0e0;
+    }
+    .intento-meta {
+      font-size: 7px;
+      color: #636e72;
+      margin-top: 4px;
+    }
+
+    /* ── Intento Context (detail view) ──────────────────────────────── */
+    .intento-context {
+      background: #16213e;
+      border: 2px solid #0f3460;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+
+    /* ── Gate log button ────────────────────────────────────────────── */
+    .gate-log-btn {
+      font-size: 7px;
+      background: #0f3460;
+      color: #5dade2;
+      border: 1px solid #5dade2;
+      cursor: pointer;
+      padding: 2px 6px;
+    }
+    .gate-log-btn:hover {
+      background: #e94560;
+      color: #fff;
+      border-color: #e94560;
+    }
+
+    /* ── Log row ────────────────────────────────────────────────── */
+    .log-row {
+      font-size: 7px;
+      color: #636e72;
+      padding: 3px 0;
+    }
+    .log-row .arrow {
+      color: #e94560;
+    }
+
+    /* ── Responsive ─────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .sidebar {
+        width: 160px;
+      }
+      .header-title {
+        font-size: 10px;
+      }
+      .content {
+        padding: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ═══ HEADER ═════════════════════════════════════════════════ -->
+  <header class="header">
+    <div>
+      <div class="header-title">🔮 <span class="crystal">ULTRATIMONEL</span></div>
+      <div class="header-subtitle">✦ GESTOR DE MISIONES ✦</div>
+    </div>
+    <div>
+      <span id="db-status" style="font-size:7px;color:#636e72;">⏳ DB...</span>
+    </div>
+  </header>
+
+  <!-- ═══ LAYOUT ══════════════════════════════════════════════════ -->
+  <div class="app-layout">
+
+    <!-- ── Sidebar ──────────────────────────────────────────────── -->
+    <nav class="sidebar" id="sidebar">
+      <div class="sidebar-title">📋 Proyectos</div>
+      <div id="project-list">
+        <!-- populated by JS -->
+      </div>
+    </nav>
+
+    <!-- ── Content ──────────────────────────────────────────────── -->
+    <main class="content" id="content">
+      <div class="content-header">
+        <div class="top-row">
+          <span id="content-title">Selecciona un proyecto</span>
+          <span class="sub" id="content-subtitle"></span>
+        </div>
+        <div class="breadcrumb" id="content-breadcrumb"></div>
+      </div>
+      <div id="mission-list"></div>
+    </main>
+
+  </div>
+
+  <!-- ═══ DETAIL OVERLAY ══════════════════════════════════════════ -->
+  <div class="detail-overlay" id="detail-overlay">
+    <div class="detail-panel" id="detail-panel">
+      <span class="close-btn" id="detail-close">✕ CERRAR</span>
+      <div id="detail-content">
+        <!-- populated by JS -->
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=2"></script>
+
+</body>
+</html>

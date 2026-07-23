@@ -1,7 +1,7 @@
 # Gate Persistence — SQLite Schema for Gate State Tracking
 
 > **Capability ID:** `gate-persistence`
-> **Status:** Draft · **Updated:** 28 Jun 2026
+> **Status:** Active · **Updated:** 19 Jul 2026
 > **MVP:** Yes — persistence capability
 
 ## 1. Purpose

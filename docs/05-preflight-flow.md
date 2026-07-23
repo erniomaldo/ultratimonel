@@ -24,22 +24,27 @@
 │     └── ¿Checkpoint existe? → cargar estado  │
 │         ¿No existe? → crear nuevo            │
 │                                              │
-│  4. [GATE 1e] Deck scan                     │
-│     ├── get_boards → filtrar proyecto        │
+│  4. [GATE 1c] Collectives (steering docs)   │
+│     ├── collectives_get_pages(collective_id) │
+│     └── Inyectar docs de dirección           │
+│                                              │
+│  5. [GATE 1e] Deck scan                     │
+│     ├── PROJECT_DECK_MAP → board ID          │
 │     │   get_stacks → cards pendientes        │
 │     └── Inyectar cards relevantes            │
 │                                              │
-│  5. [GATE 1b.1 - opcional] mcp-capabilities │
+│  6. [GATE 1b.1 - opcional] mcp-capabilities │
 │     ├── search_capabilities(task_query)      │
 │     └── Inyectar tools relevantes            │
 │                                              │
-│  6. Compilar CONTEXT ENVELOPE final          │
-│     ┌──────────────────────────┐             │
-│     │ • Memory snippets        │             │
-│     │ • Checkpoint state       │             │
-│     │ • Deck cards             │             │
-│     │ • Relevant tools         │             │
-│     └──────────────────────────┘             │
+│  7. Compilar CONTEXT ENVELOPE final          │
+│     ┌──────────────────────────────┐         │
+│     │ • Memory snippets            │         │
+│     │ • Checkpoint state           │         │
+│     │ • Steering docs (collectives)│         │
+│     │ • Deck cards                 │         │
+│     │ • Relevant tools             │         │
+│     └──────────────────────────────┘         │
 │                                              │
 └─────────────────────────────────────────────┘
         │

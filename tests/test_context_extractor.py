@@ -16,7 +16,7 @@ class TestExtractContext:
         ctx = extract_context("", "sess-001")
         assert ctx["sender"] == "user"
         assert ctx["topic"] == "general"
-        assert ctx["project"] == "general"
+        assert ctx["project"] == "unknown"
         assert ctx["session_id"] == "sess-001"
 
     def test_sender_override(self):
@@ -38,27 +38,33 @@ class TestExtractContext:
         )
         assert ctx["project"] == "ultratimonel"
 
-    def test_known_project_nocturno(self):
-        ctx = extract_context("Working on nocturno design", "sess-001")
-        assert ctx["project"] == "nocturno"
+    def test_known_project_lectura_rapida(self):
+        """Lectura rápida is one of the currently-mapped projects in
+        project_maps.json. Tests against a real, live project name to ensure
+        dynamic loading from JSON works."""
+        ctx = extract_context("Working on lectura rapida dashboard", "sess-001")
+        assert ctx["project"] == "lectura-rapida"
 
-    def test_known_project_messagens(self):
-        ctx = extract_context("Fix bug in messagens", "sess-001")
-        assert ctx["project"] == "messagens"
+    def test_known_project_voy_rojo(self):
+        """Voy-rojo is another mapped project. Multi-word pattern from JSON."""
+        ctx = extract_context("Fix bug in voy rojo board", "sess-001")
+        assert ctx["project"] == "voy-rojo"
 
-    def test_unknown_project_falls_to_topic(self):
+    def test_unknown_project_falls_to_unknown(self):
         ctx = extract_context("Building a new thing", "sess-001")
-        assert ctx["project"] == "Building a new thing"
+        assert ctx["project"] == "unknown"
 
     def test_project_case_insensitive(self):
         ctx = extract_context("ULTRATIMONEL deployment", "sess-001")
         assert ctx["project"] == "ultratimonel"
 
     def test_project_first_mention_wins(self):
+        """When multiple project patterns match, the first one in the message
+        wins (positional priority)."""
         ctx = extract_context(
-            "Working on nocturno and ultratimonel together", "sess-001"
+            "Working on voy rojo and ultratimonel together", "sess-001"
         )
-        assert ctx["project"] == "nocturno"  # first occurrence
+        assert ctx["project"] == "voy-rojo"  # first occurrence
 
     def test_session_id_preserved(self):
         ctx = extract_context("Hello", "my-session-42")
