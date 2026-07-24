@@ -179,6 +179,26 @@ class TestMissions:
         assert len(beta) == 1
         assert {m["title"] for m in alpha} == {"A", "B"}
 
+    def test_rlock_prevents_deadlock_on_reentrant_call(self, db):
+        """Reproduce the deadlock scenario that RLock fixes.
+
+        list_missions() acquires self._lock, then calls list_checklist_items()
+        per mission row, which also acquires self._lock. With a plain Lock()
+        the inner call would block forever (same thread, same lock). With
+        RLock() the reentrant acquire succeeds.
+        """
+        mid = db.upsert_mission(deck_task_id=42, project="reentrant", title="RLock Test")
+        db.upsert_checklist_item(mid, item_index=0, text="Item 1")
+        db.upsert_checklist_item(mid, item_index=1, text="Item 2")
+
+        # This is the critical call: list_missions → with self._lock → list_checklist_items → with self._lock
+        missions = db.list_missions("reentrant")
+
+        assert len(missions) == 1
+        assert missions[0]["title"] == "RLock Test"
+        assert len(missions[0]["checklist_items"]) == 2
+        assert missions[0]["checklist_items"][0]["text"] == "Item 1"
+
 
 class TestDbFile:
     def test_creates_db_file(self):

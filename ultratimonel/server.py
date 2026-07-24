@@ -322,7 +322,7 @@ def complete_gate(
 def server(action: str) -> str:
     """Control the Ultratimonel Dashboard web server.
 
-    Manages a subprocess running the FastAPI/stdio dashboard GUI.
+    Manages a subprocess running the http.server (stdlib) dashboard GUI.
     The dashboard reads from the same SQLite DB as the gates.
 
     Args:

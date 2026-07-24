@@ -41,6 +41,7 @@ logger = logging.getLogger("dashboard")
 
 HERE = Path(__file__).parent.resolve()
 DASHBOARD_DIR = HERE / "dashboard"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3005
 
 # DB path — same env var as the MCP server uses
@@ -53,6 +54,12 @@ DB_PATH = os.environ.get(
 PROJECT_MAPS_PATH = os.environ.get(
     "ULTRATIMONEL_PROJECT_MAPS",
     os.path.expanduser("~/.hermes/ultratimonel/project_maps.json"),
+)
+
+# Dashboard host — default to localhost only for security
+DASHBOARD_HOST = os.environ.get(
+    "ULTRATIMONEL_DASHBOARD_HOST",
+    DEFAULT_HOST,
 )
 
 
@@ -70,7 +77,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -437,14 +443,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
 
-def create_server(port: int = DEFAULT_PORT) -> HTTPServer:
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+def create_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT) -> HTTPServer:
+    server = HTTPServer((host, port), DashboardHandler)
     server.timeout = 1.0
     return server
 
 
-def run_server(port: int = DEFAULT_PORT):
-    server = create_server(port)
+def run_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT):
+    server = create_server(host, port)
     url = f"http://localhost:{port}"
     logger.info("Dashboard listening on %s", url)
     print(f"🌐 ULTRATIMONEL DASHBOARD — {url}")
@@ -459,4 +465,4 @@ def run_server(port: int = DEFAULT_PORT):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
-    run_server(port)
+    run_server(host=DASHBOARD_HOST, port=port)
