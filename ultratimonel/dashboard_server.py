@@ -76,7 +76,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
