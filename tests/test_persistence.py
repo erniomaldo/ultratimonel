@@ -125,29 +125,79 @@ class TestCheckpoints:
 
 
 class TestMissions:
+    """Tests for Deck-synced missions (v2 schema).
+
+    Schema v2 uses deck_task_id as the natural key: upsert_mission() takes
+    a Deck task id + project + title, and get_mission() looks up by
+    internal mission id.
+    """
+
     def test_upsert_mission(self, db):
-        db.upsert_mission("sess-1", "ultratimonel", gates_passed=2, gates_total=3)
-        mission = db.get_mission("sess-1", "ultratimonel")
+        mission_id = db.upsert_mission(
+            deck_task_id=42,
+            project="ultratimonel",
+            title="Wire up MCP",
+        )
+        assert mission_id > 0
+        mission = db.get_mission(mission_id)
         assert mission is not None
-        assert mission["status"] == "active"
-        assert mission["gates_passed"] == 2
-        assert mission["gates_total"] == 3
+        assert mission["deck_task_id"] == 42
+        assert mission["project"] == "ultratimonel"
+        assert mission["title"] == "Wire up MCP"
+        assert mission["status"] == "pendiente"
+        assert mission["checklist_total"] == 0
+        assert mission["checklist_done"] == 0
 
     def test_upsert_updates_existing(self, db):
-        db.upsert_mission("sess-1", "p", gates_passed=1)
-        db.upsert_mission("sess-1", "p", gates_passed=3)
-        mission = db.get_mission("sess-1", "p")
-        assert mission["gates_passed"] == 3
+        db.upsert_mission(deck_task_id=10, project="p", title="Old", status="pendiente")
+        mid = db.upsert_mission(deck_task_id=10, project="p", title="New", status="completada", checklist_done=3, checklist_total=3)
+        mission = db.get_mission(mid)
+        assert mission["title"] == "New"
+        assert mission["status"] == "completada"
+        assert mission["checklist_done"] == 3
+        assert mission["checklist_total"] == 3
 
-    def test_complete_mission(self, db):
-        db.upsert_mission("sess-1", "ultratimonel")
-        db.complete_mission("sess-1", "ultratimonel", status="completed")
-        mission = db.get_mission("sess-1", "ultratimonel")
-        assert mission["status"] == "completed"
-        assert mission["completed_at"] is not None
+    def test_upsert_mission_with_checklist(self, db):
+        mid = db.upsert_mission(
+            deck_task_id=99, project="p", title="Task",
+            checklist_total=5, checklist_done=2,
+        )
+        mission = db.get_mission(mid)
+        assert mission["checklist_total"] == 5
+        assert mission["checklist_done"] == 2
 
     def test_get_missing_mission(self, db):
-        assert db.get_mission("nonexistent", "p") is None
+        assert db.get_mission(99999) is None
+
+    def test_list_missions_for_project(self, db):
+        db.upsert_mission(deck_task_id=1, project="alpha", title="A")
+        db.upsert_mission(deck_task_id=2, project="alpha", title="B")
+        db.upsert_mission(deck_task_id=3, project="beta", title="C")
+        alpha = db.list_missions("alpha")
+        beta = db.list_missions("beta")
+        assert len(alpha) == 2
+        assert len(beta) == 1
+        assert {m["title"] for m in alpha} == {"A", "B"}
+
+    def test_rlock_prevents_deadlock_on_reentrant_call(self, db):
+        """Reproduce the deadlock scenario that RLock fixes.
+
+        list_missions() acquires self._lock, then calls list_checklist_items()
+        per mission row, which also acquires self._lock. With a plain Lock()
+        the inner call would block forever (same thread, same lock). With
+        RLock() the reentrant acquire succeeds.
+        """
+        mid = db.upsert_mission(deck_task_id=42, project="reentrant", title="RLock Test")
+        db.upsert_checklist_item(mid, item_index=0, text="Item 1")
+        db.upsert_checklist_item(mid, item_index=1, text="Item 2")
+
+        # This is the critical call: list_missions → with self._lock → list_checklist_items → with self._lock
+        missions = db.list_missions("reentrant")
+
+        assert len(missions) == 1
+        assert missions[0]["title"] == "RLock Test"
+        assert len(missions[0]["checklist_items"]) == 2
+        assert missions[0]["checklist_items"][0]["text"] == "Item 1"
 
 
 class TestDbFile:

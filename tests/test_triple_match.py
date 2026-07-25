@@ -82,19 +82,17 @@ class TestTripleMatch:
 
 class TestContextEnvelope:
     def test_envelope_has_all_keys(self):
-        """Even with empty results, envelope should have all four sections."""
+        """Even with empty results, envelope should have all three sections."""
         from ultratimonel.gate_engine import GateResult
 
         results = [
             GateResult(name="1a", state=PASS, result_data={"memory_snippets": []}),
             GateResult(name="1b", state=PASS, result_data={"checkpoint_state": {"status": "new"}}),
-            GateResult(name="1c", state=SKIP, result_data={"steering_docs": []}),
             GateResult(name="1e", state=SKIP, result_data={"deck_cards": []}),
         ]
         envelope = build_context_envelope(results)
         assert "memory_snippets" in envelope
         assert "checkpoint_state" in envelope
-        assert "steering_docs" in envelope
         assert "deck_cards" in envelope
 
     def test_envelope_includes_data(self):
@@ -118,11 +116,6 @@ class TestContextEnvelope:
                 },
             ),
             GateResult(
-                name="1c",
-                state=SKIP,
-                result_data={"steering_docs": []},
-            ),
-            GateResult(
                 name="1e",
                 state=PASS,
                 result_data={
@@ -134,7 +127,6 @@ class TestContextEnvelope:
         assert len(envelope["memory_snippets"]) == 1
         assert envelope["memory_snippets"][0]["content"] == "hello"
         assert envelope["checkpoint_state"]["key"] == "proj"
-        assert envelope["steering_docs"] == []
         assert len(envelope["deck_cards"]) == 1
 
     def test_envelope_with_no_result_data(self):
@@ -143,109 +135,105 @@ class TestContextEnvelope:
         results = [
             GateResult(name="1a", state=SKIP, result_data=None),
             GateResult(name="1b", state=SKIP, result_data=None),
-            GateResult(name="1c", state=SKIP, result_data=None),
             GateResult(name="1e", state=SKIP, result_data=None),
         ]
         envelope = build_context_envelope(results)
         assert envelope["memory_snippets"] == []
         assert envelope["checkpoint_state"] == {}
-        assert envelope["steering_docs"] == []
         assert envelope["deck_cards"] == []
 
 
 class TestTimeoutHandling:
-    """Timeout → WARN for all gates (NF-MG-02, triple-match spec §7)."""
+    """Timeout -> WARN for all gates (NF-MG-02, triple-match spec §7)."""
 
-    @patch("ultratimonel.triple_match._json_rpc_call", return_value=(None, "timeout"))
+    @patch("ultratimonel.triple_match.call_mcp_tool", return_value=(None, "timeout"))
     def test_agentmemory_timeout_returns_warn(self, mock_call):
-        """1a timeout → WARN, not SKIP."""
-        context = {"sender": "user", "topic": "test", "project": "p"}
+        """1a timeout -> WARN, not SKIP."""
+        context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
         result = _call_agentmemory(context)
         assert result.state == WARN
         assert "timeout" in result.message.lower()
 
-    @patch("ultratimonel.triple_match._json_rpc_call", return_value=(None, "timeout"))
+    @patch("ultratimonel.triple_match.call_mcp_tool", return_value=(None, "timeout"))
     def test_checkpoint_timeout_returns_warn(self, mock_call):
-        """1b timeout → WARN, not SKIP."""
-        context = {"sender": "user", "topic": "test", "project": "p"}
+        """1b timeout -> WARN, not SKIP."""
+        context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
         result = _call_checkpoint(context)
         assert result.state == WARN
         assert "timeout" in result.message.lower()
 
-    @patch("ultratimonel.triple_match._json_rpc_call", return_value=(None, "timeout"))
-    def test_deck_boards_timeout_returns_warn(self, mock_call):
-        """1e boards timeout → WARN, not SKIP."""
-        context = {"sender": "user", "topic": "test", "project": "p"}
+    @patch("ultratimonel.triple_match.call_mcp_tool", return_value=(None, "timeout"))
+    def test_deck_stacks_timeout_returns_warn(self, mock_call):
+        """1e stacks timeout -> WARN, not SKIP."""
+        context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
         result = _call_deck(context)
         assert result.state == WARN
         assert "timeout" in result.message.lower()
 
 
 class TestUnavailableHandling:
-    """Unavailable → WARN for 1a/1b, SKIP for 1e boards."""
+    """Unavailable -> WARN for all gates."""
 
-    @patch("ultratimonel.triple_match._json_rpc_call", return_value=(None, "unavailable"))
+    @patch("ultratimonel.triple_match.call_mcp_tool", return_value=(None, "unavailable"))
     def test_agentmemory_unavailable_returns_warn(self, mock_call):
-        """1a unavailable → WARN."""
-        context = {"sender": "user", "topic": "test", "project": "p"}
+        """1a unavailable -> WARN."""
+        context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
         result = _call_agentmemory(context)
         assert result.state == WARN
         assert "unavailable" in result.message.lower()
 
-    @patch("ultratimonel.triple_match._json_rpc_call", return_value=(None, "unavailable"))
+    @patch("ultratimonel.triple_match.call_mcp_tool", return_value=(None, "unavailable"))
     def test_checkpoint_unavailable_returns_warn(self, mock_call):
-        """1b unavailable → WARN."""
-        context = {"sender": "user", "topic": "test", "project": "p"}
+        """1b unavailable -> WARN."""
+        context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
         result = _call_checkpoint(context)
         assert result.state == WARN
         assert "unavailable" in result.message.lower()
 
-    @patch("ultratimonel.triple_match._json_rpc_call", return_value=(None, "unavailable"))
-    def test_deck_boards_unavailable_returns_skip(self, mock_call):
-        """1e boards unavailable → SKIP (per spec: DECK_UNAVAILABLE → SKIP)."""
-        context = {"sender": "user", "topic": "test", "project": "p"}
+    @patch("ultratimonel.triple_match.call_mcp_tool", return_value=(None, "unavailable"))
+    def test_deck_stacks_unavailable_returns_warn(self, mock_call):
+        """1e stacks unavailable -> WARN."""
+        context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
         result = _call_deck(context)
-        assert result.state == SKIP, "DECK_UNAVAILABLE should be SKIP"
+        assert result.state == WARN
         assert "unavailable" in result.message.lower()
 
 
 class TestOverdueCheck:
-    """Overdue cards in Deck → BLOCK (Design.md §5)."""
+    """Overdue cards in Deck -> BLOCK (Design.md §5)."""
 
     def test_overdue_card_blocks(self):
-        """Overdue card → BLOCK state."""
+        """Overdue card -> BLOCK state."""
         from datetime import datetime, timedelta
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        with patch("ultratimonel.triple_match._json_rpc_call") as mock:
-            # First call: get_boards returns a matching board
-            # Second call: get_stacks returns a stack with an overdue card
-            mock.side_effect = [
-                ([{"id": 1, "title": "Project Board"}], None),  # boards
-                ([{"title": "To Do", "cards": [
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            # First call: get_stacks returns stacks with an overdue card
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
                     {"id": 1, "title": "Overdue Task", "description": "",
                      "duedate": yesterday, "labels": []}
-                ]}], None),  # stacks
-            ]
-            context = {"sender": "user", "topic": "test", "project": "Project"}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
             result = _call_deck(context)
             assert result.state == BLOCK
             assert "overdue" in result.message.lower()
 
     def test_no_overdue_card_passes(self):
-        """Cards with future duedates → PASS."""
+        """Cards with future duedates -> PASS."""
         from datetime import datetime, timedelta
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        with patch("ultratimonel.triple_match._json_rpc_call") as mock:
-            mock.side_effect = [
-                ([{"id": 1, "title": "Project Board"}], None),  # boards
-                ([{"title": "To Do", "cards": [
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
                     {"id": 1, "title": "Future Task", "description": "",
                      "duedate": tomorrow, "labels": []}
-                ]}], None),  # stacks
-            ]
-            context = {"sender": "user", "topic": "test", "project": "Project"}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
             result = _call_deck(context)
+            assert result.state == PASS
             assert result.state == PASS
             assert "overdue" not in result.message.lower()

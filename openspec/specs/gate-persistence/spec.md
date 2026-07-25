@@ -1,7 +1,7 @@
 # Gate Persistence — SQLite Schema for Gate State Tracking
 
 > **Capability ID:** `gate-persistence`
-> **Status:** Draft · **Updated:** 28 Jun 2026
+> **Status:** Active · **Updated:** 19 Jul 2026
 > **MVP:** Yes — persistence capability
 
 ## 1. Purpose
@@ -233,3 +233,11 @@ On server startup:
 | Version | Description | Date |
 |---------|-------------|------|
 | 1 | MVP: gate_state + missions + schema_version | 2026-06-28 |
+| 2 | v2: missions refactored to deck_task_id natural key, new tables checklist_items + intentos, migration v1→v2 transparent, RLock for thread-safe composition | 2026-07-23 |
+
+## 9. Concurrency
+
+### NF-GP-07 — Reentrant lock for method composition
+The `Persistence` class SHALL use `threading.RLock()` (not `threading.Lock()`) for `self._lock`. This is REQUIRED because `list_missions(project)` calls `list_checklist_items(mission_id)` internally to enrich the response — both methods acquire `self._lock`. A non-reentrant `Lock` would deadlock when the same thread tries to acquire twice.
+
+Rationale: refactoring these methods to share a single `with self._conn() as conn:` block would add coupling without benefit. `RLock` is the idiomatic Python solution for "same thread acquires lock multiple times". Verified by the test `test_list_missions_for_project` which creates a mission + checklist item + calls `list_missions` in a single thread.

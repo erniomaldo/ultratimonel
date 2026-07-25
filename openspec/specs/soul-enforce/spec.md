@@ -1,7 +1,7 @@
 # Soul Enforce — SOUL.md Identity Hardening Rules
 
 > **Capability ID:** `soul-enforce`
-> **Status:** Draft · **Updated:** 28 Jun 2026
+> **Status:** Active · **Updated:** 19 Jul 2026
 > **MVP:** Yes — enforcement capability
 
 ## 1. Purpose
@@ -27,6 +27,8 @@ Define the SOUL.md enforcement rules that make pre-flight gate checks a non-nego
 | F-SE-11 | The rules SHALL use numbered, actionable instructions | MUST |
 | F-SE-12 | The server SHALL NOT modify SOUL.md — rules are written manually or via deployment script | MUST |
 | F-SE-13 | A deployment script SHALL be provided to inject/update the Pre-flight Protocol section | SHOULD |
+| F-SE-14 | `server.py` SHALL contain inline antipattern guard: "No edites este archivo para agregar proyectos" directing users to project_maps.json | MUST |
+| F-SE-15 | `context_extractor.py` and `triple_match.py` SHALL contain antipattern guards referencing project_maps.json as the single source of truth for project configuration | MUST |
 
 ### 2.2 Non-Functional Requirements
 

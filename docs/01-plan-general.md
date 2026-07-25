@@ -20,7 +20,7 @@ Reglas duras en la identidad del agente (SOUL.md) que exigen llamar a las gates 
 | 1a | AgentMemory recall | `mcp_agentmemory_memory_recall` | ✅ |
 | 1b | Checkpoint status | `mcp_checkpoint_get_state` | ✅ |
 | 1b.1 | mcp-capabilities search | `search_capabilities()` vía mcp-capabilities-server | 🔜 Post-MVP |
-| 1c | Session search | `session_search` (solo si no cubierto por 1b.1) | ❌ Condicional |
+| 1c | Collectives steering docs | `mcp_nextcloud_collectives_get_collectives` | ✅ |
 | 1d | Skills match | Skills del contexto (solo si no cubierto por 1b.1) | ❌ Condicional |
 | 1e | Deck scan | `mcp_nextcloud_deck_get_boards` | ✅ |
 

@@ -1,6 +1,6 @@
-# Triple Match: 1a + 1b + 1e
+# Triple Match: 1a + 1b + 1c + 1e
 
-> **Propósito:** Los 3 gates base que Ultratimonel debe verificar antes de permitir generación.
+> **Propósito:** Los 4 gates base que Ultratimonel debe verificar antes de permitir generación.
 
 ## Gate 1a — AgentMemory Recall
 
@@ -35,6 +35,23 @@
 - Datos de sesión persistentes
 
 **Si falla (no hay checkpoint):** Crea checkpoint inicial con estado "nuevo".
+
+---
+
+## Gate 1c — Collectives (Steering Docs)
+
+**Qué hace:** Busca documentos de dirección (Visión, Decisions, Arquitectura, Roadmap)
+en el collective de Nextcloud asociado al proyecto.
+
+**Tool:** `mcp_nextcloud_collectives_get_pages(collective_id)` (vía MCP)
+
+**Frecuencia:** Cada mensaje.
+
+**Respuesta esperada:**
+- IDs y títulos de páginas de dirección del proyecto
+- Enlaces a Visión, Decisions, Arquitectura, Roadmap
+
+**Si falla (SKIP):** Normal si el proyecto no tiene collective mapeado.
 
 ---
 
