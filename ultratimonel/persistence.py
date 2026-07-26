@@ -845,6 +845,13 @@ class Persistence:
 
                 return result
 
+    def delete_intento(self, intento_id: int) -> bool:
+        """Delete an intento by id. Returns True if deleted, False if not found."""
+        with self._lock:
+            with self._conn() as conn:
+                cursor = conn.execute("DELETE FROM intentos WHERE id = ?", (intento_id,))
+                return cursor.rowcount > 0
+
     # ── backward compat (old upsert_mission name → routes to actions) ───
 
     def upsert_mission_legacy(
