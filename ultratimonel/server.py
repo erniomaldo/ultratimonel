@@ -930,3 +930,78 @@ def mission_list(project: str) -> str:
         "missions": missions,
         "total": len(missions),
     }, ensure_ascii=False, default=str)
+
+
+@app.tool()
+def record_intento(
+    session_id: str,
+    project: str,
+    mission_id: int,
+    checklist_item_id: int,
+) -> str:
+    """Create an intento (assert_gates cycle) for a specific checklist item.
+
+    Args:
+        session_id: Active Hermes session identifier.
+        project:    Project slug (e.g. "voy-rojo").
+        mission_id: Numeric mission ID from the missions table.
+        checklist_item_id: Numeric checklist item ID.
+
+    Returns:
+        JSON string with the new intento id.
+    """
+    intento_id = persistence.create_intento(
+        session_id=session_id,
+        project=project,
+        mission_id=mission_id,
+        checklist_item_id=checklist_item_id,
+    )
+    return json.dumps({
+        "status": "ok",
+        "intento_id": intento_id,
+    }, ensure_ascii=False, default=str)
+
+
+@app.tool()
+def delete_intento(intento_id: int) -> str:
+    """Delete an intento by its id.
+
+    Args:
+        intento_id: Numeric intento ID to delete.
+
+    Returns:
+        JSON string confirming deletion.
+    """
+    deleted = persistence.delete_intento(intento_id)
+    return json.dumps({
+        "status": "deleted" if deleted else "not_found",
+        "intento_id": intento_id,
+    }, ensure_ascii=False, default=str)
+
+
+@app.tool()
+def complete_intento(
+    intento_id: int,
+    status: str = "running",
+    gates_passed: int = 0,
+) -> str:
+    """Update an intento with gate results after assert_gates completes.
+
+    Args:
+        intento_id: Numeric intento ID to update.
+        status:     Final status (running, success, fail, etc.).
+        gates_passed: Number of gates that passed.
+
+    Returns:
+        JSON string confirming completion.
+    """
+    persistence.complete_intento(
+        intento_id=intento_id,
+        status=status,
+        gates_passed=gates_passed,
+    )
+    return json.dumps({
+        "status": "ok",
+        "intento_id": intento_id,
+        "gates_passed": gates_passed,
+    }, ensure_ascii=False, default=str)
