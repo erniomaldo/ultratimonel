@@ -487,7 +487,12 @@ class Persistence:
                     """SELECT gate_name, state, mandatory, duration_ms,
                               message, result_data, updated_at
                        FROM gate_state
-                       WHERE session_id = ? AND project = ?
+                       WHERE id IN (
+                           SELECT MAX(id)
+                           FROM gate_state
+                           WHERE session_id = ? AND project = ?
+                           GROUP BY gate_name
+                       )
                        ORDER BY gate_name""",
                     (session_id, project),
                 ).fetchall()

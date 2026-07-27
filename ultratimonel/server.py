@@ -81,6 +81,7 @@ def _dashboard_script() -> str | None:
 def _find_free_port(start: int = 3005, max_tries: int = 20) -> int:
     """Find the first free port starting from `start`."""
     import socket
+
     for port in range(start, start + max_tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -147,9 +148,7 @@ def assert_gates(
     # Si project == "unknown" (fallback sin match), skip para evitar
     # contaminar la DB con proyectos fantasma.
     project = context["project"]
-    gates_passed = sum(
-        1 for r in gate_results if r.state in (PASS, SKIP)
-    )
+    gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
     try:
         for r in gate_results:
             persistence.upsert_gate_state(
@@ -210,10 +209,12 @@ def check_gate(
         JSON string with gate name, state, mandatory, message, updated_at.
     """
     if name not in GATE_CONFIG_MAP:
-        return json.dumps({
-            "error": f"Gate '{name}' not found",
-            "valid_gates": list(GATE_CONFIG_MAP.keys()),
-        })
+        return json.dumps(
+            {
+                "error": f"Gate '{name}' not found",
+                "valid_gates": list(GATE_CONFIG_MAP.keys()),
+            }
+        )
 
     try:
         # We need the project — try from latest session
@@ -222,26 +223,32 @@ def check_gate(
 
         state = persistence.get_gate_state(session_id, project, name)
         if state is None:
-            return json.dumps({
-                "name": name,
-                "state": "PENDING",
-                "mandatory": GATE_CONFIG_MAP[name].mandatory,
-                "message": "Gate has not been run yet in this session",
-                "updated_at": "",
-            })
+            return json.dumps(
+                {
+                    "name": name,
+                    "state": "PENDING",
+                    "mandatory": GATE_CONFIG_MAP[name].mandatory,
+                    "message": "Gate has not been run yet in this session",
+                    "updated_at": "",
+                }
+            )
 
-        return json.dumps({
-            "name": state["gate_name"],
-            "state": state["state"],
-            "mandatory": bool(state["mandatory"]),
-            "message": state.get("message", ""),
-            "updated_at": state.get("updated_at", ""),
-        })
+        return json.dumps(
+            {
+                "name": state["gate_name"],
+                "state": state["state"],
+                "mandatory": bool(state["mandatory"]),
+                "message": state.get("message", ""),
+                "updated_at": state.get("updated_at", ""),
+            }
+        )
     except Exception as exc:
         logger.exception("check_gate failed")
-        return json.dumps({
-            "error": f"Failed to check gate: {exc}",
-        })
+        return json.dumps(
+            {
+                "error": f"Failed to check gate: {exc}",
+            }
+        )
 
 
 @app.tool()
@@ -263,10 +270,12 @@ def complete_gate(
         JSON string with from_state, to_state, name.
     """
     if name not in GATE_CONFIG_MAP:
-        return json.dumps({
-            "error": f"Gate '{name}' not found",
-            "valid_gates": list(GATE_CONFIG_MAP.keys()),
-        })
+        return json.dumps(
+            {
+                "error": f"Gate '{name}' not found",
+                "valid_gates": list(GATE_CONFIG_MAP.keys()),
+            }
+        )
 
     try:
         session = persistence.get_session(session_id)
@@ -277,12 +286,14 @@ def complete_gate(
         now = datetime.now(timezone.utc).isoformat()
 
         if current_state not in (BLOCK, WARN):
-            return json.dumps({
-                "name": name,
-                "state": current_state,
-                "message": f"Gate '{name}' is already {current_state} — no change needed",
-                "updated_at": now,
-            })
+            return json.dumps(
+                {
+                    "name": name,
+                    "state": current_state,
+                    "message": f"Gate '{name}' is already {current_state} — no change needed",
+                    "updated_at": now,
+                }
+            )
 
         # Persist transition
         persistence.upsert_gate_state(
@@ -301,18 +312,22 @@ def complete_gate(
             reason=reason,
         )
 
-        return json.dumps({
-            "name": name,
-            "state": PASS,
-            "message": f"Gate '{name}' transitioned {current_state} → PASS",
-            "updated_at": now,
-        })
+        return json.dumps(
+            {
+                "name": name,
+                "state": PASS,
+                "message": f"Gate '{name}' transitioned {current_state} → PASS",
+                "updated_at": now,
+            }
+        )
 
     except Exception as exc:
         logger.exception("complete_gate failed")
-        return json.dumps({
-            "error": f"Failed to complete gate: {exc}",
-        })
+        return json.dumps(
+            {
+                "error": f"Failed to complete gate: {exc}",
+            }
+        )
 
 
 # ── Dashboard server tool ──────────────────────────────────────────────────
@@ -341,7 +356,12 @@ def server(action: str) -> str:
             "action": action,
             "running": running,
             "port": _dashboard_port,
-            "pid": pid or (_dashboard_proc.pid if _dashboard_proc and _dashboard_proc.poll() is None else None),
+            "pid": pid
+            or (
+                _dashboard_proc.pid
+                if _dashboard_proc and _dashboard_proc.poll() is None
+                else None
+            ),
             "url": f"http://localhost:{_dashboard_port}",
             "script": script,
         }
@@ -359,11 +379,19 @@ def server(action: str) -> str:
     # ── stop ─────────────────────────────────────────────────────────
     if action == "stop":
         if _dashboard_proc is None:
-            return json.dumps({**_status_dict(False), "message": "Dashboard not running"})
+            return json.dumps(
+                {**_status_dict(False), "message": "Dashboard not running"}
+            )
         ret = _dashboard_proc.poll()
         if ret is not None:
             _dashboard_proc = None
-            return json.dumps({**_status_dict(False), "message": "Dashboard was already stopped", "exit_code": ret})
+            return json.dumps(
+                {
+                    **_status_dict(False),
+                    "message": "Dashboard was already stopped",
+                    "exit_code": ret,
+                }
+            )
         try:
             _dashboard_proc.send_signal(signal.SIGINT)
             _dashboard_proc.wait(timeout=5)
@@ -379,13 +407,17 @@ def server(action: str) -> str:
     # ── start ────────────────────────────────────────────────────────
     if action == "start":
         if _dashboard_proc is not None and _dashboard_proc.poll() is None:
-            return json.dumps({**_status_dict(True), "message": "Dashboard already running"})
+            return json.dumps(
+                {**_status_dict(True), "message": "Dashboard already running"}
+            )
 
         if script is None:
-            return json.dumps({
-                "error": "dashboard_server.py not found",
-                "hint": "Expected at ultratimonel/dashboard_server.py",
-            })
+            return json.dumps(
+                {
+                    "error": "dashboard_server.py not found",
+                    "hint": "Expected at ultratimonel/dashboard_server.py",
+                }
+            )
 
         # Find a free port
         _dashboard_port = _find_free_port(DASHBOARD_PORT)
@@ -408,20 +440,29 @@ def server(action: str) -> str:
 
         # Brief wait to catch immediate crashes
         import time
+
         time.sleep(0.5)
         ret = _dashboard_proc.poll()
         if ret is not None:
-            stderr = _dashboard_proc.stderr.read().decode(errors="replace") if _dashboard_proc.stderr else ""
+            stderr = (
+                _dashboard_proc.stderr.read().decode(errors="replace")
+                if _dashboard_proc.stderr
+                else ""
+            )
             _dashboard_proc = None
-            return json.dumps({
-                "error": f"Dashboard exited immediately (code {ret})",
-                "stderr": stderr[:500],
-            })
+            return json.dumps(
+                {
+                    "error": f"Dashboard exited immediately (code {ret})",
+                    "stderr": stderr[:500],
+                }
+            )
 
-        return json.dumps({
-            **_status_dict(True),
-            "message": f"Dashboard started on http://localhost:{_dashboard_port}",
-        })
+        return json.dumps(
+            {
+                **_status_dict(True),
+                "message": f"Dashboard started on http://localhost:{_dashboard_port}",
+            }
+        )
 
     # ── restart ──────────────────────────────────────────────────────
     if action == "restart":
@@ -454,22 +495,27 @@ def server(action: str) -> str:
             return json.dumps({"error": f"Restart failed: {exc}"})
 
         import time
+
         time.sleep(0.5)
         ret = _dashboard_proc.poll()
         if ret is not None:
             _dashboard_proc = None
             return json.dumps({"error": f"Restart failed (exit code {ret})"})
 
-        return json.dumps({
-            **_status_dict(True),
-            "message": f"Dashboard restarted on http://localhost:{_dashboard_port}",
-        })
+        return json.dumps(
+            {
+                **_status_dict(True),
+                "message": f"Dashboard restarted on http://localhost:{_dashboard_port}",
+            }
+        )
 
     # ── unknown action ───────────────────────────────────────────────
-    return json.dumps({
-        "error": f"Unknown action: '{action}'",
-        "valid_actions": ["status", "start", "stop", "restart"],
-    })
+    return json.dumps(
+        {
+            "error": f"Unknown action: '{action}'",
+            "valid_actions": ["status", "start", "stop", "restart"],
+        }
+    )
 
 
 # ── Project map management tools ──────────────────────────────────────────
@@ -485,6 +531,7 @@ def map_list() -> str:
         JSON array of project entries with patterns, deck_board_id, collective_id.
     """
     from .context_extractor import get_project_maps
+
     maps = get_project_maps()
     return json.dumps(maps, ensure_ascii=False, default=str)
 
@@ -527,12 +574,15 @@ def map_add(
     save_project_maps(maps, maps_path)
     reload_project_maps(maps_path)
 
-    return json.dumps({
-        "status": "ok",
-        "project": project,
-        "path": maps_path,
-        "total_projects": len(maps),
-    }, ensure_ascii=False)
+    return json.dumps(
+        {
+            "status": "ok",
+            "project": project,
+            "path": maps_path,
+            "total_projects": len(maps),
+        },
+        ensure_ascii=False,
+    )
 
 
 @app.tool()
@@ -555,21 +605,26 @@ def map_remove(project: str) -> str:
     maps = load_project_maps(maps_path)
 
     if project not in maps:
-        return json.dumps({
-            "error": f"Project '{project}' not found",
-            "known_projects": list(maps.keys()),
-        })
+        return json.dumps(
+            {
+                "error": f"Project '{project}' not found",
+                "known_projects": list(maps.keys()),
+            }
+        )
 
     del maps[project]
     save_project_maps(maps, maps_path)
     reload_project_maps(maps_path)
 
-    return json.dumps({
-        "status": "ok",
-        "removed": project,
-        "path": maps_path,
-        "total_projects": len(maps),
-    }, ensure_ascii=False)
+    return json.dumps(
+        {
+            "status": "ok",
+            "removed": project,
+            "path": maps_path,
+            "total_projects": len(maps),
+        },
+        ensure_ascii=False,
+    )
 
 
 @app.tool()
@@ -607,7 +662,11 @@ def map_setup() -> str:
         timeout=8.0,
     )
     if boards_data:
-        board_list = boards_data if isinstance(boards_data, list) else boards_data.get("boards", boards_data.get("result", []))
+        board_list = (
+            boards_data
+            if isinstance(boards_data, list)
+            else boards_data.get("boards", boards_data.get("result", []))
+        )
         known_boards = []
         new_boards = []
         for b in board_list:
@@ -636,7 +695,11 @@ def map_setup() -> str:
         timeout=8.0,
     )
     if coll_data:
-        coll_list = coll_data if isinstance(coll_data, list) else coll_data.get("collectives", coll_data.get("result", []))
+        coll_list = (
+            coll_data
+            if isinstance(coll_data, list)
+            else coll_data.get("collectives", coll_data.get("result", []))
+        )
         known_colls = []
         new_colls = []
         for c in coll_list:
@@ -682,7 +745,9 @@ def map_sync() -> str:
 
     maps = get_project_maps()
     if not maps:
-        return json.dumps({"status": "ok", "message": "No projects mapped", "stale": []})
+        return json.dumps(
+            {"status": "ok", "message": "No projects mapped", "stale": []}
+        )
 
     boards_data, boards_err = call_mcp_tool(
         "nextcloud",
@@ -694,7 +759,11 @@ def map_sync() -> str:
     if boards_data is None:
         return json.dumps({"error": f"Cannot reach Nextcloud Deck: {boards_err}"})
 
-    board_list = boards_data if isinstance(boards_data, list) else boards_data.get("boards", boards_data.get("result", []))
+    board_list = (
+        boards_data
+        if isinstance(boards_data, list)
+        else boards_data.get("boards", boards_data.get("result", []))
+    )
     live_board_ids = {b.get("id") for b in board_list}
 
     stale = []
@@ -708,13 +777,17 @@ def map_sync() -> str:
         else:
             stale.append({"project": project, "deck_board_id": bid})
 
-    return json.dumps({
-        "status": "ok",
-        "total_projects": len(maps),
-        "healthy": healthy,
-        "stale": stale,
-        "total_stale": len(stale),
-    }, ensure_ascii=False, default=str)
+    return json.dumps(
+        {
+            "status": "ok",
+            "total_projects": len(maps),
+            "healthy": healthy,
+            "stale": stale,
+            "total_stale": len(stale),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 # ── Sync tools: Deck → missions ────────────────────────────────────────────
@@ -754,7 +827,11 @@ def sync_tasks(project: str) -> str:
     if stacks_data is None:
         return json.dumps({"error": f"Cannot reach Deck: {err}"})
 
-    stacks = stacks_data if isinstance(stacks_data, list) else stacks_data.get("stacks", stacks_data.get("result", []))
+    stacks = (
+        stacks_data
+        if isinstance(stacks_data, list)
+        else stacks_data.get("stacks", stacks_data.get("result", []))
+    )
 
     created = 0
     updated_count = 0
@@ -778,7 +855,11 @@ def sync_tasks(project: str) -> str:
                 card_detail, detail_err = call_mcp_tool(
                     "nextcloud",
                     TOOL_NAMES["nextcloud"]["deck_get_card"],
-                    {"board_id": board_id, "stack_id": stack.get("id"), "card_id": card_id},
+                    {
+                        "board_id": board_id,
+                        "stack_id": stack.get("id"),
+                        "card_id": card_id,
+                    },
                     timeout=8.0,
                 )
 
@@ -793,13 +874,25 @@ def sync_tasks(project: str) -> str:
                     items_data = card_detail.get("checklistItems", [])
                     if items_data and isinstance(items_data, list):
                         checklist_total = len(items_data)
-                        checklist_done = sum(1 for it in items_data if it.get("status") == "done" or it.get("checked"))
+                        checklist_done = sum(
+                            1
+                            for it in items_data
+                            if it.get("status") == "done" or it.get("checked")
+                        )
                         for idx, item in enumerate(items_data):
-                            checklist_items_data.append({
-                                "index": idx,
-                                "text": item.get("description", item.get("text", f"Item {idx+1}")),
-                                "done": 1 if item.get("status") == "done" or item.get("checked") else 0,
-                            })
+                            checklist_items_data.append(
+                                {
+                                    "index": idx,
+                                    "text": item.get(
+                                        "description",
+                                        item.get("text", f"Item {idx + 1}"),
+                                    ),
+                                    "done": 1
+                                    if item.get("status") == "done"
+                                    or item.get("checked")
+                                    else 0,
+                                }
+                            )
 
                 # No checklist items from Deck API? Parse description for markdown checkboxes
                 if checklist_total == 0 and description:
@@ -809,12 +902,16 @@ def sync_tasks(project: str) -> str:
                         # Match - [ ] or - [x] style checkboxes
                         if line.startswith("- [") or line.startswith("* ["):
                             done = 1 if ("[x]" in line or "[X]" in line) else 0
-                            text = line.split("]", 1)[1].strip() if "]" in line else line
-                            checklist_items_data.append({
-                                "index": checklist_total,
-                                "text": text,
-                                "done": done,
-                            })
+                            text = (
+                                line.split("]", 1)[1].strip() if "]" in line else line
+                            )
+                            checklist_items_data.append(
+                                {
+                                    "index": checklist_total,
+                                    "text": text,
+                                    "done": done,
+                                }
+                            )
                             checklist_total += 1
                             if done:
                                 checklist_done += 1
@@ -863,13 +960,17 @@ def sync_tasks(project: str) -> str:
                 errors.append(f"Card {card.get('id', '?')}: {exc}")
                 logger.exception("sync_tasks card error")
 
-    return json.dumps({
-        "project": project,
-        "board_id": board_id,
-        "synced": created,
-        "errors": errors,
-        "total_errors": len(errors),
-    }, ensure_ascii=False, default=str)
+    return json.dumps(
+        {
+            "project": project,
+            "board_id": board_id,
+            "synced": created,
+            "errors": errors,
+            "total_errors": len(errors),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 @app.tool()
@@ -882,6 +983,7 @@ def sync_all() -> str:
         JSON with per-project sync results.
     """
     from .context_extractor import get_project_maps
+
     maps = get_project_maps()
     results = {}
     total_synced = 0
@@ -904,13 +1006,17 @@ def sync_all() -> str:
             results[project] = {"status": "error", "error": str(exc)}
             total_errors += 1
 
-    return json.dumps({
-        "status": "ok",
-        "projects_synced": len(results),
-        "total_synced": total_synced,
-        "total_errors": total_errors,
-        "details": results,
-    }, ensure_ascii=False, default=str)
+    return json.dumps(
+        {
+            "status": "ok",
+            "projects_synced": len(results),
+            "total_synced": total_synced,
+            "total_errors": total_errors,
+            "details": results,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 @app.tool()
@@ -925,8 +1031,216 @@ def mission_list(project: str) -> str:
         latest intento status per item.
     """
     missions = persistence.list_missions(project)
-    return json.dumps({
-        "project": project,
-        "missions": missions,
-        "total": len(missions),
-    }, ensure_ascii=False, default=str)
+    return json.dumps(
+        {
+            "project": project,
+            "missions": missions,
+            "total": len(missions),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def record_intento(
+    session_id: str,
+    project: str,
+    mission_id: int,
+    checklist_item_id: int,
+) -> str:
+    """Create an intento (assert_gates cycle) for a specific checklist item.
+
+    Args:
+        session_id: Active Hermes session identifier.
+        project:    Project slug (e.g. "voy-rojo").
+        mission_id: Numeric mission ID from the missions table.
+        checklist_item_id: Numeric checklist item ID.
+
+    Returns:
+        JSON string with the new intento id.
+    """
+    intento_id = persistence.create_intento(
+        session_id=session_id,
+        project=project,
+        mission_id=mission_id,
+        checklist_item_id=checklist_item_id,
+    )
+    return json.dumps(
+        {
+            "status": "ok",
+            "intento_id": intento_id,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def card_update_description(
+    card_id: int,
+    description: str,
+    board_id: int,
+    stack_id: int,
+) -> str:
+    """Update only the description of a Deck card — NEVER changes the title.
+
+    Args:
+        card_id: Numeric card ID.
+        description: New description content (markdown).
+        board_id: Numeric board ID.
+        stack_id: Numeric stack ID.
+
+    Returns:
+        JSON string confirming update.
+    """
+    from .mcp_client import call_mcp_tool, TOOL_NAMES
+
+    # Fetch current card detail to preserve the title
+    card, err = call_mcp_tool(
+        "nextcloud",
+        TOOL_NAMES["nextcloud"]["deck_get_card"],
+        {"board_id": board_id, "card_id": card_id, "stack_id": stack_id},
+        timeout=8.0,
+    )
+    if card is None:
+        return json.dumps({"error": f"Cannot fetch card {card_id}: {err}"})
+
+    # Extract current title — never overwrite it
+    if isinstance(card, dict):
+        card_data = card
+    elif isinstance(card, list) and len(card) > 0:
+        card_data = card[0]
+    else:
+        return json.dumps(
+            {"error": "Unexpected response shape from Deck", "raw": str(card)[:200]}
+        )
+
+    if (
+        isinstance(card_data, dict)
+        and "content" in card_data
+        and isinstance(card_data["content"], list)
+    ):
+        for item in card_data["content"]:
+            if item.get("type") == "text" and item.get("text"):
+                try:
+                    parsed = json.loads(item["text"])
+                    card_data = parsed
+                    break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    current_title = card_data.get("title", "")
+    if not current_title:
+        return json.dumps({"error": "Could not determine current card title"})
+
+    # Update only description — title explicitly preserved
+    result, update_err = call_mcp_tool(
+        "nextcloud",
+        TOOL_NAMES["nextcloud"]["deck_update_card"],
+        {
+            "board_id": board_id,
+            "card_id": card_id,
+            "stack_id": stack_id,
+            "title": current_title,
+            "description": description,
+        },
+        timeout=8.0,
+    )
+    if result is None:
+        return json.dumps({"error": f"Failed to update card: {update_err}"})
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "card_id": card_id,
+            "title_preserved": current_title,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def delete_intento(intento_id: int) -> str:
+    """Delete an intento by its id.
+
+    Args:
+        intento_id: Numeric intento ID to delete.
+
+    Returns:
+        JSON string confirming deletion.
+    """
+    deleted = persistence.delete_intento(intento_id)
+    return json.dumps(
+        {
+            "status": "deleted" if deleted else "not_found",
+            "intento_id": intento_id,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def complete_intento(
+    intento_id: int,
+    status: str = "running",
+    gates_passed: int = 0,
+    session_id: str = "",
+    project: str = "",
+) -> str:
+    """Update an intento with gate results after assert_gates completes.
+
+    Args:
+        intento_id:      Numeric intento ID to update.
+        status:          Final status (running, success, fail, etc.).
+        gates_passed:    Number of gates that passed.
+        session_id:      Optional session ID for gate validation.
+        project:         Optional project slug for gate validation.
+
+    Returns:
+        JSON string confirming completion, or blocked if gates fail.
+
+    Note:
+        endTurn bouncer (Nikhil pattern): when session_id + project are
+        provided, validates that ALL mandatory gates are PASS/SKIP in the
+        database before allowing completion. Rejects if any gate is BLOCK/WARN.
+    """
+    # ── endTurn bouncer: validate mandatory gates against DB ────────────
+    if session_id and project:
+        gates = persistence.list_gate_states(session_id, project)
+        failed = [
+            f"{g.get('gate_name', '?')}({g.get('state', 'UNKNOWN')}): {g.get('message', '')}"
+            for g in gates
+            if g.get("mandatory") and g.get("state") not in ("PASS", "SKIP", "PENDING")
+        ]
+        if failed:
+            detail = "\n".join(f"  🔴 {f}" for f in failed)
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "error": (
+                        f"endTurn Bouncer: {len(failed)} mandatory gate(s) did not pass.\n{detail}\n\n"
+                        "Fix blocking gates and retry."
+                    ),
+                    "intento_id": intento_id,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+    persistence.complete_intento(
+        intento_id=intento_id,
+        status=status,
+        gates_passed=gates_passed,
+    )
+    return json.dumps(
+        {
+            "status": "ok",
+            "intento_id": intento_id,
+            "gates_passed": gates_passed,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
