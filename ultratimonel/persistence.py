@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 2
-SCHEMA_DESCRIPTION = "v2: Deck-linked missions, checklist_items, intentos, actions"
+SCHEMA_VERSION = 3
+SCHEMA_DESCRIPTION = "v3: turno tracking for sessions and intentos"
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -51,11 +51,12 @@ DDL_V2 = [
     )""",
     # Table 2: session context
     """CREATE TABLE IF NOT EXISTS sessions (
-        id         TEXT PRIMARY KEY,
-        sender     TEXT,
-        topic      TEXT,
-        project    TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
+        id            TEXT PRIMARY KEY,
+        sender        TEXT,
+        topic         TEXT,
+        project       TEXT,
+        turno_actual  INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT DEFAULT (datetime('now'))
     )""",
     # Table 3: per-gate status (unchanged from v1)
     """CREATE TABLE IF NOT EXISTS gate_state (
@@ -146,6 +147,7 @@ DDL_V2 = [
                           CHECK(status IN ('running','success','fail')),
         gates_passed      INTEGER NOT NULL DEFAULT 0,
         gates_total       INTEGER NOT NULL DEFAULT 4,
+        turno             INTEGER NOT NULL DEFAULT 1,
         started_at        TEXT NOT NULL DEFAULT (datetime('now')),
         completed_at      TEXT
     )""",
@@ -232,7 +234,17 @@ def _migrate_v1_to_v2(conn) -> None:
         UNIQUE(mission_id, item_index)
     )""")
 
-    # 5. Create intentos table
+    # 5. Create sessions table with turno_actual
+    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+        id            TEXT PRIMARY KEY,
+        sender        TEXT,
+        topic         TEXT,
+        project       TEXT,
+        turno_actual  INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT DEFAULT (datetime('now'))
+    )""")
+
+    # 6. Create intentos table with turno
     conn.execute("""CREATE TABLE IF NOT EXISTS intentos (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id        TEXT NOT NULL,
@@ -243,11 +255,12 @@ def _migrate_v1_to_v2(conn) -> None:
                           CHECK(status IN ('running','success','fail')),
         gates_passed      INTEGER NOT NULL DEFAULT 0,
         gates_total       INTEGER NOT NULL DEFAULT 4,
+        turno             INTEGER NOT NULL DEFAULT 1,
         started_at        TEXT NOT NULL DEFAULT (datetime('now')),
         completed_at      TEXT
     )""")
 
-    # 6. Create indexes
+    # 7. Create indexes
     for idx in [
         "CREATE INDEX IF NOT EXISTS idx_actions_project ON actions(project)",
         "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status)",
@@ -262,7 +275,28 @@ def _migrate_v1_to_v2(conn) -> None:
         conn.execute(idx)
 
 
+def _migrate_v2_to_v3(conn) -> None:
+    """Migrate from v2 schema to v3.
+
+    Adds turno tracking columns:
+      - sessions.turno_actual  INTEGER NOT NULL DEFAULT 1
+      - intentos.turno         INTEGER NOT NULL DEFAULT 1
+    """
+    # Add turno_actual to sessions if not exists
+    conn.execute(
+        "ALTER TABLE sessions ADD COLUMN turno_actual INTEGER NOT NULL DEFAULT 1"
+    )
+
+    # Add turno to intentos if not exists
+    conn.execute(
+        "ALTER TABLE intentos ADD COLUMN turno INTEGER NOT NULL DEFAULT 1"
+    )
+
+    logger.info("Migrated DB v2→v3: added turno tracking columns")
+
+
 # ── Persistence class ───────────────────────────────────────────────────
+
 
 class Persistence:
     """Thread-safe SQLite persistence layer for gate state."""
@@ -272,6 +306,7 @@ class Persistence:
         self._is_memory = raw_path == ":memory:"
         if self._is_memory:
             import tempfile
+
             tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
             tmp.close()
             self._db_path = tmp.name
@@ -301,12 +336,14 @@ class Persistence:
     def _conn(self):
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
         except sqlite3.OperationalError as exc:
             if "database is locked" in str(exc):
                 import time as _time
+
                 for attempt in range(3):
                     _time.sleep(0.1 * (attempt + 1))
                     try:
@@ -372,8 +409,16 @@ class Persistence:
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
                     logger.info("Migrated DB v1→v2: %s", self._db_path)
+                elif current_ver == 2:
+                    # Migration v2 → v3
+                    _migrate_v2_to_v3(conn)
+                    conn.execute(
+                        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+                        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
+                    )
+                    logger.info("Migrated DB v2→v3: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
-                    # Already current — ensure all v2 tables exist
+                    # Already current — ensure all tables exist
                     for stmt in DDL_V2:
                         try:
                             conn.execute(stmt)
@@ -411,6 +456,33 @@ class Persistence:
                     (session_id,),
                 ).fetchone()
                 return dict(row) if row else None
+
+    def get_session_turn(self, session_id: str) -> int:
+        """Get the current turno for a session. Defaults to 1 if not set."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(turno_actual, 1) FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                return row[0] if row else 1
+
+    def increment_session_turn(self, session_id: str) -> int:
+        """Increment the turno for a session. Returns the new turno value."""
+        with self._lock:
+            with self._conn() as conn:
+                cur = conn.execute(
+                    """UPDATE sessions SET turno_actual = turno_actual + 1 WHERE id = ?""",
+                    (session_id,),
+                )
+                # If session doesn't exist yet, insert with turno=1
+                if cur.rowcount == 0:
+                    conn.execute(
+                        """INSERT INTO sessions (id, turno_actual) VALUES (?, 1)
+                           ON CONFLICT(id) DO UPDATE SET turno_actual = 1""",
+                        (session_id,),
+                    )
+                return self.get_session_turn(session_id)
 
     # ── gate_state CRUD ─────────────────────────────────────────────────
 
@@ -514,7 +586,8 @@ class Persistence:
         """
         with self._lock:
             with self._conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT gs.gate_name, gs.state, gs.mandatory,
                            gs.duration_ms, gs.message, gs.updated_at
                     FROM gate_state gs
@@ -525,7 +598,9 @@ class Persistence:
                         GROUP BY gate_name
                     ) latest ON gs.id = latest.max_id
                     ORDER BY gs.gate_name
-                """, (project,)).fetchall()
+                """,
+                    (project,),
+                ).fetchall()
                 return [dict(r) for r in rows]
 
     # ── gate_log ────────────────────────────────────────────────────────
@@ -556,7 +631,8 @@ class Persistence:
         """Get gate transition logs for a specific gate in a project."""
         with self._lock:
             with self._conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT gl.id, gl.session_id, gl.gate_name,
                            gl.from_state, gl.to_state, gl.reason, gl.created_at
                     FROM gate_logs gl
@@ -564,7 +640,9 @@ class Persistence:
                     WHERE s.project = ? AND gl.gate_name = ?
                     ORDER BY gl.created_at DESC
                     LIMIT ?
-                """, (project, gate_name, limit)).fetchall()
+                """,
+                    (project, gate_name, limit),
+                ).fetchall()
                 return [dict(r) for r in rows]
 
     # ── checkpoints ─────────────────────────────────────────────────────
@@ -627,14 +705,17 @@ class Persistence:
         """List action records (session-level) for a project."""
         with self._lock:
             with self._conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT id, session_id, project, status,
                            gates_passed, gates_total,
                            started_at, completed_at, last_gate_run
                     FROM actions
                     WHERE project = ?
                     ORDER BY started_at DESC
-                """, (project,)).fetchall()
+                """,
+                    (project,),
+                ).fetchall()
                 return [dict(r) for r in rows]
 
     # ── missions (Deck-linked) ──────────────────────────────────────────
@@ -664,8 +745,15 @@ class Persistence:
                            checklist_total = excluded.checklist_total,
                            checklist_done  = excluded.checklist_done,
                            last_sync       = datetime('now')""",
-                    (deck_task_id, project, title, description, status,
-                     checklist_total, checklist_done),
+                    (
+                        deck_task_id,
+                        project,
+                        title,
+                        description,
+                        status,
+                        checklist_total,
+                        checklist_done,
+                    ),
                 )
                 row = conn.execute(
                     "SELECT id FROM missions WHERE deck_task_id = ?",
@@ -686,13 +774,16 @@ class Persistence:
         """List missions for a project."""
         with self._lock:
             with self._conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT id, deck_task_id, project, title, description,
                            status, checklist_total, checklist_done, last_sync, created_at
                     FROM missions
                     WHERE project = ?
                     ORDER BY created_at DESC
-                """, (project,)).fetchall()
+                """,
+                    (project,),
+                ).fetchall()
                 result = []
                 for r in rows:
                     d = dict(r)
@@ -760,12 +851,15 @@ class Persistence:
     def list_checklist_items(self, mission_id: int) -> list[dict]:
         with self._lock:
             with self._conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT id, mission_id, item_index, text, done
                     FROM checklist_items
                     WHERE mission_id = ?
                     ORDER BY item_index
-                """, (mission_id,)).fetchall()
+                """,
+                    (mission_id,),
+                ).fetchall()
                 return [dict(r) for r in rows]
 
     # ── intentos ────────────────────────────────────────────────────────
@@ -776,15 +870,29 @@ class Persistence:
         project: str,
         mission_id: int,
         checklist_item_id: int,
+        turno: int = 1,
     ) -> int:
-        """Create a new intento (assert_gates cycle for a checklist item). Returns id."""
+        """Create a new intento (assert_gates cycle for a checklist item). Returns id.
+
+        Args:
+            session_id: Active Hermes session identifier.
+            project: Project slug.
+            mission_id: Numeric mission ID from the missions table.
+            checklist_item_id: Numeric checklist item ID.
+            turno: Current turn number (default 1 for backward compat).
+
+        Raises:
+            ValueError: if mission_id <= 0
+        """
+        if mission_id <= 0:
+            raise ValueError("mission_id must be > 0")
         with self._lock:
             with self._conn() as conn:
                 conn.execute(
                     """INSERT INTO intentos
-                           (session_id, project, mission_id, checklist_item_id, status)
-                       VALUES (?, ?, ?, ?, 'running')""",
-                    (session_id, project, mission_id, checklist_item_id),
+                           (session_id, project, mission_id, checklist_item_id, status, turno)
+                       VALUES (?, ?, ?, ?, 'running', ?)""",
+                    (session_id, project, mission_id, checklist_item_id, turno),
                 )
                 return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -806,24 +914,49 @@ class Persistence:
     def get_intento(self, intento_id: int) -> Optional[dict]:
         with self._lock:
             with self._conn() as conn:
-                row = conn.execute("""
+                # Get the latest gate state for this intento's session+project
+                row = conn.execute(
+                    """
                     SELECT i.*, gs.state as latest_gate_state, gs.message as latest_gate_msg
                     FROM intentos i
+                    LEFT JOIN gate_state gs
+                        ON gs.session_id = i.session_id
+                        AND gs.project = i.project
+                        AND gs.id = (
+                            SELECT MAX(id) FROM gate_state
+                            WHERE session_id = i.session_id
+                              AND project = i.project
+                        )
                     WHERE i.id = ?
-                """, (intento_id,)).fetchone()
+                """,
+                    (intento_id,),
+                ).fetchone()
                 return dict(row) if row else None
+
+    def intento_belongs_to_turn(self, intento_id: int, turno: int) -> bool:
+        """Check if an intento was created in the given turn."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT turno FROM intentos WHERE id = ?",
+                    (intento_id,),
+                ).fetchone()
+                return row is not None and row[0] == turno
 
     def list_intentos_by_checklist_item(self, checklist_item_id: int) -> list[dict]:
         with self._lock:
             with self._conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT id, session_id, project, mission_id,
                            checklist_item_id, status, gates_passed, gates_total,
                            started_at, completed_at
                     FROM intentos
                     WHERE checklist_item_id = ?
                     ORDER BY started_at DESC
-                """, (checklist_item_id,)).fetchall()
+                """,
+                    (checklist_item_id,),
+                ).fetchall()
                 return [dict(r) for r in rows]
 
     def get_intento_with_gates(self, intento_id: int) -> Optional[dict]:
@@ -839,13 +972,16 @@ class Persistence:
                 result = dict(intento)
 
                 # Get gates for this session
-                gates = conn.execute("""
+                gates = conn.execute(
+                    """
                     SELECT gate_name, state, mandatory, duration_ms, message,
                            result_data, updated_at
                     FROM gate_state
                     WHERE session_id = ? AND project = ?
                     ORDER BY gate_name
-                """, (result["session_id"], result["project"])).fetchall()
+                """,
+                    (result["session_id"], result["project"]),
+                ).fetchall()
                 result["gates"] = [dict(g) for g in gates]
 
                 return result
@@ -854,7 +990,9 @@ class Persistence:
         """Delete an intento by id. Returns True if deleted, False if not found."""
         with self._lock:
             with self._conn() as conn:
-                cursor = conn.execute("DELETE FROM intentos WHERE id = ?", (intento_id,))
+                cursor = conn.execute(
+                    "DELETE FROM intentos WHERE id = ?", (intento_id,)
+                )
                 return cursor.rowcount > 0
 
     # ── backward compat (old upsert_mission name → routes to actions) ───

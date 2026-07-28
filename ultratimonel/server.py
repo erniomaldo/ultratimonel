@@ -101,6 +101,7 @@ def assert_gates(
     message: str,
     session_id: str,
     sender: str = "user",
+    project: str = "",
 ) -> str:
     """Run all pre-flight gates and return structured results.
 
@@ -114,6 +115,8 @@ def assert_gates(
         message:    The user's raw message / query.
         session_id: Active Hermes session identifier.
         sender:     Optional sender name (default: "user").
+        project:    Optional explicit project name. If non-empty, overrides
+                    the auto-detected project from extract_context.
 
     Returns:
         JSON string with:
@@ -125,6 +128,10 @@ def assert_gates(
     """
     # 1. Extract context
     context = extract_context(message, session_id, sender=sender)
+
+    # If an explicit project was provided, use it directly (skip auto-detection).
+    if project:
+        context["project"] = project
 
     try:
         persistence.upsert_session(
@@ -1049,7 +1056,14 @@ def record_intento(
     mission_id: int,
     checklist_item_id: int,
 ) -> str:
-    """Create an intento (assert_gates cycle) for a specific checklist item.
+    """DEPRECATED — use begin_turn instead.
+
+    Create an intento (assert_gates cycle) for a specific checklist item.
+
+    .. deprecated::
+        Use :func:`begin_turn` which provides turn-scoped intentos with
+        consolidated two-tool flow (begin_turn → end_turn). This tool
+        remains for backward compatibility only.
 
     Args:
         session_id: Active Hermes session identifier.
@@ -1060,6 +1074,24 @@ def record_intento(
     Returns:
         JSON string with the new intento id.
     """
+    if mission_id <= 0:
+        return json.dumps(
+            {
+                "error": "mission_id must be > 0",
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+        )
+
+    if checklist_item_id <= 0:
+        return json.dumps(
+            {
+                "error": "checklist_item_id must be > 0",
+                "checklist_item_id": checklist_item_id,
+            },
+            ensure_ascii=False,
+        )
+
     intento_id = persistence.create_intento(
         session_id=session_id,
         project=project,
@@ -1190,7 +1222,14 @@ def complete_intento(
     session_id: str = "",
     project: str = "",
 ) -> str:
-    """Update an intento with gate results after assert_gates completes.
+    """DEPRECATED — use end_turn instead.
+
+    Update an intento with gate results after assert_gates completes.
+
+    .. deprecated::
+        Use :func:`end_turn` which provides turn-scoped validation and
+        a consolidated two-tool flow (begin_turn → end_turn). This tool
+        remains for backward compatibility only.
 
     Args:
         intento_id:      Numeric intento ID to update.
@@ -1207,6 +1246,36 @@ def complete_intento(
         provided, validates that ALL mandatory gates are PASS/SKIP in the
         database before allowing completion. Rejects if any gate is BLOCK/WARN.
     """
+    # ── Turn-check: reject intento from a different turn (GAP-1) ──────────
+    intento = persistence.get_intento(intento_id)
+    if intento is None:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"intento_id={intento_id} not found",
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    session_turno = persistence.get_session_turn(intento["session_id"])
+    if intento["turno"] != session_turno:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    f"intento_id={intento_id} does not belong to the current turn. "
+                    f"Belongs to turn {intento['turno']}, but current turn is {session_turno}. "
+                    "Call begin_turn() first to start the current turn."
+                ),
+                "intento_id": intento_id,
+                "intento_turno": intento["turno"],
+                "current_turno": session_turno,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     # ── endTurn bouncer: validate mandatory gates against DB ────────────
     if session_id and project:
         gates = persistence.list_gate_states(session_id, project)
@@ -1240,6 +1309,143 @@ def complete_intento(
             "status": "ok",
             "intento_id": intento_id,
             "gates_passed": gates_passed,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def begin_turn(
+    session_id: str,
+    project: str,
+    mission_id: int,
+    checklist_item_id: int,
+) -> str:
+    """Begin a new turn and create a turno-scoped intento.
+
+    This is the first half of the consolidated two-tool intent flow.
+    It increments the session's turno counter, creates an intento
+    linked to the current turn, and returns the intento_id for use
+    with :func:`end_turn`.
+
+    Args:
+        session_id:      Active Hermes session identifier.
+        project:         Project slug (e.g. "voy-rojo").
+        mission_id:      Numeric mission ID from the missions table (> 0).
+        checklist_item_id: Numeric checklist item ID.
+
+    Returns:
+        JSON string with status and intento_id.
+
+    Raises:
+        Error if mission_id <= 0.
+    """
+    if mission_id <= 0:
+        return json.dumps(
+            {
+                "error": "mission_id must be > 0",
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        # Read the current turno — do NOT increment yet.
+        # Hermes may advance the session turn between tool calls within
+        # the same message, so we must capture the value that is valid at
+        # call time and defer incrementing until end_turn commits.
+        turno_actual = persistence.get_session_turn(session_id)
+
+        # Create intento scoped to THIS turno (the one active at call time)
+        intento_id = persistence.create_intento(
+            session_id=session_id,
+            project=project,
+            mission_id=mission_id,
+            checklist_item_id=checklist_item_id,
+            turno=turno_actual,
+        )
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "intento_id": intento_id,
+                "turno": turno_actual,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception as exc:
+        logger.exception("begin_turn failed")
+        return json.dumps(
+            {"error": f"Failed to begin turn: {exc}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+
+@app.tool()
+def end_turn(intento_id: int, status: str = "success") -> str:
+    """End the current turn by completing a turno-scoped intento.
+
+    This is the second half of the consolidated two-tool intent flow.
+    It validates that the intento was created during the current turn
+    (turno-scoped), then marks it as completed.
+
+    Args:
+        intento_id: Numeric intento ID returned by :func:`begin_turn`.
+        status:     Final status (default: "success").
+
+    Returns:
+        JSON string confirming completion, or error if the intento
+        does not belong to the current turn.
+    """
+    # Look up the intento
+    intento = persistence.get_intento(intento_id)
+    if intento is None:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"intento_id={intento_id} not found",
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Validate turn scope
+    session_turno = persistence.get_session_turn(intento["session_id"])
+    if intento["turno"] != session_turno:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    f"intento_id={intento_id} belongs to turn {intento['turno']}, "
+                    f"but current turn is {session_turno}. "
+                    "Call begin_turn() first to start the current turn."
+                ),
+                "intento_turno": intento["turno"],
+                "current_turno": session_turno,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Complete the intento
+    persistence.complete_intento(
+        intento_id=intento_id,
+        status=status,
+        gates_passed=0,
+    )
+
+    # Increment session turn — now that the intento is committed.
+    # This ensures the turno is advanced exactly once per begin+end cycle.
+    persistence.increment_session_turn(intento["session_id"])
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "intento_id": intento_id,
+            "turno": session_turno,
         },
         ensure_ascii=False,
         default=str,

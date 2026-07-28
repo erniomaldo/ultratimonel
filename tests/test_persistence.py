@@ -2,6 +2,7 @@
 Unit tests for persistence.py — CRUD, upsert, mission lifecycle.
 """
 
+import sqlite3
 import sys
 import os
 import tempfile
@@ -24,9 +25,7 @@ def db():
 class TestSchema:
     def test_schema_version(self, db):
         with db._conn() as conn:
-            row = conn.execute(
-                "SELECT MAX(version) FROM schema_version"
-            ).fetchone()
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
             assert row[0] == SCHEMA_VERSION
 
     def test_tables_exist(self, db):
@@ -150,7 +149,14 @@ class TestMissions:
 
     def test_upsert_updates_existing(self, db):
         db.upsert_mission(deck_task_id=10, project="p", title="Old", status="pendiente")
-        mid = db.upsert_mission(deck_task_id=10, project="p", title="New", status="completada", checklist_done=3, checklist_total=3)
+        mid = db.upsert_mission(
+            deck_task_id=10,
+            project="p",
+            title="New",
+            status="completada",
+            checklist_done=3,
+            checklist_total=3,
+        )
         mission = db.get_mission(mid)
         assert mission["title"] == "New"
         assert mission["status"] == "completada"
@@ -159,8 +165,11 @@ class TestMissions:
 
     def test_upsert_mission_with_checklist(self, db):
         mid = db.upsert_mission(
-            deck_task_id=99, project="p", title="Task",
-            checklist_total=5, checklist_done=2,
+            deck_task_id=99,
+            project="p",
+            title="Task",
+            checklist_total=5,
+            checklist_done=2,
         )
         mission = db.get_mission(mid)
         assert mission["checklist_total"] == 5
@@ -187,7 +196,9 @@ class TestMissions:
         the inner call would block forever (same thread, same lock). With
         RLock() the reentrant acquire succeeds.
         """
-        mid = db.upsert_mission(deck_task_id=42, project="reentrant", title="RLock Test")
+        mid = db.upsert_mission(
+            deck_task_id=42, project="reentrant", title="RLock Test"
+        )
         db.upsert_checklist_item(mid, item_index=0, text="Item 1")
         db.upsert_checklist_item(mid, item_index=1, text="Item 2")
 
@@ -208,9 +219,7 @@ class TestDbFile:
             p = Persistence(db_path=db_path)
             assert os.path.exists(db_path)
             with p._conn() as conn:
-                row = conn.execute(
-                    "SELECT MAX(version) FROM schema_version"
-                ).fetchone()
+                row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
                 assert row[0] == SCHEMA_VERSION
         finally:
             os.unlink(db_path)
@@ -223,5 +232,60 @@ class TestDbFile:
             with p._conn() as conn:
                 row = conn.execute("PRAGMA journal_mode").fetchone()
                 assert row[0] == "wal"
+        finally:
+            os.unlink(db_path)
+
+
+class TestCreateIntento:
+    """Tests for create_intento validation and foreign key enforcement."""
+
+    def test_rejects_mission_id_zero(self, db):
+        with pytest.raises(ValueError, match="mission_id must be > 0"):
+            db.create_intento("sess-1", "p", mission_id=0, checklist_item_id=42)
+
+    def test_rejects_mission_id_negative(self, db):
+        with pytest.raises(ValueError, match="mission_id must be > 0"):
+            db.create_intento("sess-1", "p", mission_id=-99, checklist_item_id=42)
+
+    def test_accepts_valid_mission_id(self, db):
+        mid = db.upsert_mission(deck_task_id=7, project="p", title="Test")
+        cid = db.upsert_checklist_item(mid, item_index=0, text="Item 1")
+        intento_id = db.create_intento(
+            "sess-1", "p", mission_id=mid, checklist_item_id=cid
+        )
+        assert intento_id > 0
+
+    def test_foreign_keys_enabled_on_connection(self):
+        """Verify PRAGMA foreign_keys=ON fires on every new connection."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            p = Persistence(db_path=db_path)
+
+            # First connection — should be ON
+            with p._conn() as conn:
+                row = conn.execute("PRAGMA foreign_keys").fetchone()
+                assert row[0] == 1, "foreign_keys must be ON on first _conn()"
+
+            # Create a second independent connection to verify it's also ON
+            with p._conn() as conn:
+                row = conn.execute("PRAGMA foreign_keys").fetchone()
+                assert row[0] == 1, "foreign_keys must be ON on subsequent connections"
+        finally:
+            os.unlink(db_path)
+
+    def test_foreign_key_violation_blocks_insert(self):
+        """Verify that a FK violation (bad checklist_item_id) is rejected."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            p = Persistence(db_path=db_path)
+
+            # Try to create an intento referencing a non-existent checklist item.
+            # With foreign_keys=ON this should raise an OperationalError.
+            with pytest.raises(
+                sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"
+            ):
+                p.create_intento("sess-1", "p", mission_id=1, checklist_item_id=99999)
         finally:
             os.unlink(db_path)

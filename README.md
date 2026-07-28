@@ -11,6 +11,7 @@ Además del enforcement de gates, Ultratimonel proporciona:
 - **Dashboard web** (NES.css) para visualizar misiones y gates
 - **Sistema de Misiones** sincronizado con Nextcloud Deck
 - **endTurn Bouncer** — validación server-side en `complete_intento()`
+- **begin_turn / end_turn** — flujo consolidado: 2 llamadas MCP por turno (reemplaza record_intento + complete_intento)
 - **Card update** seguro — actualiza descripciones sin pisar títulos
 
 ---
@@ -127,10 +128,13 @@ Ver `scripts/deploy_soul.sh` para despliegue automatizado.
 ```
 1. Plugin (automático): pre_llm_call → assert_gates() → inyecta contexto gates
 2. Agente: Paso 1 → assert_gates() refresca contexto
-3. Agente: Trabajo del turno (tools, respuestas)
-4. Agente: Paso 5 → record_intento() + complete_intento()
-5. Plugin (automático): pre_tool_call bouncer → bloquea si gates no PASS
+3. Agente: Paso 4b → begin_turn(mission_id, checklist_item_id) crea intento scoped a turno
+4. Agente: Trabajo del turno (tools, respuestas)
+5. Agente: Paso 5 → end_turn(intento_id) completa el intento
+6. Plugin (automático): pre_tool_call bouncer → bloquea si gates no PASS
 ```
+
+Nota: `record_intento()` y `complete_intento()` están **deprecated** pero siguen disponibles para backward compatibility. El flujo recomendado es `begin_turn` + `end_turn`.
 
 Nota: el plugin y el agente ejecutan `assert_gates()` de forma independiente.
 Ambos escriben en la misma DB (`ULTRATIMONEL_DB_PATH`). El agente ve las gates
@@ -161,9 +165,9 @@ no tiene acceso a los mismos MCP servers. Para evitar inconsistencias,
 
 ---
 
-## Tools (16)
+## Tools (18)
 
-Ultratimonel expone 16 MCP tools:
+Ultratimonel expone 18 MCP tools:
 
 ### Núcleo (Gates)
 
@@ -199,10 +203,12 @@ Ultratimonel expone 16 MCP tools:
 
 ### Intentos (ciclos assert_gates)
 
-| Tool | Descripción |
+|| Tool | Descripción |
 |------|-------------|
-| `record_intento(session_id, project, mission_id, checklist_item_id)` | Crea un intento para un checklist item |
-| `complete_intento(intento_id, status, gates_passed, session_id, project)` | Finaliza un intento con validación endTurn bouncer |
+| `begin_turn(mission_id, checklist_item_id)` | Crea un intento scoped a turno y retorna intento_id (flujo recomendado) |
+| `end_turn(intento_id, status="success")` | Completa el intento del turno actual |
+| `record_intento(session_id, project, mission_id, checklist_item_id)` | ⚠️ DEPRECATED — usa begin_turn() en su lugar |
+| `complete_intento(intento_id, status, gates_passed, session_id, project)` | ⚠️ DEPRECATED — usa end_turn() en su lugar |
 | `delete_intento(intento_id)` | Elimina un intento por ID |
 
 ### Deck Cards
@@ -279,7 +285,7 @@ SQLite con WAL journal mode. Ruta por defecto: `~/.hermes/ultratimonel.db`
 | `actions` | Acciones registradas por el agente |
 | `missions` | Ciclo de vida de misiones (sincronizadas desde Deck) |
 | `checklist_items` | Items de checklist dentro de cada misión |
-| `intentos` | Intentos/ciclos de assert_gates por checklist item |
+| `intentos` | Intentos/ciclos de assert_gates por checklist item (con turno tracking) |
 
 ### Parámetros
 
