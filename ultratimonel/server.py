@@ -345,13 +345,24 @@ def server(action: str) -> str:
     """Control the Ultratimonel Dashboard web server.
 
     Manages a subprocess running the http.server (stdlib) dashboard GUI.
-    The dashboard reads from the same SQLite DB as the gates.
+    The dashboard reads from the same SQLite DB as the gates and writes
+    persistent logs to {db_dir}/logs/dashboard_{stdout,stderr}.log.
+
+    Stability features:
+      - Fixed port (DASHBOARD_PORT=3005) with SO_REUSEADDR for immediate restart.
+      - Subprocess stdout/stderr captured to append-mode log files (survive restarts).
+      - Status returns exit_code + stderr_tail when the subprocess has exited.
+      - Immediate post-start crash returns a hint pointing to the log file.
 
     Args:
         action: One of "status", "start", "stop", "restart".
 
     Returns:
-        JSON string with port, pid, url, and running status.
+        JSON string with port, pid, url, and running status. Additional fields
+        may appear depending on action and subprocess state:
+          - exit_code (int): Subprocess exit code when not running (status action).
+          - stderr_tail (str): Last 2000 chars of residual stderr (status action).
+          - hint (str): Path to dashboard_stderr.log for immediate crash diagnosis.
     """
     global _dashboard_proc, _dashboard_port
 
@@ -379,8 +390,19 @@ def server(action: str) -> str:
             return json.dumps(_status_dict(False))
         ret = _dashboard_proc.poll()
         if ret is not None:
-            _dashboard_proc = None
-            return json.dumps({**_status_dict(False), "exit_code": ret})
+            # NO null tear — solo reportar estado. Leer stderr residual.
+            stderr = ""
+            try:
+                if _dashboard_proc.stderr:
+                    raw = _dashboard_proc.stderr.read()
+                    stderr = raw if isinstance(raw, str) else raw.decode(errors="replace")
+            except Exception:
+                stderr = "(log file: ~/.hermes/logs/dashboard_stderr.log)"
+            return json.dumps({
+                **_status_dict(False),
+                "exit_code": ret,
+                "stderr_tail": stderr[-2000:] if stderr else "",
+            })
         return json.dumps(_status_dict(True))
 
     # ── stop ─────────────────────────────────────────────────────────
@@ -426,18 +448,24 @@ def server(action: str) -> str:
                 }
             )
 
-        # Find a free port
-        _dashboard_port = _find_free_port(DASHBOARD_PORT)
+        # Usar puerto fijo — dashboard_server.py tiene SO_REUSEADDR
+        _dashboard_port = DASHBOARD_PORT
 
         # Determine which python to use
         python = sys.executable
+
+        # Logs persistentes (no PIPE efímero)
+        log_dir = os.path.join(os.path.dirname(db_path), "logs") if os.path.dirname(db_path) else os.path.expanduser("~/.hermes/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_out = open(os.path.join(log_dir, f"dashboard_stdout.log"), "a")
+        log_err = open(os.path.join(log_dir, f"dashboard_stderr.log"), "a")
 
         try:
             _dashboard_proc = subprocess.Popen(
                 [python, script, str(_dashboard_port)],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=log_out,
+                stderr=log_err,
                 env={**os.environ, "ULTRATIMONEL_DB_PATH": db_path},
             )
         except FileNotFoundError:
@@ -451,16 +479,11 @@ def server(action: str) -> str:
         time.sleep(0.5)
         ret = _dashboard_proc.poll()
         if ret is not None:
-            stderr = (
-                _dashboard_proc.stderr.read().decode(errors="replace")
-                if _dashboard_proc.stderr
-                else ""
-            )
             _dashboard_proc = None
             return json.dumps(
                 {
                     "error": f"Dashboard exited immediately (code {ret})",
-                    "stderr": stderr[:500],
+                    "hint": f"Check logs: {log_dir}/dashboard_stderr.log",
                 }
             )
 
@@ -486,18 +509,33 @@ def server(action: str) -> str:
                     pass
             _dashboard_proc = None
 
-        # Then start
-        _dashboard_port = _find_free_port(DASHBOARD_PORT)
+        # Then start — same pattern as 'start' block
+        if script is None:
+            return json.dumps(
+                {
+                    "error": "dashboard_server.py not found",
+                    "hint": "Expected at ultratimonel/dashboard_server.py",
+                }
+            )
+
+        _dashboard_port = DASHBOARD_PORT
         python = sys.executable
+
+        log_dir = os.path.join(os.path.dirname(db_path), "logs") if os.path.dirname(db_path) else os.path.expanduser("~/.hermes/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_out = open(os.path.join(log_dir, f"dashboard_stdout.log"), "a")
+        log_err = open(os.path.join(log_dir, f"dashboard_stderr.log"), "a")
 
         try:
             _dashboard_proc = subprocess.Popen(
                 [python, script, str(_dashboard_port)],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=log_out,
+                stderr=log_err,
                 env={**os.environ, "ULTRATIMONEL_DB_PATH": db_path},
             )
+        except FileNotFoundError:
+            return json.dumps({"error": f"Python not found: {python}"})
         except Exception as exc:
             return json.dumps({"error": f"Restart failed: {exc}"})
 
@@ -507,7 +545,12 @@ def server(action: str) -> str:
         ret = _dashboard_proc.poll()
         if ret is not None:
             _dashboard_proc = None
-            return json.dumps({"error": f"Restart failed (exit code {ret})"})
+            return json.dumps(
+                {
+                    "error": f"Restart failed (exit code {ret})",
+                    "hint": f"Check logs: {log_dir}/dashboard_stderr.log",
+                }
+            )
 
         return json.dumps(
             {
