@@ -122,7 +122,7 @@ def run_gate(
             result.message = "Gate not executed (no executor)"
     except Exception as exc:
         logger.warning("Gate %s failed: %s", config.name, exc)
-        result.state = WARN if config.mandatory else SKIP
+        result.state = BLOCK if config.mandatory else WARN
         result.message = f"Gate {config.name} unavailable: {exc}"
         result.result_data = None
 

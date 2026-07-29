@@ -284,9 +284,11 @@ class TestEndTurn:
             "id": 7,
             "session_id": "sess-1",
             "turno": 3,
+            "project": "testproj",
         }
         mock_persistence.get_session_turn.return_value = 3
         mock_persistence.increment_session_turn.return_value = 4
+        mock_persistence.list_gate_states.return_value = []
 
         result = json.loads(end_turn(7, status="success"))
         assert result["status"] == "ok"
@@ -296,6 +298,86 @@ class TestEndTurn:
             intento_id=7, status="success", gates_passed=0
         )
         mock_persistence.increment_session_turn.assert_called_once_with("sess-1")
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_calculates_gates_passed_from_gate_states(self, mock_persistence):
+        """end_turn reads gate states from persistence and calculates gates_passed."""
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            "id": 7,
+            "session_id": "sess-1",
+            "turno": 3,
+            "project": "testproj",
+        }
+        mock_persistence.get_session_turn.return_value = 3
+        mock_persistence.increment_session_turn.return_value = 4
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": True},
+            {"gate_name": "1b", "state": "PASS", "mandatory": True},
+            {"gate_name": "1e", "state": "PASS", "mandatory": True},
+        ]
+
+        result = json.loads(end_turn(7, status="success"))
+        assert result["status"] == "ok"
+        mock_persistence.list_gate_states.assert_called_once_with("sess-1", "testproj")
+        mock_persistence.complete_intento.assert_called_once_with(
+            intento_id=7, status="success", gates_passed=3
+        )
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_counts_pass_and_skip_gates(self, mock_persistence):
+        """end_turn counts both PASS and SKIP states in gates_passed."""
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            "id": 7,
+            "session_id": "sess-1",
+            "turno": 3,
+            "project": "testproj",
+        }
+        mock_persistence.get_session_turn.return_value = 3
+        mock_persistence.increment_session_turn.return_value = 4
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": True},
+            {"gate_name": "1b", "state": "PASS", "mandatory": True},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": False},
+            {"gate_name": "1e", "state": "PASS", "mandatory": True},
+        ]
+
+        result = json.loads(end_turn(7, status="success"))
+        assert result["status"] == "ok"
+        mock_persistence.complete_intento.assert_called_once_with(
+            intento_id=7, status="success", gates_passed=4
+        )
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_hardware_fixed_zero_no_longer_occurs(self, mock_persistence):
+        """gates_passed is no longer hardcoded to 0 — it reflects real gate states."""
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            "id": 7,
+            "session_id": "sess-1",
+            "turno": 3,
+            "project": "testproj",
+        }
+        mock_persistence.get_session_turn.return_value = 3
+        mock_persistence.increment_session_turn.return_value = 4
+        # 3 out of 4 gates passed — gates_passed must NOT be 0
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": True},
+            {"gate_name": "1b", "state": "BLOCK", "mandatory": True},
+            {"gate_name": "1c", "state": "WARN", "mandatory": False},
+            {"gate_name": "1e", "state": "PASS", "mandatory": True},
+        ]
+
+        result = json.loads(end_turn(7, status="success"))
+        assert result["status"] == "ok"
+        call_kwargs = mock_persistence.complete_intento.call_args[1]
+        assert call_kwargs["gates_passed"] == 2, (
+            f"gates_passed should be 2 (2 PASS gates), got {call_kwargs['gates_passed']}"
+        )
 
     @patch("ultratimonel.server.persistence")
     def test_end_turn_rejects_foreign_turn(self, mock_persistence):

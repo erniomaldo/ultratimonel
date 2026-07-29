@@ -1430,11 +1430,15 @@ def end_turn(intento_id: int, status: str = "success") -> str:
             default=str,
         )
 
+    # Calculate actual gates_passed from current gate states for this session
+    gate_states = persistence.list_gate_states(intento["session_id"], intento["project"])
+    gates_passed = sum(1 for g in gate_states if g.get("state") in ("PASS", "SKIP"))
+
     # Complete the intento
     persistence.complete_intento(
         intento_id=intento_id,
         status=status,
-        gates_passed=0,
+        gates_passed=gates_passed,
     )
 
     # Increment session turn — now that the intento is committed.
