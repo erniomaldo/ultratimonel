@@ -1,0 +1,13 @@
+name: ultratimonel-preflight
+version: 2.0.0
+description: >-
+  Implementa el patrón Nikhil Verma de mandatory tool contracts en Hermes.
+  pre_tool_call bouncer bloquea tools críticas si assert_gates no se ha
+  ejecutado o si las 4 gates no están PASS. post_tool_call bloquea todas
+  las tools después de end_turn para forzar el ciclo begin→trabajo→end.
+author: "Ultratimonel"
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
