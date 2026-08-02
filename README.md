@@ -80,27 +80,41 @@ mcp_servers:
 ### 2. Plugin preflight (`ultratimonel-preflight`)
 
 El plugin implementa el patrón **Nikhil Verma de mandatory tool contracts**.
-Requiere 3 archivos en `~/.hermes/plugins/ultratimonel-preflight/`:
+**La fuente de verdad del plugin vive DENTRO de este repo** en `ultratimonel/`:
 
-| Archivo | Propósito |
-|---------|-----------|
-| `plugin.yaml` | Declaración del plugin (nombre, versión, hooks) |
-| `__init__.py` | Lógica: `pre_llm_call` ejecuta gates, `pre_tool_call` bouncer bloquea tools sin gates PASS |
-| `ultratimonel_client.py` | Cliente MCP stdio para comunicación con el server ultratimonel |
+| Archivo en el repo | Propósito |
+|--------------------|-----------|
+| `ultratimonel/plugin_preflight.py` | Lógica: `pre_llm_call` ejecuta gates, `pre_tool_call` bouncer bloquea tools sin gates PASS, `post_tool_call` bloquea todas las tools después de `end_turn` (1 ciclo por respuesta) |
+| `ultratimonel/ultratimonel_client.py` | Cliente MCP stdio para comunicación con el server ultratimonel |
+| `ultratimonel/plugin.yaml` | Declaración del plugin (nombre, versión, hooks) |
 
-**plugin.yaml:**
+> ⚠️ **REGLAS DE SINCRONÍA — LÉELAS ANTES DE TOCAR EL PLUGIN:**
+>
+> 1. **NO muevas ni copies el plugin fuera del repo.** Si copias los archivos a
+>    otra ubicación (p. ej. `~/.hermes/plugins/ultratimonel-preflight/`) y luego
+>    actualizas el repo, **la copia externa queda desincronizada** — el runtime
+>    seguiría corriendo una versión vieja sin los últimos fixes.
+> 2. **El repo es la única fuente autorizada.** Cualquier cambio al plugin se
+>    hace aquí (commit + PR) y desde aquí se despliega a la instalación.
+> 3. Al instalar/desplegar, `ultratimonel/plugin_preflight.py` se copia a
+>    `~/.hermes/plugins/ultratimonel-preflight/__init__.py` (mismo contenido,
+>    distinto nombre de archivo dentro del paquete).
+
+**plugin.yaml (v2.0.0):**
 ```yaml
 name: ultratimonel-preflight
-version: 1.1.0
+version: 2.0.0
 description: >-
   Implementa el patrón Nikhil Verma de mandatory tool contracts en Hermes.
   pre_tool_call bouncer bloquea tools críticas si assert_gates no se ha
-  ejecutado o si las 4 gates no están PASS.
+  ejecutado o si las 4 gates no están PASS. post_tool_call bloquea todas
+  las tools después de end_turn para forzar el ciclo begin→trabajo→end.
 author: "Ultratimonel"
 provides_hooks:
   - on_session_start
   - pre_llm_call
   - pre_tool_call
+  - post_tool_call
 ```
 
 ### 3. Activar en config.yaml
