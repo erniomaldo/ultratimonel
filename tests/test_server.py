@@ -852,3 +852,197 @@ class TestFluxConsolidated:
         assert end_result["status"] == "ok"
         assert end_result["final_status"] == "fail"
         assert end_result["gates_passed"] == 3
+
+
+class TestDashboardStability:
+    """Tests for dashboard stability fixes (PR #11 port)."""
+
+    @patch("ultratimonel.server.os.path.dirname")
+    def test_dashboard_log_dir_uses_db_parent(self, mock_dirname):
+        """_dashboard_log_dir uses parent of db_path when valid."""
+        from ultratimonel.server import _dashboard_log_dir
+        import ultratimonel.server as srv
+
+        original = srv.db_path
+        srv.db_path = "/home/user/.hermes/ultratimonel.db"
+        mock_dirname.return_value = "/home/user/.hermes"
+        try:
+            result = _dashboard_log_dir()
+            assert result == "/home/user/.hermes/logs"
+        finally:
+            srv.db_path = original
+
+    @patch("ultratimonel.server.os.path.dirname")
+    def test_dashboard_log_dir_fallback_on_root(self, mock_dirname):
+        """_dashboard_log_dir falls back when dirname is '/'."""
+        from ultratimonel.server import _dashboard_log_dir
+        import ultratimonel.server as srv
+
+        original = srv.db_path
+        srv.db_path = "/ultratimonel.db"
+        mock_dirname.return_value = "/"
+        try:
+            result = _dashboard_log_dir()
+            assert result == os.path.expanduser("~/.hermes/logs")
+        finally:
+            srv.db_path = original
+
+    @patch("ultratimonel.server.os.path.dirname")
+    def test_dashboard_log_dir_fallback_on_empty(self, mock_dirname):
+        """_dashboard_log_dir falls back when dirname is empty."""
+        from ultratimonel.server import _dashboard_log_dir
+        import ultratimonel.server as srv
+
+        original = srv.db_path
+        srv.db_path = "ultratimonel.db"
+        mock_dirname.return_value = ""
+        try:
+            result = _dashboard_log_dir()
+            assert result == os.path.expanduser("~/.hermes/logs")
+        finally:
+            srv.db_path = original
+
+    def test_read_stderr_tail_from_file(self, tmp_path):
+        """_read_stderr_tail reads the last 2000 chars from the log file."""
+        from ultratimonel.server import _read_stderr_tail
+
+        log_dir = str(tmp_path)
+        log_file = os.path.join(log_dir, "dashboard_stderr.log")
+        # Write enough content so line2 appears in the last 2000 chars
+        prefix = "a" * 2100
+        tail_content = "line1\nline2\nERROR: crash here"
+        with open(log_file, "w") as f:
+            f.write(prefix + tail_content)
+
+        result = _read_stderr_tail(log_dir)
+        assert len(result) == 2000
+        assert "line2" in result
+        assert "crash here" in result
+
+    def test_read_stderr_tail_missing_file(self, tmp_path):
+        """_read_stderr_tail returns empty when log file is missing."""
+        from ultratimonel.server import _read_stderr_tail
+
+        result = _read_stderr_tail(str(tmp_path))
+        assert result == ""
+
+    @patch("ultratimonel.server.subprocess.Popen")
+    @patch("ultratimonel.server._dashboard_script")
+    @patch("ultratimonel.server.os.makedirs")
+    def test_spawn_closes_handles_on_success(self, mock_makedirs, mock_script, mock_popen):
+        """Log handles are closed after Popen succeeds (CRÍTICO 2)."""
+        from ultratimonel.server import server
+        import ultratimonel.server as srv
+
+        mock_script.return_value = "/fake/dashboard_server.py"
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+
+        original_port = srv._dashboard_port
+        srv._dashboard_port = 3005
+        try:
+            result = json.loads(server("start"))
+            assert result["running"] is True
+            # Handles should be closed (Popen called with them, then closed)
+            mock_popen.assert_called_once()
+        finally:
+            srv._dashboard_port = original_port
+
+    @patch("ultratimonel.server.subprocess.Popen")
+    @patch("ultratimonel.server._dashboard_script")
+    @patch("ultratimonel.server.os.makedirs")
+    def test_spawn_closes_handles_on_crash(self, mock_makedirs, mock_script, mock_popen):
+        """Log handles are closed even when dashboard crashes immediately (CRÍTICO 2)."""
+        from ultratimonel.server import server
+        import ultratimonel.server as srv
+
+        mock_script.return_value = "/fake/dashboard_server.py"
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # immediate crash
+        mock_popen.return_value = mock_proc
+
+        original_port = srv._dashboard_port
+        srv._dashboard_port = 3005
+        try:
+            result = json.loads(server("start"))
+            assert "hint" in result
+            assert result["error"] is not None
+        finally:
+            srv._dashboard_port = original_port
+
+    @patch("ultratimonel.server.subprocess.Popen")
+    @patch("ultratimonel.server._dashboard_script")
+    @patch("ultratimonel.server.os.makedirs")
+    def test_status_returns_stderr_tail_from_file(self, mock_makedirs, mock_script, mock_popen, tmp_path):
+        """status action reads stderr_tail from log file (CRÍTICO 1)."""
+        from ultratimonel.server import server
+        import ultratimonel.server as srv
+
+        mock_script.return_value = "/fake/dashboard_server.py"
+
+        # Write some content to the fake log file
+        log_dir = str(tmp_path)
+        log_file = os.path.join(log_dir, "dashboard_stderr.log")
+        with open(log_file, "w") as f:
+            f.write("ERROR: dashboard crashed\ntraceback here\n")
+
+        # Patch _dashboard_log_dir to return our temp dir
+        with patch("ultratimonel.server._dashboard_log_dir", return_value=log_dir):
+            # Simulate a crashed process
+            mock_proc = MagicMock()
+            mock_proc.poll.return_value = 2
+            original_proc = srv._dashboard_proc
+            srv._dashboard_proc = mock_proc
+
+            try:
+                result = json.loads(server("status"))
+                assert "exit_code" in result
+                assert result["exit_code"] == 2
+                assert "stderr_tail" in result
+                assert "crashed" in result["stderr_tail"]
+            finally:
+                srv._dashboard_proc = original_proc
+
+    @patch("ultratimonel.server.subprocess.Popen")
+    @patch("ultratimonel.server._dashboard_script")
+    @patch("ultratimonel.server.os.makedirs")
+    def test_start_uses_fixed_port(self, mock_makedirs, mock_script, mock_popen):
+        """start action uses DASHBOARD_PORT directly, not _find_free_port."""
+        from ultratimonel.server import server, DASHBOARD_PORT
+        import ultratimonel.server as srv
+
+        mock_script.return_value = "/fake/dashboard_server.py"
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+
+        original_port = srv._dashboard_port
+        srv._dashboard_port = 9999  # different from DASHBOARD_PORT
+        try:
+            result = json.loads(server("start"))
+            assert result["port"] == DASHBOARD_PORT
+        finally:
+            srv._dashboard_port = original_port
+
+    @patch("ultratimonel.server.subprocess.Popen")
+    @patch("ultratimonel.server._dashboard_script")
+    @patch("ultratimonel.server.os.makedirs")
+    def test_restart_returns_hint_on_crash(self, mock_makedirs, mock_script, mock_popen):
+        """restart action returns hint on immediate crash (F-DS-06)."""
+        from ultratimonel.server import server, DASHBOARD_PORT
+        import ultratimonel.server as srv
+
+        mock_script.return_value = "/fake/dashboard_server.py"
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # crash
+        mock_popen.return_value = mock_proc
+
+        original_port = srv._dashboard_port
+        srv._dashboard_port = DASHBOARD_PORT
+        try:
+            result = json.loads(server("restart"))
+            assert "hint" in result
+            assert "error" in result
+        finally:
+            srv._dashboard_port = original_port

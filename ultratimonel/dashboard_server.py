@@ -25,6 +25,7 @@ Endpoints:
 import json
 import logging
 import os
+import socket
 import sqlite3
 import socketserver
 import sys
@@ -32,11 +33,45 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] dashboard: %(message)s",
-    stream=sys.stderr,
-)
+# ── Logging a archivo persistente + stderr (deferred init) ──
+_LOG_DIR: Path | None = None
+_LOG_FILE: str | None = None
+
+
+def _resolve_log_dir() -> Path:
+    """Return the log directory, creating it if needed."""
+    global _LOG_DIR
+    if _LOG_DIR is None:
+        _LOG_DIR = Path(os.environ.get(
+            "ULTRATIMONEL_LOG_DIR",
+            str(Path.home() / ".hermes" / "logs"),
+        ))
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return _LOG_DIR
+
+
+def init_logging() -> None:
+    """Initialize persistent logging (call once at startup).
+
+    Writes to both a file (~/.hermes/logs/dashboard.log) and stderr.
+    Defers LOG_DIR creation until first call so import-time side-effects
+    are avoided.
+    """
+    global _LOG_FILE
+    log_dir = _resolve_log_dir()
+    _LOG_FILE = str(log_dir / "dashboard.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] dashboard: %(message)s",
+        handlers=[
+            logging.FileHandler(_LOG_FILE),
+            logging.StreamHandler(sys.stderr),
+        ],
+    )
+    logger = logging.getLogger("dashboard")
+    logger.info("Dashboard log file: %s", _LOG_FILE)
+
+
 logger = logging.getLogger("dashboard")
 
 HERE = Path(__file__).parent.resolve()
@@ -67,8 +102,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     # ── helpers ───────────────────────────────────────────────────────
 
-    def _db(self):
-        conn = sqlite3.connect(DB_PATH)
+    def _db(self) -> sqlite3.Connection:
+        """Open a SQLite connection with a 5-second lock timeout.
+
+        The timeout prevents indefinite blocking when another process holds
+        a write lock on the dashboard database. If the timeout expires,
+        sqlite3.OperationalError is raised and the server continues running.
+        """
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -443,12 +484,40 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 
 def create_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT) -> HTTPServer:
+    """Create an HTTPServer with SO_REUSEADDR for immediate port reclamation.
+
+    Sets socket.SO_REUSEADDR=1 so that the port is reclaimable immediately
+    after an ungraceful exit (crash, OOM, signal). Without this option the
+    kernel keeps the socket in TIME_WAIT for ~60-120s and any new bind fails
+    with OSError errno 98.
+
+    Args:
+        host: Bind address (default: DASHBOARD_HOST, "127.0.0.1").
+        port: Bind port (default: DEFAULT_PORT, 3005).
+
+    Returns:
+        Configured HTTPServer instance.
+    """
     server = HTTPServer((host, port), DashboardHandler)
+    # SO_REUSEADDR — permite reocupar puerto inmediatamente tras caída
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.timeout = 1.0
     return server
 
 
-def run_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT):
+def run_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT) -> None:
+    """Run the dashboard HTTP server with crash-safe shutdown handling.
+
+    Wraps serve_forever() in a try/except/finally block so that unexpected
+    exceptions are logged with full traceback (logger.exception) and the
+    server shuts down cleanly. KeyboardInterrupt logs a graceful SIGINT
+    message before shutdown. The finally block always logs exit.
+
+    Args:
+        host: Bind address (default: DASHBOARD_HOST, "127.0.0.1").
+        port: Bind port (default: DEFAULT_PORT, 3005).
+    """
+    init_logging()
     server = create_server(host, port)
     url = f"http://localhost:{port}"
     logger.info("Dashboard listening on %s", url)
@@ -458,8 +527,14 @@ def run_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT):
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Shutting down dashboard server")
+        logger.info("Shutting down dashboard server (SIGINT)")
         server.shutdown()
+    except Exception as exc:
+        # logger.exception includes full traceback — critical for post-mortem.
+        logger.exception("Dashboard server crashed: %s", exc)
+        server.shutdown()
+    finally:
+        logger.info("Dashboard server exited")
 
 
 if __name__ == "__main__":

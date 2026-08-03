@@ -407,18 +407,44 @@ def complete_gate(
 # ── Dashboard server tool ──────────────────────────────────────────────────
 
 
+def _dashboard_log_dir() -> str:
+    """Return the log directory for dashboard subprocess logs.
+
+    Uses the parent directory of db_path when it is a real directory
+    (not "/" or empty). Falls back to ~/.hermes/logs otherwise.
+    """
+    parent = os.path.dirname(db_path)
+    if parent and parent != "/":
+        return os.path.join(parent, "logs")
+    return os.path.expanduser("~/.hermes/logs")
+
+
+def _read_stderr_tail(log_dir: str) -> str:
+    """Read the last 2000 chars of dashboard_stderr.log, or empty string."""
+    log_path = os.path.join(log_dir, "dashboard_stderr.log")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return content[-2000:] if content else ""
+    except OSError:
+        return ""
+
+
 @app.tool()
 def server(action: str) -> str:
     """Control the Ultratimonel Dashboard web server.
 
     Manages a subprocess running the http.server (stdlib) dashboard GUI.
     The dashboard reads from the same SQLite DB as the gates.
+    Subprocess stdout/stderr are appended to persistent log files.
 
     Args:
         action: One of "status", "start", "stop", "restart".
 
     Returns:
         JSON string with port, pid, url, and running status.
+        On crash, returns a `hint` field pointing to the log file.
+        On status after exit, returns `exit_code` and `stderr_tail`.
     """
     global _dashboard_proc, _dashboard_port
 
@@ -440,14 +466,77 @@ def server(action: str) -> str:
             "script": script,
         }
 
+    def _spawn_dashboard(port: int) -> tuple[subprocess.Popen | None, str | None]:
+        """Spawn the dashboard subprocess with persistent log files.
+
+        Returns (proc, error_hint) — proc is None on failure, error_hint
+        points to the stderr log file for crash diagnosis.
+        """
+        global _dashboard_port
+        # Usar puerto fijo — dashboard_server.py tiene SO_REUSEADDR
+        _dashboard_port = DASHBOARD_PORT
+        python = sys.executable
+
+        log_dir = _dashboard_log_dir()
+        os.makedirs(log_dir, exist_ok=True)
+        log_out_path = os.path.join(log_dir, "dashboard_stdout.log")
+        log_err_path = os.path.join(log_dir, "dashboard_stderr.log")
+
+        log_out = None
+        log_err = None
+        try:
+            log_out = open(log_out_path, "a", encoding="utf-8")
+            log_err = open(log_err_path, "a", encoding="utf-8")
+            _dashboard_proc = subprocess.Popen(
+                [python, script, str(port)],
+                stdin=subprocess.DEVNULL,
+                stdout=log_out,
+                stderr=log_err,
+                env={**os.environ, "ULTRATIMONEL_DB_PATH": db_path},
+            )
+        except FileNotFoundError:
+            return None, f"Python not found: {python}"
+        except Exception as exc:
+            return None, f"Failed to start dashboard: {exc}"
+        finally:
+            # CRÍTICO 2: cerrar handles en TODOS los paths (éxito y error)
+            if log_out is not None:
+                try:
+                    log_out.close()
+                except OSError:
+                    pass
+            if log_err is not None:
+                try:
+                    log_err.close()
+                except OSError:
+                    pass
+
+        # Brief wait to catch immediate crashes
+        import time
+        time.sleep(0.5)
+        ret = _dashboard_proc.poll()
+        if ret is not None:
+            _dashboard_proc = None
+            return None, f"Check logs: {log_err_path}"
+
+        return _dashboard_proc, None
+
     # ── status ───────────────────────────────────────────────────────
     if action == "status":
         if _dashboard_proc is None:
             return json.dumps(_status_dict(False))
         ret = _dashboard_proc.poll()
         if ret is not None:
+            # CRÍTICO 1: leer stderr_tail del archivo de log, no del PIPE
+            # (que es None cuando se usa stderr=log_err file)
+            log_dir = _dashboard_log_dir()
+            stderr_tail = _read_stderr_tail(log_dir)
             _dashboard_proc = None
-            return json.dumps({**_status_dict(False), "exit_code": ret})
+            return json.dumps({
+                **_status_dict(False),
+                "exit_code": ret,
+                "stderr_tail": stderr_tail,
+            })
         return json.dumps(_status_dict(True))
 
     # ── stop ─────────────────────────────────────────────────────────
@@ -493,43 +582,12 @@ def server(action: str) -> str:
                 }
             )
 
-        # Find a free port
-        _dashboard_port = _find_free_port(DASHBOARD_PORT)
-
-        # Determine which python to use
-        python = sys.executable
-
-        try:
-            _dashboard_proc = subprocess.Popen(
-                [python, script, str(_dashboard_port)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env={**os.environ, "ULTRATIMONEL_DB_PATH": db_path},
-            )
-        except FileNotFoundError:
-            return json.dumps({"error": f"Python not found: {python}"})
-        except Exception as exc:
-            return json.dumps({"error": f"Failed to start dashboard: {exc}"})
-
-        # Brief wait to catch immediate crashes
-        import time
-
-        time.sleep(0.5)
-        ret = _dashboard_proc.poll()
-        if ret is not None:
-            stderr = (
-                _dashboard_proc.stderr.read().decode(errors="replace")
-                if _dashboard_proc.stderr
-                else ""
-            )
-            _dashboard_proc = None
-            return json.dumps(
-                {
-                    "error": f"Dashboard exited immediately (code {ret})",
-                    "stderr": stderr[:500],
-                }
-            )
+        proc, hint = _spawn_dashboard(_dashboard_port)
+        if proc is None:
+            return json.dumps({
+                "error": f"Dashboard exited immediately (code ?)",
+                "hint": hint or "Unknown error",
+            })
 
         return json.dumps(
             {
@@ -553,28 +611,20 @@ def server(action: str) -> str:
                     pass
             _dashboard_proc = None
 
-        # Then start
-        _dashboard_port = _find_free_port(DASHBOARD_PORT)
-        python = sys.executable
-
-        try:
-            _dashboard_proc = subprocess.Popen(
-                [python, script, str(_dashboard_port)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env={**os.environ, "ULTRATIMONEL_DB_PATH": db_path},
+        if script is None:
+            return json.dumps(
+                {
+                    "error": "dashboard_server.py not found",
+                    "hint": "Expected at ultratimonel/dashboard_server.py",
+                }
             )
-        except Exception as exc:
-            return json.dumps({"error": f"Restart failed: {exc}"})
 
-        import time
-
-        time.sleep(0.5)
-        ret = _dashboard_proc.poll()
-        if ret is not None:
-            _dashboard_proc = None
-            return json.dumps({"error": f"Restart failed (exit code {ret})"})
+        proc, hint = _spawn_dashboard(_dashboard_port)
+        if proc is None:
+            return json.dumps({
+                "error": "Restart failed",
+                "hint": hint or "Unknown error",
+            })
 
         return json.dumps(
             {
