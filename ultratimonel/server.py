@@ -968,6 +968,11 @@ def sync_tasks(project: str) -> str:
                                 }
                             )
 
+                # Fallback: if stacks didn't provide description, use card_detail's full description
+                # so the markdown checkbox parser below can still extract checklists.
+                if not description and isinstance(card_detail, dict):
+                    description = card_detail.get("description", "") or ""
+
                 # No checklist items from Deck API? Parse description for markdown checkboxes
                 if checklist_total == 0 and description:
                     lines = description.strip().split("\n")
