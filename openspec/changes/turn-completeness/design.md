@@ -316,3 +316,65 @@ un bloqueo permanente del flujo. Firma clásica: `end_turn(intento_id, status="s
 | list_gate_states falla | error + running | fail (gates=[]) + limpio |
 | Turno huérfano en memoria | begin_turn bloquea | begin_turn auto-limpia |
 | end_turn de intento running no-activo | scoping error | recovery: cierra el running |
+
+---
+
+## ADR-008: MCP initialize timeout 5s→30s para bridge http_to_stdio
+
+**Contexto:** El gateway MCP usa un subproceso `http_to_stdio` como bridge hacia
+Nextcloud MCP server. Durante el handshake `initialize`, este subprocess tarda
+más de 5 segundos en responder — el timeout original de 5s cortaba la conexión
+con el error `"Initialize timeout for nextcloud"`, dejando los gates **1c**
+(Collective) y **1e** (Deck) en estado WARN permanente.
+
+Esto impedía que `assert_gates` resolviera esos gates a PASS durante
+`begin_turn`/`end_turn`, lo que causaba que los intentos cerraran con
+`final_status=fail` aunque el trabajo hubiera sido exitoso.
+
+**Análisis de causa raíz:**
+
+- El gateway MCP (proceso nativo) conecta contra `http_to_stdio` como si fuera
+  un subprocess stdio normal. La diferencia es que `http_to_stdio` es un puente
+  HTTP→stdio que debe hacer una llamada HTTP real a Nextcloud antes de responder
+  al handshake initialize.
+- El timeout fijo de 5s era suficiente para servidores MCP nativos (que responden
+  en milisegundos), pero no para el bridge que depende de latencia de red +
+  procesamiento del servidor Nextcloud.
+- `mcp_client.py` ya tenía un timeout de 30s en la línea del handshake — el fix
+  consistió en asegurar que ese valor se aplique consistentemente y que no haya
+  otro camino que use 5s para el handshake.
+
+**Alternativas consideradas:**
+
+1. **Aumentar timeout a 30s**: Simple, resuelve el problema directamente. El
+   handshake real tarda ~2-4s en producción; 30s da margen suficiente.
+2. **Timeout dinámico por server**: Configurar timeouts distintos por servidor.
+   Overengineering para un solo caso de bridge lento.
+3. **Eliminar timeout del handshake**: Peligroso — podría colgar el proceso
+   indefinidamente si el subprocess nunca responde.
+
+**Decisión:** Opción 1. Timeout fijo de 30s para initialize, documentado en
+`mcp_client.py` con comentario explicando que el bridge http_to_stdio requiere
+más tiempo que un MCP nativo.
+
+**Rationale:**
+- **Causa raíz identificada y aislada.** El problema no es del plugin ni del
+  server — es una limitación del bridge HTTP→stdio que tarda >5s en handshake.
+- **Fix mínimo, impacto localizado.** Un solo change de 1 línea en `mcp_client.py`.
+- **Verificado en producción.** Intentos #171 y #172 cerraron con SUCCESS 4/4
+  (gates_detail completo) después del fix.
+- **No afecta otros timeouts.** El timeout de tool calls permanece en 8s; solo
+  el initialize handshake cambia.
+
+**Consecuencias:**
+- `mcp_client.py` línea 252: `_read_line(self.proc.stdout, timeout=30.0)` — ya
+  estaba en el código post-fix (commit 7bc8d7a). Documentar la razón.
+- Gates 1c (Collective) y 1e (Deck) ahora pasan correctamente en producción.
+- `end_turn` puede completar con `final_status=success` cuando todos los gates
+  están PASS, incluyendo los dependientes del bridge Nextcloud.
+
+**Evidencia post-fix:**
+- Commit: `7bc8d7a fix(mcp_client): initialize timeout 5s→30s`
+- Producción intento #171 (2026-08-03 14:47 UTC): gates 1a=670ms, 1b=392ms,
+  1c=1472ms (4 steering docs), 1e=585ms (26 cards) — todos PASS. end_turn SUCCESS 4/4.
+- Producción intento #172: begin_turn con gates_passed_so_far=4 + end_turn SUCCESS 4/4.

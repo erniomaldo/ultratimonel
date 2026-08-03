@@ -72,9 +72,37 @@ Todos los tests originales pasan sin cambios.
 | Gates WARN se registran pero no bloquean | ✅ | Test: warn_gates_completes_as_fail |
 | Firma clásica sin cambios | ✅ | `end_turn(intento_id, status="success")` |
 
+## Evidencia final de producción
+
+### Intento #171 — 2026-08-03 14:47 UTC
+
+assert_gates fresco con 4/4 PASS:
+
+| Gate | Duración | Contexto |
+|------|----------|----------|
+| 1a   | 670ms    | PASS     |
+| 1b   | 392ms    | PASS     |
+| 1c   | 1472ms   | PASS (4 steering docs) |
+| 1e   | 585ms    | PASS (26 cards) |
+
+end_turn: SUCCESS 4/4 con gates_detail completo.
+
+### Intento #172 — Post-fix timeout
+
+begin_turn: gates_passed_so_far=4
+end_turn: SUCCESS 4/4 con gates_detail completo.
+
+**Confirmación:** El fix del timeout (commit 7bc8d7a) desbloqueó los gates 1c
+y 1e que previamente fallaban por `"Initialize timeout for nextcloud"`.
+
+---
+
 ## Notas
 
 - `plugin_preflight.py` NO fue modificado (como se solicitó)
+- `mcp_client.py` fue parchado en commit separado (7bc8d7a): initialize timeout
+  5s→30s para bridge http_to_stdio — fix dependiente pero necesario para
+  turn-completeness en producción
 - `_validate_gates_for_completion()` sigue existiendo y se usa para logging — solo ya no bloquea
 - `complete_intento()` mantiene su bouncer original (backward compat)
-- ADR-007 documentado en `design.md`
+- ADR-007 y ADR-008 documentados en `design.md`

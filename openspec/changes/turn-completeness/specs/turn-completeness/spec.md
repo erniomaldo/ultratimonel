@@ -185,3 +185,31 @@ WHEN la DB está en schema v2 y se conecta un servidor v3
 THEN la migración agrega `gates_detail` a la tabla `intentos`
 AND los intentos existentes funcionan normal (columna NULL)
 AND los nuevos intentos vía begin_turn tienen gates_detail poblado
+
+---
+
+## Req-6: MCP client initialize timeout suficiente para bridges
+
+**SHALL** el cliente MCP permitir un timeout de inicialización de al menos 30
+segundos para servidores que operan mediante bridge http_to_stdio (p. ej.
+Nextcloud MCP), donde el handshake `initialize` requiere una llamada HTTP
+externa que puede tardar >5s.
+
+**SHALL** el timeout de initialize estar separado del timeout de tool calls
+(8s), ya que son fases con características de latencia distintas.
+
+### Escenario 6a: Initialize timeout suficiente para bridge Nextcloud
+
+WHEN el MCP client conecta contra un servidor bridge http_to_stdio (Nextcloud)
+AND el handshake initialize tarda ~2-4s (latencia HTTP real)
+THEN el cliente NO corta la conexión por timeout (timeout=30s)
+AND el servidor se inicializa correctamente
+AND los gates dependientes del servidor (1c Collective, 1e Deck) pueden
+    resolverse a PASS en asserts posteriores
+
+### Escenario 6b: Initialize timeout no afecta tool calls
+
+WHEN un tool call al mismo servidor bridge tarda más de 8s
+THEN el timeout de tool calls (8s) sigue aplicándose independientemente
+AND el initialize timeout (30s) NO interfiere con el comportamiento de
+    tool calls

@@ -46,6 +46,18 @@
 
 ## Fase 5: Verificación
 
-- [ ] 5.1 Ejecutar `pytest tests/ -q --tb=short` — TODO passing
-- [ ] 5.2 Verificar que tests existentes no se rompieron
-- [ ] 5.3 Verificar py_compile en server.py y persistence.py
+- [x] 5.1 Ejecutar `pytest tests/ -q --tb=short` — 97/97 passing
+- [x] 5.2 Verificar que tests existentes no se rompieron (91/91 sin regresiones)
+- [x] 5.3 Verificar py_compile en server.py y persistence.py
+
+## Fase 6: Fix dependiente — MCP initialize timeout
+
+- [x] 6.1 Identificar causa raíz: bridge http_to_stdio tarda >5s en handshake
+- [x] 6.2 Aumentar initialize timeout de 5s a 30s en mcp_client.py (commit 7bc8d7a)
+- [x] 6.3 Verificar en producción: gates 1c/1e pasan a PASS, intentos #171 y #172 SUCCESS 4/4
+
+## Fase 7: Documentación retrospectiva
+
+- [x] 7.1 Agregar ADR-008 en design.md (timeout fix)
+- [x] 7.2 Agregar Req-6 en spec.md (MCP timeout requirement)
+- [x] 7.3 Actualizar verify-report.md con evidencia final de producción
