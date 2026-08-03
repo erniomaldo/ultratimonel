@@ -1,69 +1,133 @@
-# Ultratimonel — Pre-flight Gate Enforcement + Missions + Dashboard
+# Ultratimonel 🛡️
 
-<p align="center">
-  <img src="docs/logo.png" alt="Ultratimonel logo" width="323">
-</p>
+<div align="center">
 
-**Ultratimonel** es un servidor MCP (Model Context Protocol) que implementa el
-protocolo **pre-flight** para Hermes Agent. Actúa como un "guardia de
-seguridad" que se ejecuta **antes de cada generación** del LLM, verificando que
-el agente haya consultado memoria, checkpoint, steering docs y el tablero de
-tareas antes de responder.
+![Ultratimonel](docs/logo.png)
 
-Además del enforcement de gates, Ultratimonel proporciona:
+**Pre-flight gate enforcement + Missions + Dashboard para [Hermes Agent](https://hermes-agent.nousresearch.com/docs).**
 
-- **Dashboard web** (NES.css) para visualizar misiones y gates
-- **Sistema de Misiones** sincronizado con Nextcloud Deck
-- **endTurn Bouncer** — validación server-side en `complete_intento()`
-- **Card update** seguro — actualiza descripciones sin pisar títulos
+Un guardián que se ejecuta **antes de cada generación del LLM** para que el agente
+nunca responda sin memoria, checkpoint, steering docs ni tareas activas.
 
----
+[![MCP Server](https://img.shields.io/badge/MCP%20Server-7B3FF2?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
+[![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](pyproject.toml)
+[![Language](https://img.shields.io/github/languages/top/erniomaldo/ultratimonel)](https://github.com/erniomaldo/ultratimonel)
+[![Repo Size](https://img.shields.io/github/repo-size/erniomaldo/ultratimonel)](https://github.com/erniomaldo/ultratimonel)
 
-## Cómo funciona
+🌐 **Español** · [🇺🇸 English](README.en.md)
 
-### El plugin pre-flight (SOUL.md)
-
-Ultratimonel NO es opcional en el flujo de Hermes. El archivo
-[SOUL.md](../../SOUL.md) contiene el **Protocolo de Respuesta — Hábito
-Irrompible** que exige `begin_turn()` al inicio de CADA mensaje (ejecuta los
-4 gates internamente). El plugin ejecuta `assert_gates()` automáticamente en
-`pre_llm_call`. Sin esto, el agente no tiene contexto de memoria, checkpoint
-ni tareas activas.
-
-```
-[Mensaje del usuario]
-        │
-        ▼
-┌──────────────────────────────────────────┐
-│  1. begin_turn() — AUTOCONTENIDO         │
-│     ├── Ejecuta los 4 gates frescos      │
-│     │   (1a AgentMemory, 1b Checkpoint,  │
-│     │    1c Steering Docs, 1e Deck)      │
-│     └── Crea el intento con snapshot     │
-├──────────────────────────────────────────┤
-│  2. Trabajo del turno (tools normales)   │
-├──────────────────────────────────────────┤
-│  3. end_turn(intento_id) — SIEMPRE       │
-│     ├── Finaliza con success o fail      │
-│     └── Nunca deja el turno atascado     │
-├──────────────────────────────────────────┤
-│  4. Reporte al usuario (resumen final)   │
-└──────────────────────────────────────────┘
-```
-
-`begin_turn()` ejecuta los 4 gates internamente (autocontenido) y crea el
-intento. Si al finalizar algún gate mandatory está BLOCK/WARN, `end_turn()`
-completa el intento como `fail` con `gates_detail` — el agente reporta al
-usuario qué gate bloqueó y por qué.
+</div>
 
 ---
 
-## Integración con Hermes Agent
+## 📚 Tabla de contenidos
 
-Para usar Ultratimonel con el stack completo (plugin preflight + SOUL.md), se
-requiere:
+- [🤔 El problema](#el-problema)
+- [✅ La solución](#la-solucion)
+- [✨ Características](#caracteristicas)
+- [🚀 Quick Start — instalación nueva](#quick-start)
+- [🔄 El ciclo por turno](#ciclo-por-turno)
+- [🛠️ Tools (MCP API)](#tools)
+- [🗄️ Gates y estados](#gates)
+- [🔌 Integración con Hermes Agent](#integracion)
+- [⚙️ Configuración](#configuracion)
+- [🏗️ Arquitectura](#arquitectura)
+- [🗃️ Base de datos](#base-de-datos)
+- [📊 Dashboard](#dashboard)
+- [🧪 Desarrollo](#desarrollo)
+- [📦 Dependencias](#dependencias)
+- [📜 Licencia](#licencia)
 
-### 1. MCP Server en config.yaml
+---
+
+<a id="el-problema"></a>
+## 🤔 El problema
+
+Los agentes de IA generan respuestas con **contexto incompleto**: no consultan su memoria
+de proyecto, no verifican el checkpoint de estado, no leen las tareas activas. El resultado:
+
+| Problema | Qué pasa | Consecuencia |
+|----------|----------|--------------|
+| Memoria no consultada | El agente responde sin saber el historial del proyecto | Respuestas que ignoran decisiones previas |
+| Checkpoint ignorado | El agente no sabe en qué fase quedó el trabajo | Retoma en el lugar equivocado |
+| Tareas sin leer | El agente desconoce las cards activas del tablero | Trabajo duplicado o fuera de alcance |
+| Sin rendición de cuentas | Cada turno es una isla, sin trazabilidad | Imposible auditar qué se hizo y cuándo |
+
+**Bottom line:** agentes que responden "de memoria" (o sin memoria), trabajos que se
+repiten, y cero trazabilidad de qué intento completó qué tarea.
+
+---
+
+<a id="la-solucion"></a>
+## ✅ La solución
+
+Ultratimonel es un **servidor MCP + plugin de enforcement** que obliga al agente a pasar
+por un ciclo trazado en cada turno: consultar las 4 fuentes de contexto, registrar un
+**intento** vinculado a una tarea real (misión + checklist item de Nextcloud Deck), y
+cerrar el turno con verificación de gates.
+
+```
+┌──────────────┐   MCP stdio    ┌──────────────────┐    SQLite WAL    ┌──────────────┐
+│  Hermes      │ ──────────────→│  Ultratimonel    │ ──────────────→│              │
+│  Agent       │                │  MCP Server      │                 │ ultratimonel │
+│  + plugin    │ ←──────────────│  (18 tools)      │ ←──────────────│ .db (1 file) │
+│  preflight   │                │                  │                 │              │
+└──────────────┘                └─────────┬────────┘                 └──────────────┘
+                                          │
+                              ┌───────────┼───────────┐
+                              ▼           ▼           ▼
+                        AgentMemory   Checkpoint   Nextcloud
+                        (Gate 1a)     (Gate 1b)    Deck (1e) + Collective (1c)
+```
+
+**El ciclo por turno es de 2 llamadas** (antes eran 5+):
+
+```
+begin_turn()  →  trabajo del turno  →  end_turn()  →  reporte al usuario
+```
+
+> [!IMPORTANT]
+> Ultratimonel **no es opcional** en el flujo de Hermes: el plugin `ultratimonel-preflight`
+> bloquea tools si los gates no están PASS, y el `post_tool_call` fuerza el ciclo
+> begin → trabajo → end por respuesta. No hay "modo desactivado".
+
+---
+
+<a id="caracteristicas"></a>
+## ✨ Características
+
+| Área | Qué ofrece |
+|------|------------|
+| 🧠 **4 gates pre-flight** | 1a AgentMemory · 1b Checkpoint · 1c Steering Docs (opcional) · 1e Deck (mandatory) |
+| 🔁 **Flujo consolidado** | `begin_turn()` autocontenido — ejecuta los gates internamente y crea el intento |
+| 🛑 **endTurn Bouncer** | Valida gates mandatory PASS/SKIP al cerrar; `end_turn()` **nunca bloquea** (completa con `fail` + `gates_detail`) |
+| 📋 **Misiones** | Sincronizadas con Nextcloud Deck: mission + checklist items + intentos trazados |
+| 📊 **Dashboard web** | NES.css v2.3.0, light/dark theme, misiones con progreso, detalle de intentos |
+| 🔌 **Plugin v2.0** | `pre_llm_call` ejecuta gates, `pre_tool_call` bouncer, `post_tool_call` guard — **fuente de verdad en el repo** |
+| 🧩 **18 tools MCP** | 16 activas + 2 legacy (~~DEPRECATED~~) — ver [Tools](#️-tools-mcp-api) |
+| 💾 **SQLite WAL** | 9 tablas, migraciones incrementales, zero infraestructura |
+
+---
+
+<a id="quick-start"></a>
+## 🚀 Quick Start — instalación nueva
+
+### 1. Clonar e instalar
+
+```bash
+git clone https://github.com/erniomaldo/ultratimonel.git
+cd ultratimonel
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Probar que arranca (stdio transport)
+python main.py
+```
+
+### 2. Registrar el MCP server en `~/.hermes/config.yaml`
 
 ```yaml
 mcp_servers:
@@ -85,30 +149,44 @@ mcp_servers:
     max_lifetime_seconds: 86400
 ```
 
-### 2. Plugin preflight (`ultratimonel-preflight`)
+> [!NOTE]
+> Los gates 1c/1e (Nextcloud) se conectan vía el bridge
+> [**http-to-stdio**](https://github.com/erniomaldo/http-to-stdio) (público).
+> El `initialize` del cliente MCP usa timeout de 30s para llamadas HTTP lentas.
+
+### 3. Activar el plugin preflight
+
+```yaml
+plugins:
+  enabled:
+    - ultratimonel-preflight
+  entries:
+    ultratimonel-preflight:
+      allow_tool_override: false
+```
 
 El plugin implementa el patrón **Nikhil Verma de mandatory tool contracts**.
 **La fuente de verdad del plugin vive DENTRO de este repo** en `ultratimonel/`:
 
 | Archivo en el repo | Propósito |
 |--------------------|-----------|
-| `ultratimonel/plugin_preflight.py` | Lógica: `pre_llm_call` ejecuta gates, `pre_tool_call` bouncer bloquea tools sin gates PASS, `post_tool_call` bloquea todas las tools después de `end_turn` (1 ciclo por respuesta) |
-| `ultratimonel/ultratimonel_client.py` | Cliente MCP stdio para comunicación con el server ultratimonel |
-| `ultratimonel/plugin.yaml` | Declaración del plugin (nombre, versión, hooks) |
+| `ultratimonel/plugin_preflight.py` | `pre_llm_call` ejecuta gates · `pre_tool_call` bouncer bloquea tools sin gates PASS · `post_tool_call` bloquea tools después de `end_turn` (1 ciclo por respuesta) |
+| `ultratimonel/ultratimonel_client.py` | Cliente MCP stdio hacia el server |
+| `ultratimonel/plugin.yaml` | Declaración del plugin (nombre, versión v2.0.0, hooks) |
 
-> ⚠️ **REGLAS DE SINCRONÍA — LÉELAS ANTES DE TOCAR EL PLUGIN:**
->
-> 1. **NO muevas ni copies el plugin fuera del repo.** Si copias los archivos a
->    otra ubicación (p. ej. `~/.hermes/plugins/ultratimonel-preflight/`) y luego
->    actualizas el repo, **la copia externa queda desincronizada** — el runtime
->    seguiría corriendo una versión vieja sin los últimos fixes.
-> 2. **El repo es la única fuente autorizada.** Cualquier cambio al plugin se
->    hace aquí (commit + PR) y desde aquí se despliega a la instalación.
-> 3. Al instalar/desplegar, `ultratimonel/plugin_preflight.py` se copia a
+> [!WARNING]
+> **Reglas de sincronía — léelas antes de tocar el plugin:**
+> 1. **NO muevas ni copies el plugin fuera del repo.** Una copia externa
+>    (p. ej. `~/.hermes/plugins/ultratimonel-preflight/`) queda desincronizada
+>    cuando el repo avanza — el runtime seguiría corriendo una versión vieja.
+> 2. **El repo es la única fuente autorizada.** Los cambios se hacen aquí
+>    (commit + PR) y desde aquí se despliegan.
+> 3. Al desplegar, `plugin_preflight.py` se copia a
 >    `~/.hermes/plugins/ultratimonel-preflight/__init__.py` (mismo contenido,
 >    distinto nombre de archivo dentro del paquete).
 
 **plugin.yaml (v2.0.0):**
+
 ```yaml
 name: ultratimonel-preflight
 version: 2.0.0
@@ -125,31 +203,54 @@ provides_hooks:
   - post_tool_call
 ```
 
-### 3. Activar en config.yaml
+### 4. Instalar las skills del proyecto (para cualquier Hermes)
 
-```yaml
-plugins:
-  enabled:
-    - ultratimonel-preflight
-  entries:
-    ultratimonel-preflight:
-      allow_tool_override: false
+Las skills del flujo de trazabilidad viven **dentro de este repo** en `skills/`:
+
+| Skill | Propósito |
+|-------|-----------|
+| `skills/ultratimonel-ciclo-basico/SKILL.md` | Ciclo básico: mission_list → begin_turn → end_turn (sin experimentar) |
+| `skills/protocolo-de-trazabilidad/SKILL.md` | Protocolo Quad Persistence completo (begin/end, gates, checkpoints, agentmemory, Deck) |
+
+```bash
+# Copiar desde el repo (NUNCA editar la copia instalada)
+cp -r skills/ultratimonel-ciclo-basico ~/.hermes/skills/
+cp -r skills/protocolo-de-trazabilidad ~/.hermes/skills/
 ```
 
-### 4. Protocolo SOUL.md
+> [!WARNING]
+> Misma regla que el plugin: la copia instalada en `~/.hermes/skills/` **no se edita** —
+> los cambios se hacen en el repo y se re-copian.
 
-El archivo `~/.hermes/SOUL.md` debe incluir el **Protocolo de Respuesta —
-Hábito Irrompible** que exige `begin_turn()` al inicio de cada mensaje y
-`end_turn()` al finalizar, con reporte final al usuario (paso 6 del
-protocolo). Las tools legacy `record_intento()` + `complete_intento()` están
+### 5. Desplegar el protocolo SOUL.md
+
+```bash
+./scripts/deploy_soul.sh
+```
+
+Inyecta el **Protocolo de Respuesta — Hábito Irrompible** en `~/.hermes/SOUL.md`:
+`begin_turn()` al inicio de cada mensaje y `end_turn()` al finalizar, con reporte
+final al usuario. Las tools legacy `record_intento()` + `complete_intento()` están
 **DEPRECATED** — no usarlas en flujos nuevos.
 
-Ver `scripts/deploy_soul.sh` para despliegue automatizado.
+### 6. Verificar
 
-### 5. Flujo completo por turno
+```bash
+python -m pytest tests/ -v          # suite completa
+python main.py                      # arranca el MCP server
+```
+
+> [!TIP]
+> Después de configurar, reinicia Hermes y ejecuta `mission_list("tu-proyecto")`
+> para confirmar que el server responde y que las misiones de Deck están sincronizadas.
+
+---
+
+<a id="ciclo-por-turno"></a>
+## 🔄 El ciclo por turno
 
 ```
-1. Plugin (automático): pre_llm_call → assert_gates() → inyecta contexto gates
+1. Plugin (automático): pre_llm_call → assert_gates() → inyecta contexto de gates
 2. Agente: begin_turn(session_id, project, mission_id, checklist_item_id)
            ├── Ejecuta los 4 gates internamente (autocontenido)
            └── Crea el intento con snapshot fresco
@@ -161,85 +262,53 @@ Ver `scripts/deploy_soul.sh` para despliegue automatizado.
 6. Plugin (automático): pre_tool_call bouncer → bloquea si gates no PASS
 ```
 
-**begin_turn es autocontenido**: ejecuta los 4 gates internamente y persiste
-el snapshot en el mismo intento. No requiere `assert_gates()` manual como paso
-del agente (sigue existiendo como tool, usada por el plugin en pre_llm_call).
+**`begin_turn` es autocontenido:** ejecuta los 4 gates internamente y persiste el
+snapshot en el mismo intento. No requiere `assert_gates()` manual como paso del
+agente (sigue existiendo como tool, usada por el plugin en `pre_llm_call`).
 
-**end_turn siempre finaliza**: nunca deja intentos running huérfanos;
-`begin_turn` auto-limpia intentos running de sesiones anteriores.
+**`end_turn` siempre finaliza:** nunca deja intentos `running` huérfanos;
+`begin_turn` auto-limpia intentos running de sesiones anteriores (turn-scoping por
+`intento_id` + auto-recovery).
 
-> Nota: el plugin ejecuta `assert_gates()` de forma independiente en
-> `pre_llm_call`. Ambos escriben en la misma DB (`ULTRATIMONEL_DB_PATH`).
-> Para evitar inconsistencias, `list_gate_states()` usa `MAX(id)` para
-> devolver solo el estado más reciente (ver ADR-006).
-
-**Fix de timeout**: el initialize del `mcp_client` pasó de 5s a 30s para
-desbloquear gates 1c/1e con bridge http_to_stdio (llamadas HTTP lentas).
-
-### 6. Skills del proyecto (para cualquier Hermes)
-
-Las skills del flujo de trazabilidad viven **DENTRO de este repo** en `skills/`:
-
-| Skill | Propósito |
-|-------|-----------|
-| `skills/ultratimonel-ciclo-basico/SKILL.md` | Ciclo básico: mission_list → begin_turn → end_turn (sin experimentar) |
-| `skills/protocolo-de-trazabilidad/SKILL.md` | Protocolo Quad Persistence completo (begin/end, gates, checkpoints, agentmemory, Deck) |
-
-**Instalación en un Hermes nuevo:**
-
-```bash
-# Copiar desde el repo (NUNCA editar la copia instalada)
-cp -r skills/ultratimonel-ciclo-basico ~/.hermes/skills/
-cp -r skills/protocolo-de-trazabilidad ~/.hermes/skills/
-```
-
-> ⚠️ **REGLAS DE SINCRONÍA (igual que el plugin):**
-> 1. **NO edites la copia en `~/.hermes/skills/`** — los cambios se hacen en el repo y se re-copian; la copia instalada se desincroniza si se edita ahí.
-> 2. El repo es la única fuente autorizada de las skills del proyecto.
+> [!NOTE]
+> El plugin ejecuta `assert_gates()` de forma independiente en `pre_llm_call`.
+> Ambos escriben en la misma DB (`ULTRATIMONEL_DB_PATH`). Para evitar
+> inconsistencias, `list_gate_states()` usa `MAX(id)` para devolver solo el
+> estado más reciente (ver ADR-006).
 
 ---
 
-## Gates
+<a id="tools"></a>
+## 🛠️ Tools (MCP API)
 
-| Gate | Fuente | Mandatory | Propósito |
-|------|--------|-----------|-----------|
-| **1a** | `mcp_agentmemory_memory_smart_search` | ✅ Sí | Recuperar memoria relevante del proyecto/sender |
-| **1b** | `mcp_checkpoint_get_state` | ✅ Sí | Obtener checkpoint de estado del proyecto activo |
-| **1c** | `mcp_nextcloud_collectives_get_pages` | ❌ No | Cargar steering docs desde Nextcloud Collective |
-| **1e** | `mcp_nextcloud_deck_get_boards` | ✅ Sí | Listar tareas activas desde Nextcloud Deck |
+Ultratimonel expone **18 tools MCP**: 16 activas + 2 legacy (~~DEPRECATED~~,
+mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP.
 
-### Estados
-
-| Estado | Significado | Acción |
-|--------|-------------|--------|
-| `PASS` | Gate completó exitosamente | Continuar |
-| `SKIP` | Gate no aplica / N/A | Continuar |
-| `WARN` | Gate falló (no crítico) | Advertir + continuar |
-| `BLOCK` | Gate falló (mandatory) | **Detener generación** |
-
----
-
-## Tools (18)
-
-Ultratimonel expone 18 MCP tools: **16 activas** + **2 legacy**
-(`record_intento`, `complete_intento` — ~~DEPRECATED~~, mantenidas por
-compatibilidad).
-
-### Núcleo (Gates)
+### 🧠 Núcleo (Gates)
 
 | Tool | Descripción |
 |------|-------------|
-| `assert_gates(message, session_id, sender)` | Ejecuta los 4 gates y retorna resultados estructurados |
-| `check_gate(name, session_id)` | Lee el estado de un gate desde SQLite |
-| `complete_gate(name, session_id, reason)` | Marca manualmente un gate como PASS (solo desde BLOCK/WARN) |
+| `assert_gates(message, session_id, sender)` | Ejecuta los 4 gates y retorna resultados estructurados (la usa el plugin en `pre_llm_call`) |
+| `check_gate(name, session_id)` | Lee el estado de un gate desde SQLite (diagnóstico) |
+| `complete_gate(name, session_id, reason)` | Marca manualmente un gate como PASS — solo desde BLOCK/WARN (remediación) |
 
-### Dashboard
+### 🔁 Intentos (ciclo begin_turn / end_turn)
+
+| Tool | Firma | Descripción |
+|------|-------|-------------|
+| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. **Flujo recomendado.** |
+| `end_turn(intento_id, status="success")` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates_detail` completo. Nunca deja el turno atascado. |
+| `delete_intento(intento_id)` | Elimina un intento por ID (limpieza operacional) |
+
+### 📋 Misiones / Deck Sync
 
 | Tool | Descripción |
 |------|-------------|
-| `server(action)` | Controla el servidor web del dashboard (start/stop/status) |
+| `sync_tasks(project)` | Sincroniza cards de Deck → tabla missions para un proyecto |
+| `sync_all()` | Sincroniza todos los proyectos mapeados |
+| `mission_list(project)` | Lista misiones (Deck tasks) de un proyecto |
 
-### Project Maps
+### 🗺️ Project Maps
 
 | Tool | Descripción |
 |------|-------------|
@@ -249,38 +318,102 @@ compatibilidad).
 | `map_setup()` | Descubre boards/collectives disponibles para mapeo |
 | `map_sync()` | Verifica que los IDs de boards sigan existiendo |
 
-### Misiones / Deck Sync
+### 📊 Dashboard
 
 | Tool | Descripción |
 |------|-------------|
-| `sync_tasks(project)` | Sincroniza cards de Deck → tabla missions para un proyecto |
-| `sync_all()` | Sincroniza todos los proyectos mapeados |
-| `mission_list(project)` | Lista misiones (Deck tasks) de un proyecto |
+| `server(action)` | Controla el servidor web del dashboard (start/stop/status) |
 
-### Intentos (ciclos begin_turn / end_turn)
+### 🗂️ Deck Cards
 
-| Tool | Firma | Descripción |
-|------|-------|-------------|
-| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. Flujo recomendado. |
-| `end_turn(intento_id, status="success")` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates_detail` completo. Nunca deja el turno atascado. |
-| `delete_intento(intento_id)` | Elimina un intento por ID (limpieza operacional) |
+| Tool | Descripción |
+|------|-------------|
+| `card_update_description(card_id, description, board_id, stack_id)` | Actualiza solo la descripción de una card — NUNCA cambia el título |
 
-### Legacy / Archivadas (compatibilidad — no usar en flujos nuevos)
+### 🗄️ Legacy / Archivadas (compatibilidad — no usar en flujos nuevos)
 
 | Tool | Firma | Descripción |
 |------|-------|-------------|
 | `record_intento(session_id, project, mission_id, checklist_item_id)` | ~~DEPRECATED~~ — usa `begin_turn()` en su lugar |
 | `complete_intento(intento_id, status, gates_passed, session_id, project)` | ~~DEPRECATED~~ — usa `end_turn()` en su lugar |
 
-### Deck Cards
+---
 
-| Tool | Descripción |
-|------|-------------|
-| `card_update_description(card_id, description, board_id, stack_id)` | Actualiza solo la descripción de una card — NUNCA cambia el título |
+<a id="gates"></a>
+## 🗄️ Gates y estados
+
+| Gate | Fuente | Mandatory | Propósito |
+|------|--------|-----------|-----------|
+| **1a** | `mcp_agentmemory_memory_smart_search` | ✅ Sí | Recuperar memoria relevante del proyecto/sender |
+| **1b** | `mcp_checkpoint_get_state` | ✅ Sí | Obtener checkpoint de estado del proyecto activo |
+| **1c** | `mcp_nextcloud_collectives_get_pages` | ❌ No | Cargar steering docs desde Nextcloud Collective |
+| **1e** | `mcp_nextcloud_deck_get_boards` | ✅ Sí | Listar tareas activas desde Nextcloud Deck |
+
+| Estado | Significado | Acción |
+|--------|-------------|--------|
+| `PASS` | Gate completó exitosamente | Continuar |
+| `SKIP` | Gate no aplica / N/A | Continuar |
+| `WARN` | Gate falló (no crítico) | Advertir + continuar |
+| `BLOCK` | Gate falló (mandatory) | **Detener generación** |
+
+> [!NOTE]
+> **Grace Period:** el plugin tiene `ULTRATIMONEL_GRACE_TURNS=3` (default 3).
+> Durante los primeros 3 turnos de la sesión el bouncer no bloquea aunque los
+> gates fallen; a partir del turno 4 es estricto.
 
 ---
 
-## Arquitectura
+<a id="integracion"></a>
+## 🔌 Integración con Hermes Agent
+
+### Protocolo SOUL.md
+
+El archivo `~/.hermes/SOUL.md` debe incluir el **Protocolo de Respuesta —
+Hábito Irrompible** que exige `begin_turn()` al inicio de cada mensaje y
+`end_turn()` al finalizar, con reporte final al usuario (paso 6 del protocolo).
+Ver `scripts/deploy_soul.sh` para despliegue automatizado.
+
+### endTurn Bouncer
+
+Validación server-side del cierre de turno. En el flujo recomendado vive en
+`end_turn()`; también está disponible en `complete_intento()` (legacy). Cuando
+se proporcionan `session_id` y `project`, consulta `list_gate_states()` en
+SQLite para verificar que **todas las gates mandatory estén PASS o SKIP**.
+
+Si alguna gate mandatory está BLOCK o WARN, retorna `status: "blocked"` (en
+`end_turn()` el intento se completa como `fail` con `gates_detail` — nunca
+bloquea permanentemente).
+
+---
+
+<a id="configuracion"></a>
+## ⚙️ Configuración
+
+### Project Maps
+
+**No edites código para configurar proyectos.** Toda la configuración vive en
+`~/.hermes/ultratimonel/project_maps.json` (configurable via
+`ULTRATIMONEL_PROJECT_MAPS`). Usa las tools MCP:
+
+```bash
+map_setup()         # Descubre boards/collectives
+map_add("mi-proyecto", deck_board_name="Mi Board", ...)
+map_list()
+map_sync()
+```
+
+### Variables de entorno
+
+| Variable | Default | Propósito |
+|----------|---------|-----------|
+| `ULTRATIMONEL_DB_PATH` | `~/.hermes/ultratimonel.db` | Ruta a SQLite |
+| `ULTRATIMONEL_PROJECT_MAPS` | `~/.hermes/ultratimonel/project_maps.json` | Config de proyectos |
+| `ULTRATIMONEL_DASHBOARD_PORT` | `3005` | Puerto del dashboard |
+
+---
+
+<a id="arquitectura"></a>
+## 🏗️ Arquitectura
 
 ```
 ultratimonel/
@@ -301,12 +434,18 @@ ultratimonel/
 │   ├── mcp_client.py                # Cliente HTTP para MCP calls externos
 │   ├── bridge.py                    # Bridge hacia mcp-capabilities
 │   ├── dashboard_server.py          # Servidor HTTP (stdlib) del dashboard
+│   ├── plugin_preflight.py          # Plugin v2.0.0 (pre/post_tool_call guards)
+│   ├── ultratimonel_client.py       # Cliente MCP stdio del plugin
+│   ├── plugin.yaml                  # Declaración del plugin
 │   └── dashboard/
 │       ├── __init__.py
 │       ├── index.html               # Dashboard web (NES.css v2.3.0)
 │       └── app.js                   # Lógica JS del dashboard
 ├── scripts/
 │   └── deploy_soul.sh               # Inyección de reglas SOUL.md
+├── skills/
+│   ├── ultratimonel-ciclo-basico/   # Ciclo básico (mission_list → begin/end_turn)
+│   └── protocolo-de-trazabilidad/   # Protocolo Quad Persistence completo
 ├── openspec/
 │   ├── config.yaml                  # Configuración de OpenSpec
 │   ├── specs/                       # Especificaciones SDD
@@ -329,12 +468,11 @@ ultratimonel/
 
 ---
 
-## Base de datos
+<a id="base-de-datos"></a>
+## 🗃️ Base de datos
 
-SQLite con WAL journal mode. Ruta por defecto: `~/.hermes/ultratimonel.db`
+SQLite con **WAL journal mode**. Ruta por defecto: `~/.hermes/ultratimonel.db`
 (configurable via `ULTRATIMONEL_DB_PATH`).
-
-### 9 tablas
 
 | Tabla | Propósito |
 |-------|-----------|
@@ -348,16 +486,13 @@ SQLite con WAL journal mode. Ruta por defecto: `~/.hermes/ultratimonel.db`
 | `checklist_items` | Items de checklist dentro de cada misión |
 | `intentos` | Intentos/ciclos de assert_gates por checklist item |
 
-### Parámetros
-
-- WAL journal mode
-- NORMAL synchronous
-- 5s busy timeout
-- Migrations incrementales vía `schema_version`
+**Parámetros:** WAL journal mode · NORMAL synchronous · 5s busy timeout ·
+migraciones incrementales vía `schema_version`.
 
 ---
 
-## Dashboard
+<a id="dashboard"></a>
+## 📊 Dashboard
 
 El dashboard web corre en un servidor **http.server** (stdlib, no FastAPI),
 puerto por defecto **3005** (configurable via `ULTRATIMONEL_DASHBOARD_PORT`).
@@ -369,7 +504,7 @@ Interfaz NES.css v2.3.0 con:
 - Detalle de intentos por checklist item
 - Light/dark theme
 
-```
+```python
 server(action="start")   # Inicia el dashboard
 server(action="stop")    # Lo detiene
 server(action="status")  # Estado actual
@@ -377,48 +512,8 @@ server(action="status")  # Estado actual
 
 ---
 
-## endTurn Bouncer
-
-Validación server-side del cierre de turno. En el flujo recomendado vive en
-`end_turn()`; también está disponible en `complete_intento()` (legacy). Cuando
-se proporcionan `session_id` y `project`, la función consulta
-`list_gate_states()` en SQLite para verificar que **todas las gates mandatory
-estén PASS o SKIP**.
-
-Si alguna gate mandatory está BLOCK o WARN, la función retorna
-`status: "blocked"` (en `end_turn()` el intento se completa como `fail` con
-`gates_detail` — nunca bloquea permanentemente) con la lista de gates
-fallando.
-
-**Parámetros en `complete_intento()` (legacy):**
-
-- `session_id` (str, default `""`) — solo valida si es non-empty
-- `project` (str, default `""`) — solo valida si es non-empty
-
-Esto garantiza backward compatibility: llamadas existentes sin estos
-parámetros siguen funcionando sin validación. En flujos nuevos usar
-`end_turn(intento_id)`.
-
----
-
-## Project Maps (configuración)
-
-**No edites código para configurar proyectos.** Toda la configuración de
-proyectos vive en `~/.hermes/ultratimonel/project_maps.json` (configurable
-via `ULTRATIMONEL_PROJECT_MAPS`).
-
-Usa las tools MCP para gestionar proyectos:
-
-```bash
-map_setup()         # Descubre boards/collectives
-map_add("mi-proyecto", deck_board_name="Mi Board", ...)
-map_list()
-map_sync()
-```
-
----
-
-## Quick Start
+<a id="desarrollo"></a>
+## 🧪 Desarrollo
 
 ```bash
 # Entorno
@@ -426,36 +521,34 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Ejecutar (stdio transport)
-python main.py
-
-# Ruta DB personalizada
-ULTRATIMONEL_DB_PATH=/tmp/test.db python main.py
-
 # Tests
-python -m pytest tests/ -v
+python -m pytest tests/test_gate_engine.py tests/test_server.py tests/test_persistence.py -q
+# 76 passed
+
+# Ruta DB personalizada (para pruebas aisladas)
+ULTRATIMONEL_DB_PATH=/tmp/test.db python main.py
 ```
 
-### Variables de entorno
-
-| Variable | Default | Propósito |
-|----------|---------|-----------|
-| `ULTRATIMONEL_DB_PATH` | `~/.hermes/ultratimonel.db` | Ruta a SQLite |
-| `ULTRATIMONEL_PROJECT_MAPS` | `~/.hermes/ultratimonel/project_maps.json` | Config de proyectos |
-| `ULTRATIMONEL_DASHBOARD_PORT` | `3005` | Puerto del dashboard |
+Los cambios de diseño siguen el flujo **OpenSpec/SDD** (`openspec/changes/`) con
+validación adversarial (`judgment-day`) y trazabilidad triple (intentos en
+ultratimonel, checkpoints, agentmemory). Ver `docs/` para la documentación
+detallada del diseño.
 
 ---
 
-## Dependencias
+<a id="dependencias"></a>
+## 📦 Dependencias
 
 - Python ≥ 3.13
 - `fastmcp` — Framework MCP
 - `httpx` — Cliente HTTP para calls MCP externas (Deck)
-- **`http-to-stdio`** — bridge HTTP→stdio para conectar a Nextcloud MCP: [github.com/erniomaldo/http-to-stdio](https://github.com/erniomaldo/http-to-stdio) (público)
+- **`http-to-stdio`** — bridge HTTP→stdio para conectar a Nextcloud MCP:
+  [github.com/erniomaldo/http-to-stdio](https://github.com/erniomaldo/http-to-stdio) (público)
 - `sqlite3` — Persistencia (stdlib)
 
 ---
 
-## Licencia
+<a id="licencia"></a>
+## 📜 Licencia
 
-MIT
+MIT — ver [pyproject.toml](pyproject.toml).
