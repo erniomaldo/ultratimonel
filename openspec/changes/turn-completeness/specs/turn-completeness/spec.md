@@ -8,48 +8,67 @@ gates con detalle completo.
 
 ---
 
-## Req-1: begin_turn — crear intento con gates capturados
+## Req-1: begin_turn — ejecutar gates frescos y crear intento
 
 **SHALL** recibir `session_id` (str) y `project` (str) como argumentos.
 
+**SHALL** recibir opcionalmente `message` (str) y `sender` (str) para extraer
+contexto y ejecutar los gates de forma autónoma.
+
 **SHALL** validar que no existe un turno activo previo (turn-scoping).
 
-**SHALL** consultar los gate states actuales para `session_id` + `project`
-usando `persistence.list_gate_states()`.
+**SHALL** ejecutar INTERNAMENTE los 4 gates (1a/1b/1c/1e) de forma fresca
+usando `extract_context()` + `run_triple_match()`, NO leyendo estados viejos
+de la DB.
+
+**SHALL** persistir cada resultado de gate via `persistence.upsert_gate_state()`
+para que el estado refleje el momento exacto del begin_turn.
 
 **SHALL** crear un nuevo intento con status='running' y persistir los gates
-capturados en la columna `gates_detail` como JSON.
+ejecutados en la columna `gates_detail` como JSON.
 
 **SHALL** registrar el intento como turno activo para validación posterior.
 
-**SHALL** retornar JSON con `intento_id`, `status: "started"`, y conteo de
-gates capturados.
+**SHALL** retornar JSON con `intento_id`, `status: "started"`, conteo de
+gates capturados, `gates_passed_so_far`, `overall`, y `context` extraído.
 
-### Escenario 1a: begin_turn exitoso con gates previos
+### Escenario 1a: begin_turn ejecuta gates frescos exitosamente
 
-WHEN el agente llama `begin_turn(session_id="s1", project="voy-rojo")`
-AND existen 4 gates en PASS en gate_state para s1/voy-rojo
-THEN se crea un intento con status='running'
-AND `gates_detail` contiene los 4 gates con nombre, estado y mensaje
-AND `gates_passed` se establece al conteo de gates PASS/SKIP
+WHEN el agente llama `begin_turn(session_id="s1", project="voy-rojo",
+message="test msg", sender="user")`
+THEN se ejecutan los 4 gates de forma fresca (1a→1b→1c→1e)
+AND cada gate se persiste en gate_state con estado actualizado
+AND se crea un intento con status='running'
+AND `gates_detail` contiene los 4 gates ejecutados con nombre, estado y mensaje
+AND `gates_passed_so_far` refleja el conteo real de PASS/SKIP
 AND el intento se registra como turno activo
-AND se retorna `intento_id > 0`
+AND se retorna `intento_id > 0` y `overall` con el estado agregado
 
-### Escenario 1b: begin_turn sin gates previos
+### Escenario 1b: begin_turn sin message/sender (backward compat)
 
 WHEN el agente llama `begin_turn(session_id="s2", project="alpha")`
-AND no existen gates en gate_state para s2/alpha
-THEN se crea un intento con status='running'
-AND `gates_detail` es un array vacío `[]`
-AND `gates_passed` es 0
+(sin message ni sender — firma legacy)
+THEN se usa sender por defecto "user" y message vacío
+AND los gates se ejecutan de forma fresca igual que con params explícitos
+AND se crea un intento con status='running'
 AND se retorna `intento_id > 0`
 
-### Escenario 1c: begin_turn duplicado (turno ya activo)
+### Escenario 1c: begin_turn servicios no disponibles -> WARN frescos
+
+WHEN el agente llama `begin_turn(...)` y los servicios externos (agentmemory,
+checkpoint, nextcloud) no responden
+THEN los gates salen en estado WARN (no BLOCK ni SKIP)
+AND se persisten como WARN en gate_state
+AND se crea un intento con status='running'
+AND `overall` es "WARN"
+AND el turno puede continuar (el agente decide si procede)
+
+### Escenario 1d: begin_turn duplicado (turno ya activo)
 
 WHEN existe un turno activo y el agente llama `begin_turn()` nuevamente
-THEN se retorna error con message indicando que hay un turno activo
-AND no se crea un nuevo intento
-AND el turno activo permanece sin cambios
+THEN se detecta como huérfano si no corresponde al mismo intento running
+AND se auto-completa el turno huérfano como "fail"
+AND se crea el nuevo intento con gates frescos
 
 ---
 

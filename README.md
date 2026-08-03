@@ -140,18 +140,30 @@ Ver `scripts/deploy_soul.sh` para despliegue automatizado.
 
 ```
 1. Plugin (automático): pre_llm_call → assert_gates() → inyecta contexto gates
-2. Agente: Paso 1 → assert_gates() refresca contexto
+2. Agente: begin_turn(session_id, project, mission_id, checklist_item_id)
+           ├── Ejecuta los 4 gates internamente (autocontenido)
+           └── Crea el intento con snapshot fresco
 3. Agente: Trabajo del turno (tools, respuestas)
-4. Agente: Paso 5 → record_intento() + complete_intento()
+4. Agente: end_turn(intento_id, status="success")
+           ├── Finaliza SIEMPRE con "success" o "fail" + gates_detail
+           └── Nunca deja el turno atascado
 5. Plugin (automático): pre_tool_call bouncer → bloquea si gates no PASS
 ```
 
-Nota: el plugin y el agente ejecutan `assert_gates()` de forma independiente.
-Ambos escriben en la misma DB (`ULTRATIMONEL_DB_PATH`). El agente ve las gates
-PASS desde el MCP server de Hermes; el plugin puede ver WARN si su subprocess
-no tiene acceso a los mismos MCP servers. Para evitar inconsistencias,
-`list_gate_states()` usa `MAX(id)` para devolver solo el estado más reciente
-(ver ADR-006).
+**begin_turn es autocontenido**: ejecuta los 4 gates internamente y persiste
+el snapshot en el mismo intento. No requiere `assert_gates()` manual como paso
+del agente (sigue existiendo como tool, usada por el plugin en pre_llm_call).
+
+**end_turn siempre finaliza**: nunca deja intentos running huérfanos;
+`begin_turn` auto-limpia intentos running de sesiones anteriores.
+
+> Nota: el plugin ejecuta `assert_gates()` de forma independiente en
+> `pre_llm_call`. Ambos escriben en la misma DB (`ULTRATIMONEL_DB_PATH`).
+> Para evitar inconsistencias, `list_gate_states()` usa `MAX(id)` para
+> devolver solo el estado más reciente (ver ADR-006).
+
+**Fix de timeout**: el initialize del `mcp_client` pasó de 5s a 30s para
+desbloquear gates 1c/1e con bridge http_to_stdio (llamadas HTTP lentas).
 
 ---
 
@@ -211,12 +223,14 @@ Ultratimonel expone 16 MCP tools:
 | `sync_all()` | Sincroniza todos los proyectos mapeados |
 | `mission_list(project)` | Lista misiones (Deck tasks) de un proyecto |
 
-### Intentos (ciclos assert_gates)
+### Intentos (ciclos begin_turn / end_turn)
 
-| Tool | Descripción |
-|------|-------------|
-| `record_intento(session_id, project, mission_id, checklist_item_id)` | Crea un intento para un checklist item |
-| `complete_intento(intento_id, status, gates_passed, session_id, project)` | Finaliza un intento con validación endTurn bouncer |
+| Tool | Firma | Descripción |
+|------|-------|-------------|
+| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. Flujo recomendado. |
+| `end_turn(intento_id, status="success")` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates_detail` completo. Nunca deja el turno atascado. |
+| `record_intento(session_id, project, mission_id, checklist_item_id)` | ~~DEPRECATED~~ — se mantiene por compatibilidad |
+| `complete_intento(intento_id, status, gates_passed, session_id, project)` | ~~DEPRECATED~~ — se mantiene por compatibilidad |
 | `delete_intento(intento_id)` | Elimina un intento por ID |
 
 ### Deck Cards

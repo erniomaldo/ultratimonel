@@ -378,3 +378,64 @@ más tiempo que un MCP nativo.
 - Producción intento #171 (2026-08-03 14:47 UTC): gates 1a=670ms, 1b=392ms,
   1c=1472ms (4 steering docs), 1e=585ms (26 cards) — todos PASS. end_turn SUCCESS 4/4.
 - Producción intento #172: begin_turn con gates_passed_so_far=4 + end_turn SUCCESS 4/4.
+
+---
+
+## ADR-009: Assert interno de gates en begin_turn — autocontención del turno
+
+**Contexto:** El flujo consolidado de 2 calls (`begin_turn` → `end_turn`)
+requiere que `begin_turn` sea **autocontenido**: debe ejecutar los 4 gates
+(1a/1b/1c/1e) internamente en lugar de solo leer estados existentes de la DB.
+
+El problema observado: en producción, `begin_turn` solo llamaba a
+`list_gate_states()` que lee estados capturados previamente por el plugin
+preflight o por un `assert_gates` manual. Sin el assert manual (intentos
+#171/#172/#177), begin_turn capturaba estados obsoletos y end_turn fallaba
+con datos que no reflejaban el momento actual.
+
+**Alternativas consideradas:**
+
+1. **Ejecutar gates internamente en begin_turn**: begin_turn llama a
+   `extract_context()` + `run_triple_match()`, persiste resultados frescos,
+   y retorna estados reales. El plugin preflight sigue existiendo como capa
+   complementaria de inyección de contexto al agente.
+
+2. **Mantener lectura de DB pero agregar refresh opcional**: Agregar un flag
+   `refresh=true` a begin_turn que ejecute gates solo cuando se pide. Más
+   complejo, menos predecible.
+
+3. **Eliminar begin_turn y volver al flujo de 5 calls**: No cumple el
+   objetivo de consolidación a 2 calls.
+
+**Decisión:** Opción 1. begin_turn ejecuta los 4 gates internamente como
+parte de su responsabilidad principal.
+
+**Rationale:**
+- **Autocontención del turno.** begin_turn es la primera llamada del turno;
+  tiene todo el contexto necesario (session_id, project, message, sender)
+  para ejecutar los gates sin depender de llamadas previas.
+- **Flujo de 2 calls real.** El agente solo necesita `begin_turn` + `end_turn`;
+  no requiere llamar `assert_gates` manualmente antes de cada turno.
+- **Estado fresco.** Los gates capturados reflejan el momento exacto del
+  inicio del turno, no estados obsoletos de la DB.
+- **Plugin preflight complementario.** El plugin sigue ejecutando assert en
+  `pre_llm_call` para inyectar contexto al agente; begin_turn lo hace para
+  persistir estado y crear el intento. Son capas complementarias, no
+  reemplazos.
+- **Backward compat.** Los params `message` y `sender` son opcionales con
+  defaults (`""`, `"user"`), por lo que llamadas legacy siguen funcionando.
+
+**Consecuencias:**
+- `begin_turn` ahora tiene una responsabilidad más amplia: extraer contexto,
+  ejecutar gates, persistir estados, crear intento.
+- La firma de begin_turn se amplía con `message: str = ""` y `sender: str = "user"`.
+- Los tests deben mockear `extract_context` y `run_triple_match` en lugar
+  de `list_gate_states` para las pruebas de begin_turn.
+- end_turn NO cambia: sigue leyendo gates de DB para validación y cierre.
+- El plugin `plugin_preflight.py` NO se modifica (se mantiene como capa
+  complementaria).
+
+**Evidencia post-cambio:**
+- Tests actualizados: 31 passing en test_server.py.
+- Flujo de 2 calls verificado: begin_turn ejecuta gates frescos, end_turn
+  completa el intento sin necesidad de assert_gates manual.
