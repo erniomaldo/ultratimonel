@@ -225,3 +225,89 @@ class TestDbFile:
                 assert row[0] == "wal"
         finally:
             os.unlink(db_path)
+
+
+class TestGatesDetail:
+    """Tests for gates_detail column (v3 schema)."""
+
+    def test_schema_version_v3(self, db):
+        with db._conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()
+            assert row[0] == 3
+
+    def test_gates_detail_column_exists(self, db):
+        with db._conn() as conn:
+            cols = conn.execute("PRAGMA table_info(intentos)").fetchall()
+            col_names = {c[1] for c in cols}
+            assert "gates_detail" in col_names
+
+    def test_capture_gates_for_intento(self, db):
+        mid = db.upsert_mission(deck_task_id=1, project="p", title="T")
+        cid = db.upsert_checklist_item(mid, item_index=0, text="Item")
+        iid = db.create_intento("s1", "p", mid, cid)
+
+        gates = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1b", "state": "BLOCK", "mandatory": 1, "message": "fail"},
+        ]
+        db.capture_gates_for_intento(iid, gates)
+
+        with db._conn() as conn:
+            row = conn.execute(
+                "SELECT gates_detail FROM intentos WHERE id = ?", (iid,)
+            ).fetchone()
+        import json
+        captured = json.loads(row["gates_detail"])
+        assert len(captured) == 2
+        assert captured[0]["gate_name"] == "1a"
+        assert captured[0]["state"] == "PASS"
+
+    def test_complete_intento_with_gates(self, db):
+        mid = db.upsert_mission(deck_task_id=2, project="p", title="T")
+        cid = db.upsert_checklist_item(mid, item_index=0, text="Item")
+        iid = db.create_intento("s1", "p", mid, cid)
+
+        gates = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1c", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
+        ]
+        db.complete_intento_with_gates(iid, "success", 4, gates)
+
+        intento = db.get_intento(iid)
+        assert intento["status"] == "success"
+        assert intento["gates_passed"] == 4
+        assert intento["completed_at"] is not None
+
+    def test_migration_v2_to_v3(self):
+        """Simulate migration from v2 to v3."""
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            # Create v2 DB
+            p2 = Persistence(db_path=db_path)
+            with p2._conn() as conn:
+                conn.execute(
+                    "INSERT INTO schema_version (version, description) VALUES (2, 'v2')"
+                )
+            p2.close()
+
+            # Reopen — should auto-migrate to v3
+            p3 = Persistence(db_path=db_path)
+            with p3._conn() as conn:
+                row = conn.execute(
+                    "SELECT MAX(version) FROM schema_version"
+                ).fetchone()
+                assert row[0] == 3
+
+                # Column should exist
+                cols = conn.execute("PRAGMA table_info(intentos)").fetchall()
+                col_names = {c[1] for c in cols}
+                assert "gates_detail" in col_names
+            p3.close()
+        finally:
+            os.unlink(db_path)

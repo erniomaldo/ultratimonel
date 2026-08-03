@@ -93,6 +93,80 @@ def _find_free_port(start: int = 3005, max_tries: int = 20) -> int:
 
 
 #
+# ── Turn state (server-side turn-scoping) ───────────────────────────────
+# Complements plugin_preflight.py's _turn_active/_turn_ended.
+# Used by begin_turn/end_turn to validate意图 belongs to current turn.
+#
+
+import threading as _threading
+
+_turn_lock = _threading.RLock()
+_active_intento: dict | None = None  # {intento_id, session_id, project}
+
+
+def _get_active_intento() -> dict | None:
+    """Return the active intento info under lock."""
+    with _turn_lock:
+        return _active_intento.copy() if _active_intento else None
+
+
+def _set_active_intento(intento_id: int, session_id: str, project: str) -> None:
+    """Set the active intento under lock."""
+    global _active_intento
+    with _turn_lock:
+        _active_intento = {
+            "intento_id": intento_id,
+            "session_id": session_id,
+            "project": project,
+        }
+
+
+def _clear_active_intento() -> None:
+    """Clear the active intento under lock."""
+    global _active_intento
+    with _turn_lock:
+        _active_intento = None
+
+
+def _validate_gates_for_completion(
+    session_id: str, project: str
+) -> tuple[bool, list[str]]:
+    """Validate that all mandatory gates are PASS/SKIP/PENDING.
+
+    Returns:
+        (allowed, failed_details) — allowed=True means completion is permitted.
+    """
+    gates = persistence.list_gate_states(session_id, project)
+    failed = [
+        f"{g.get('gate_name', '?')}({g.get('state', 'UNKNOWN')}): {g.get('message', '')}"
+        for g in gates
+        if g.get("mandatory") and g.get("state") not in ("PASS", "SKIP", "PENDING")
+    ]
+    return (len(failed) == 0, failed)
+
+
+def _resolve_requesting_intento(
+    session_id: str, project: str
+) -> int | None:
+    """Resolve the intento_id that should be considered 'requesting' for a
+    begin_turn call. Returns the latest running intento for this session+project,
+    or None if none exists. Used by begin_turn to detect orphaned turns."""
+    try:
+        # Find the most recent running intento for this session+project
+        with persistence._conn() as conn:
+            row = conn.execute(
+                """SELECT id FROM intentos
+                   WHERE session_id = ? AND project = ? AND status = 'running'
+                   ORDER BY started_at DESC LIMIT 1""",
+                (session_id, project),
+            ).fetchone()
+            return row["id"] if row else None
+    except Exception as exc:
+        logger.warning("Failed to resolve requesting intento: %s", exc)
+        return None
+
+
+#
 # ── Tool handlers ───────────────────────────────────────────────────────
 
 
@@ -1043,6 +1117,229 @@ def mission_list(project: str) -> str:
 
 
 @app.tool()
+def begin_turn(
+    session_id: str,
+    project: str,
+    mission_id: int = 0,
+    checklist_item_id: int = 0,
+) -> str:
+    """Begin a new turn: create an intento and capture current gate states.
+
+    This is the first call of the consolidated 2-call turn workflow:
+      begin_turn → trabajo → end_turn
+
+    If an orphaned turn exists (active in memory but not matching this request),
+    it is auto-completed as "fail" so the new turn can proceed — this prevents
+    IRRECOVERABLE state where a crashed/blocked previous turn blocks all future turns.
+
+    Args:
+        session_id:         Active Hermes session identifier.
+        project:            Project slug (e.g. "voy-rojo").
+        mission_id:         Numeric mission ID (same as record_intento).
+        checklist_item_id:  Numeric checklist item ID (same as record_intento).
+
+    Returns:
+        JSON string with intento_id, status, and captured gates count.
+    """
+    # 1. Check for orphaned/active turn — auto-cleanup if needed
+    active = _get_active_intento()
+    if active is not None:
+        if active["intento_id"] != _resolve_requesting_intento(session_id, project):
+            # Orphaned turn: complete it as fail so we can proceed
+            logger.warning(
+                "Orphaned turno detected (intento #%d). Auto-completing as fail.",
+                active["intento_id"],
+            )
+            try:
+                persistence.complete_intento(
+                    intento_id=active["intento_id"],
+                    status="fail",
+                    gates_passed=0,
+                )
+            except Exception as exc:
+                logger.error("Failed to auto-complete orphaned intento #%d: %s", active["intento_id"], exc)
+            _clear_active_intento()
+
+    # 2. Capturar gates del estado actual
+    try:
+        gates = persistence.list_gate_states(session_id, project)
+    except Exception as exc:
+        logger.warning("Failed to capture gate states for begin_turn: %s", exc)
+        gates = []
+
+    # 3. Crear intento con gates capturados
+    intento_id = persistence.create_intento(
+        session_id=session_id,
+        project=project,
+        mission_id=mission_id,
+        checklist_item_id=checklist_item_id,
+    )
+
+    # 4. Persistir snapshot de gates en el intento
+    if gates:
+        try:
+            persistence.capture_gates_for_intento(intento_id, gates)
+        except Exception as exc:
+            logger.warning("Failed to capture gates for intento #%d: %s", intento_id, exc)
+
+    # 5. Registrar como turno activo
+    _set_active_intento(intento_id, session_id, project)
+
+    gates_passed = sum(1 for g in gates if g.get("state") in ("PASS", "SKIP"))
+    return json.dumps(
+        {
+            "status": "started",
+            "intento_id": intento_id,
+            "gates_captured": len(gates),
+            "gates_passed_so_far": gates_passed,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def end_turn(
+    intento_id: int,
+    status: str = "success",
+) -> str:
+    """End the current turn: validate gates and complete the intento.
+
+    This is the second (and final) call of the consolidated 2-call turn workflow:
+      begin_turn → trabajo → end_turn
+
+    The classical signature accepts only the intento_id — all definitional
+    data (session_id, project) is resolved internally from the DB so the
+    orchestrating agent never has to pass it.
+
+    end_turn NEVER blocks permanently. When gates do not pass, it completes
+    the intento with final_status="fail" and real gate detail, then clears
+    the active turn state — always leaving the system in a recoverable state.
+
+    Args:
+        intento_id: Numeric intento ID returned by begin_turn().
+        status:     Final status hint ('success' or 'fail'). Used for logging;
+                    actual completion status derives from gate validation.
+
+    Returns:
+        JSON string with completion status, gates_passed count, and gate detail.
+    """
+    global _active_intento
+
+    # 1. Resolve session_id + project from the DB (no delegation to orchestrator)
+    intento = persistence.get_intento(intento_id)
+    if intento is None:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"Intento #{intento_id} not found in database.",
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    session_id = intento["session_id"]
+    project = intento["project"]
+
+    # 2. Turn-scoping: validate against active turn OR allow recovery of running intentos
+    active = _get_active_intento()
+    if active is not None and active["intento_id"] != intento_id:
+        # Not the exact active turno — check if it's a running intento we can recover
+        if intento.get("status") == "running":
+            logger.warning(
+                "Turn-scoping mismatch (active=#%d, requested=#%d). "
+                "Auto-recovering running intento #%d.",
+                active["intento_id"],
+                intento_id,
+                intento_id,
+            )
+            # Complete the orphaned running intento so we can proceed
+            try:
+                persistence.complete_intento(
+                    intento_id=active["intento_id"],
+                    status="fail",
+                    gates_passed=0,
+                )
+            except Exception as exc:
+                logger.error("Failed to auto-complete active intento #%d during recovery: %s", active["intento_id"], exc)
+            _clear_active_intento()
+        else:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        f"Turn-scoping mismatch: turno activo es intento #{active['intento_id']} "
+                        f"pero se solicitó cerrar intento #{intento_id}."
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+    # 3. Capturar estado final de gates (always attempt, never block)
+    try:
+        final_gates = persistence.list_gate_states(session_id, project)
+    except Exception as exc:
+        logger.warning("Failed to capture final gate states: %s", exc)
+        final_gates = []
+
+    # 4. Validate gates for logging (does NOT block completion)
+    try:
+        allowed, failed_details = _validate_gates_for_completion(session_id, project)
+    except Exception as exc:
+        logger.warning("Gate validation failed (degraded): %s", exc)
+        allowed, failed_details = True, []
+    if not allowed:
+        detail = "\n".join(f"  🔴 {f}" for f in failed_details)
+        logger.warning(
+            "end_turn #%d: %d mandatory gate(s) did not pass. Completing as fail.\n%s",
+            intento_id,
+            len(failed_details),
+            detail,
+        )
+
+    # 5. Contar gates passed
+    gates_passed = sum(1 for g in final_gates if g.get("state") in ("PASS", "SKIP"))
+    final_status = "success" if gates_passed >= 4 else "fail"
+
+    # 6. Completar intento con detalle completo (NEVER blocks — always completes)
+    try:
+        persistence.complete_intento_with_gates(
+            intento_id=intento_id,
+            status=final_status,
+            gates_passed=gates_passed,
+            gates_detail=final_gates,
+        )
+    except Exception as exc:
+        logger.error("Failed to complete intento #%d: %s", intento_id, exc)
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"Failed to persist intento completion: {exc}",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # 7. Limpiar estado de turno activo
+    _clear_active_intento()
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "intento_id": intento_id,
+            "final_status": final_status,
+            "gates_passed": gates_passed,
+            "gates_total": len(final_gates) if final_gates else 4,
+            "gates": final_gates,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
 def record_intento(
     session_id: str,
     project: str,
@@ -1209,19 +1506,14 @@ def complete_intento(
     """
     # ── endTurn bouncer: validate mandatory gates against DB ────────────
     if session_id and project:
-        gates = persistence.list_gate_states(session_id, project)
-        failed = [
-            f"{g.get('gate_name', '?')}({g.get('state', 'UNKNOWN')}): {g.get('message', '')}"
-            for g in gates
-            if g.get("mandatory") and g.get("state") not in ("PASS", "SKIP", "PENDING")
-        ]
-        if failed:
-            detail = "\n".join(f"  🔴 {f}" for f in failed)
+        allowed, failed_details = _validate_gates_for_completion(session_id, project)
+        if not allowed:
+            detail = "\n".join(f"  🔴 {f}" for f in failed_details)
             return json.dumps(
                 {
                     "status": "blocked",
                     "error": (
-                        f"endTurn Bouncer: {len(failed)} mandatory gate(s) did not pass.\n{detail}\n\n"
+                        f"endTurn Bouncer: {len(failed_details)} mandatory gate(s) did not pass.\n{detail}\n\n"
                         "Fix blocking gates and retry."
                     ),
                     "intento_id": intento_id,

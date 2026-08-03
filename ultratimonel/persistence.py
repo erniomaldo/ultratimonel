@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 2
-SCHEMA_DESCRIPTION = "v2: Deck-linked missions, checklist_items, intentos, actions"
+SCHEMA_VERSION = 3
+SCHEMA_DESCRIPTION = "v3: gates_detail JSON column on intentos for turn completeness"
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -352,18 +352,25 @@ class Persistence:
                 current_ver = cur.fetchone()[0]
 
                 if current_ver == 0:
-                    # Fresh DB — apply v2 DDL
+                    # Fresh DB — apply v2 DDL then add v3 columns
                     for stmt in DDL_V2:
                         try:
                             conn.execute(stmt)
                         except sqlite3.OperationalError as exc:
                             if "already exists" not in str(exc):
                                 raise
+                    # Add v3 additions for fresh install
+                    try:
+                        conn.execute(
+                            "ALTER TABLE intentos ADD COLUMN gates_detail TEXT"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
                     conn.execute(
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
-                    logger.info("Fresh DB initialized at schema v2: %s", self._db_path)
+                    logger.info("Fresh DB initialized at schema v3: %s", self._db_path)
                 elif current_ver == 1:
                     # Migration v1 → v2
                     _migrate_v1_to_v2(conn)
@@ -372,14 +379,33 @@ class Persistence:
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
                     logger.info("Migrated DB v1→v2: %s", self._db_path)
+                elif current_ver == 2:
+                    # Migration v2 → v3: add gates_detail column to intentos
+                    try:
+                        conn.execute(
+                            "ALTER TABLE intentos ADD COLUMN gates_detail TEXT"
+                        )
+                        logger.info("Migrated DB v2→v3: added gates_detail to intentos")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists (idempotent)
+                    conn.execute(
+                        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+                        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
+                    )
+                    logger.info("Migrated DB v2→v3: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
-                    # Already current — ensure all v2 tables exist
+                    # Already current — ensure all tables exist
                     for stmt in DDL_V2:
                         try:
                             conn.execute(stmt)
                         except sqlite3.OperationalError as exc:
                             if "already exists" not in str(exc):
                                 raise
+                    # Ensure v3 column exists (idempotent)
+                    try:
+                        conn.execute("ALTER TABLE intentos ADD COLUMN gates_detail TEXT")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists
                     logger.debug("DB schema up to date (v%s)", SCHEMA_VERSION)
 
     # ── session CRUD ───────────────────────────────────────────────────
@@ -803,14 +829,65 @@ class Persistence:
                     (status, gates_passed, intento_id),
                 )
 
+    def capture_gates_for_intento(
+        self,
+        intento_id: int,
+        gates: list[dict],
+    ) -> None:
+        """Persist gate snapshot into the intento's gates_detail column.
+
+        Args:
+            intento_id: Numeric intento ID.
+            gates: List of gate dicts from list_gate_states().
+        """
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    """UPDATE intentos
+                       SET gates_detail = ?
+                       WHERE id = ?""",
+                    (json.dumps(gates, ensure_ascii=False, default=str), intento_id),
+                )
+
+    def complete_intento_with_gates(
+        self,
+        intento_id: int,
+        status: str,
+        gates_passed: int,
+        gates_detail: list[dict],
+    ) -> None:
+        """Complete an intento with full gate detail snapshot.
+
+        Args:
+            intento_id:     Numeric intento ID.
+            status:         Final status ('success' or 'fail').
+            gates_passed:   Count of gates that passed (PASS + SKIP).
+            gates_detail:   Full gate snapshot as list of dicts.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    """UPDATE intentos
+                       SET status = ?,
+                           gates_passed = ?,
+                           gates_detail = ?,
+                           completed_at = datetime('now')
+                       WHERE id = ?""",
+                    (
+                        status,
+                        gates_passed,
+                        json.dumps(gates_detail, ensure_ascii=False, default=str),
+                        intento_id,
+                    ),
+                )
+
     def get_intento(self, intento_id: int) -> Optional[dict]:
         with self._lock:
             with self._conn() as conn:
-                row = conn.execute("""
-                    SELECT i.*, gs.state as latest_gate_state, gs.message as latest_gate_msg
-                    FROM intentos i
-                    WHERE i.id = ?
-                """, (intento_id,)).fetchone()
+                row = conn.execute(
+                    "SELECT * FROM intentos WHERE id = ?",
+                    (intento_id,),
+                ).fetchone()
                 return dict(row) if row else None
 
     def list_intentos_by_checklist_item(self, checklist_item_id: int) -> list[dict]:
