@@ -1415,6 +1415,9 @@ def record_intento(
 ) -> str:
     """Create an intento (assert_gates cycle) for a specific checklist item.
 
+    DEPRECATED — use begin_turn() instead (consolidated 2-call flow:
+    begin_turn → trabajo → end_turn). Mantenida por compatibilidad.
+
     Args:
         session_id: Active Hermes session identifier.
         project:    Project slug (e.g. "voy-rojo").
@@ -1555,6 +1558,9 @@ def complete_intento(
     project: str = "",
 ) -> str:
     """Update an intento with gate results after assert_gates completes.
+
+    DEPRECATED — use end_turn() instead (consolidated 2-call flow:
+    begin_turn → trabajo → end_turn). Mantenida por compatibilidad.
 
     Args:
         intento_id:      Numeric intento ID to update.

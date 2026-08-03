@@ -25,32 +25,36 @@ Además del enforcement de gates, Ultratimonel proporciona:
 
 Ultratimonel NO es opcional en el flujo de Hermes. El archivo
 [SOUL.md](../../SOUL.md) contiene el **Protocolo de Respuesta — Hábito
-Irrompible** que exige ejecutar `assert_gates()` al inicio de CADA mensaje.
-Sin esto, el agente no tiene contexto de memoria, checkpoint ni tareas
-activas.
+Irrompible** que exige `begin_turn()` al inicio de CADA mensaje (ejecuta los
+4 gates internamente). El plugin ejecuta `assert_gates()` automáticamente en
+`pre_llm_call`. Sin esto, el agente no tiene contexto de memoria, checkpoint
+ni tareas activas.
 
 ```
 [Mensaje del usuario]
         │
         ▼
 ┌──────────────────────────────────────────┐
-│  1. assert_gates() — OBLIGATORIO         │
-│     ├── Gate 1a: AgentMemory             │
-│     ├── Gate 1b: Checkpoint              │
-│     ├── Gate 1c: Steering Docs (opcional)│
-│     └── Gate 1e: Deck (tareas activas)   │
+│  1. begin_turn() — AUTOCONTENIDO         │
+│     ├── Ejecuta los 4 gates frescos      │
+│     │   (1a AgentMemory, 1b Checkpoint,  │
+│     │    1c Steering Docs, 1e Deck)      │
+│     └── Crea el intento con snapshot     │
 ├──────────────────────────────────────────┤
-│  2. Generación del LLM (si gates PASS)   │
+│  2. Trabajo del turno (tools normales)   │
 ├──────────────────────────────────────────┤
-│  3. complete_intento() — endTurn bouncer │
-│     └── Valida gates en DB antes de      │
-│         marcar intento como completado    │
+│  3. end_turn(intento_id) — SIEMPRE       │
+│     ├── Finaliza con success o fail      │
+│     └── Nunca deja el turno atascado     │
+├──────────────────────────────────────────┤
+│  4. Reporte al usuario (resumen final)   │
 └──────────────────────────────────────────┘
 ```
 
-Si `assert_gates()` retorna algún gate en estado BLOCK, el protocolo impide
-la generación. El agente **no puede responder** hasta que resuelva los gates
-bloqueantes.
+`begin_turn()` ejecuta los 4 gates internamente (autocontenido) y crea el
+intento. Si al finalizar algún gate mandatory está BLOCK/WARN, `end_turn()`
+completa el intento como `fail` con `gates_detail` — el agente reporta al
+usuario qué gate bloqueó y por qué.
 
 ---
 
@@ -135,8 +139,10 @@ plugins:
 ### 4. Protocolo SOUL.md
 
 El archivo `~/.hermes/SOUL.md` debe incluir el **Protocolo de Respuesta —
-Hábito Irrompible** que exige ejecutar `assert_gates()` al inicio de cada
-mensaje y `record_intento()` + `complete_intento()` al finalizar.
+Hábito Irrompible** que exige `begin_turn()` al inicio de cada mensaje y
+`end_turn()` al finalizar, con reporte final al usuario (paso 6 del
+protocolo). Las tools legacy `record_intento()` + `complete_intento()` están
+**DEPRECATED** — no usarlas en flujos nuevos.
 
 Ver `scripts/deploy_soul.sh` para despliegue automatizado.
 
@@ -151,7 +157,8 @@ Ver `scripts/deploy_soul.sh` para despliegue automatizado.
 4. Agente: end_turn(intento_id, status="success")
            ├── Finaliza SIEMPRE con "success" o "fail" + gates_detail
            └── Nunca deja el turno atascado
-5. Plugin (automático): pre_tool_call bouncer → bloquea si gates no PASS
+5. Agente: Reporte al usuario (resumen de lo logrado, claro y directo)
+6. Plugin (automático): pre_tool_call bouncer → bloquea si gates no PASS
 ```
 
 **begin_turn es autocontenido**: ejecuta los 4 gates internamente y persiste
@@ -212,9 +219,11 @@ cp -r skills/protocolo-de-trazabilidad ~/.hermes/skills/
 
 ---
 
-## Tools (16)
+## Tools (18)
 
-Ultratimonel expone 16 MCP tools:
+Ultratimonel expone 18 MCP tools: **16 activas** + **2 legacy**
+(`record_intento`, `complete_intento` — ~~DEPRECATED~~, mantenidas por
+compatibilidad).
 
 ### Núcleo (Gates)
 
@@ -254,9 +263,14 @@ Ultratimonel expone 16 MCP tools:
 |------|-------|-------------|
 | `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. Flujo recomendado. |
 | `end_turn(intento_id, status="success")` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates_detail` completo. Nunca deja el turno atascado. |
-| `record_intento(session_id, project, mission_id, checklist_item_id)` | ~~DEPRECATED~~ — se mantiene por compatibilidad |
-| `complete_intento(intento_id, status, gates_passed, session_id, project)` | ~~DEPRECATED~~ — se mantiene por compatibilidad |
-| `delete_intento(intento_id)` | Elimina un intento por ID |
+| `delete_intento(intento_id)` | Elimina un intento por ID (limpieza operacional) |
+
+### Legacy / Archivadas (compatibilidad — no usar en flujos nuevos)
+
+| Tool | Firma | Descripción |
+|------|-------|-------------|
+| `record_intento(session_id, project, mission_id, checklist_item_id)` | ~~DEPRECATED~~ — usa `begin_turn()` en su lugar |
+| `complete_intento(intento_id, status, gates_passed, session_id, project)` | ~~DEPRECATED~~ — usa `end_turn()` en su lugar |
 
 ### Deck Cards
 
@@ -278,7 +292,7 @@ ultratimonel/
 ├── .spec -> ~/.spec                 # Symlink a spec externa
 ├── ultratimonel/
 │   ├── __init__.py                  # Package metadata
-│   ├── server.py                    # FastMCP — 16 tool handlers
+│   ├── server.py                    # FastMCP — 18 tool handlers (16 activas + 2 legacy)
 │   ├── persistence.py               # SQLite layer (WAL, 9 tablas, migrations)
 │   ├── gate_engine.py               # State machine: PASS/SKIP/WARN/BLOCK
 │   ├── triple_match.py              # Orquestación de gates 1a→1b→1c→1e
@@ -365,21 +379,25 @@ server(action="status")  # Estado actual
 
 ## endTurn Bouncer
 
-Validación server-side en `complete_intento()`. Cuando se proporcionan
-`session_id` y `project`, la función consulta `list_gate_states()` en SQLite
-para verificar que **todas las gates mandatory estén PASS o SKIP**.
+Validación server-side del cierre de turno. En el flujo recomendado vive en
+`end_turn()`; también está disponible en `complete_intento()` (legacy). Cuando
+se proporcionan `session_id` y `project`, la función consulta
+`list_gate_states()` en SQLite para verificar que **todas las gates mandatory
+estén PASS o SKIP**.
 
 Si alguna gate mandatory está BLOCK o WARN, la función retorna
-`status: "blocked"` con la lista de gates fallando, impidiendo la
-completación del intento.
+`status: "blocked"` (en `end_turn()` el intento se completa como `fail` con
+`gates_detail` — nunca bloquea permanentemente) con la lista de gates
+fallando.
 
-**Parámetros nuevos en `complete_intento()`:**
+**Parámetros en `complete_intento()` (legacy):**
 
 - `session_id` (str, default `""`) — solo valida si es non-empty
 - `project` (str, default `""`) — solo valida si es non-empty
 
 Esto garantiza backward compatibility: llamadas existentes sin estos
-parámetros siguen funcionando sin validación.
+parámetros siguen funcionando sin validación. En flujos nuevos usar
+`end_turn(intento_id)`.
 
 ---
 
