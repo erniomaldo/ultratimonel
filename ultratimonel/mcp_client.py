@@ -249,7 +249,7 @@ class _MCPConnection:
         self.proc.stdin.write((init_req + "\n").encode())
         self.proc.stdin.flush()
 
-        init_resp = _read_line(self.proc.stdout, timeout=5.0)
+        init_resp = _read_line(self.proc.stdout, timeout=30.0)
         if init_resp is None:
             logger.warning("No initialize response from %s (timeout)", self.server_name)
             self._die()
