@@ -165,6 +165,27 @@ del agente (sigue existiendo como tool, usada por el plugin en pre_llm_call).
 **Fix de timeout**: el initialize del `mcp_client` pasó de 5s a 30s para
 desbloquear gates 1c/1e con bridge http_to_stdio (llamadas HTTP lentas).
 
+### 6. Skills del proyecto (para cualquier Hermes)
+
+Las skills del flujo de trazabilidad viven **DENTRO de este repo** en `skills/`:
+
+| Skill | Propósito |
+|-------|-----------|
+| `skills/ultratimonel-ciclo-basico/SKILL.md` | Ciclo básico: mission_list → begin_turn → end_turn (sin experimentar) |
+| `skills/protocolo-de-trazabilidad/SKILL.md` | Protocolo Quad Persistence completo (begin/end, gates, checkpoints, agentmemory, Deck) |
+
+**Instalación en un Hermes nuevo:**
+
+```bash
+# Copiar desde el repo (NUNCA editar la copia instalada)
+cp -r skills/ultratimonel-ciclo-basico ~/.hermes/skills/
+cp -r skills/protocolo-de-trazabilidad ~/.hermes/skills/
+```
+
+> ⚠️ **REGLAS DE SINCRONÍA (igual que el plugin):**
+> 1. **NO edites la copia en `~/.hermes/skills/`** — los cambios se hacen en el repo y se re-copian; la copia instalada se desincroniza si se edita ahí.
+> 2. El repo es la única fuente autorizada de las skills del proyecto.
+
 ---
 
 ## Gates
@@ -408,6 +429,7 @@ python -m pytest tests/ -v
 - Python ≥ 3.13
 - `fastmcp` — Framework MCP
 - `httpx` — Cliente HTTP para calls MCP externas (Deck)
+- **`http-to-stdio`** — bridge HTTP→stdio para conectar a Nextcloud MCP: [github.com/erniomaldo/http-to-stdio](https://github.com/erniomaldo/http-to-stdio) (público)
 - `sqlite3` — Persistencia (stdlib)
 
 ---
