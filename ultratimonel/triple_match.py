@@ -298,7 +298,7 @@ def _call_deck_impl(context: dict) -> GateResult:
                 "stack": stack_name,
                 "description": card.get("description", ""),
                 "duedate": card.get("duedate"),
-                "labels": [l.get("title", "") for l in (card.get("labels") or [])],
+                "labels": [l["title"] if isinstance(l, dict) else str(l) for l in (card.get("labels") or [])],
             }
             cards.append(card_info)
 

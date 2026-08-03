@@ -237,3 +237,108 @@ class TestOverdueCheck:
             assert result.state == PASS
             assert result.state == PASS
             assert "overdue" not in result.message.lower()
+
+
+class TestLabelParsing:
+    """Labels can be dicts, strings, null, or mixed — Req-1 labels-tolerant-parsing."""
+
+    def test_labels_as_dicts(self):
+        """Dict labels -> extract title field."""
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
+                    {"id": 1, "title": "Task A", "description": "",
+                     "duedate": None,
+                     "labels": [{"id": 1, "title": "Crítica", "color": "#ff0000"}]}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+            result = _call_deck(context)
+            assert result.state == PASS
+            cards_data = result.result_data.get("deck_cards", [])
+            assert len(cards_data) == 1
+            assert cards_data[0]["labels"] == ["Crítica"]
+
+    def test_labels_as_strings(self):
+        """String labels -> use string as title (multi-deployment abec)."""
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
+                    {"id": 1, "title": "Task B", "description": "",
+                     "duedate": None,
+                     "labels": ["🚨 Crítica", "Prioritaria"]}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+            result = _call_deck(context)
+            assert result.state == PASS
+            cards_data = result.result_data.get("deck_cards", [])
+            assert len(cards_data) == 1
+            assert cards_data[0]["labels"] == ["🚨 Crítica", "Prioritaria"]
+
+    def test_labels_null(self):
+        """Null labels -> empty list."""
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
+                    {"id": 1, "title": "Task C", "description": "",
+                     "duedate": None,
+                     "labels": None}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+            result = _call_deck(context)
+            assert result.state == PASS
+            cards_data = result.result_data.get("deck_cards", [])
+            assert len(cards_data) == 1
+            assert cards_data[0]["labels"] == []
+
+    def test_labels_empty(self):
+        """Empty labels -> empty list."""
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
+                    {"id": 1, "title": "Task D", "description": "",
+                     "duedate": None,
+                     "labels": []}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+            result = _call_deck(context)
+            assert result.state == PASS
+            cards_data = result.result_data.get("deck_cards", [])
+            assert len(cards_data) == 1
+            assert cards_data[0]["labels"] == []
+
+    def test_labels_mixed_str_and_dict(self):
+        """Mixed str+dict labels -> both handled correctly."""
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
+                    {"id": 1, "title": "Task E", "description": "",
+                     "duedate": None,
+                     "labels": [{"id": 2, "title": "FromDict"}, "FromString"]}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+            result = _call_deck(context)
+            assert result.state == PASS
+            cards_data = result.result_data.get("deck_cards", [])
+            assert len(cards_data) == 1
+            assert cards_data[0]["labels"] == ["FromDict", "FromString"]
+
+    def test_card_without_labels_key(self):
+        """Card missing labels key -> empty list (no regressión)."""
+        with patch("ultratimonel.triple_match.call_mcp_tool") as mock:
+            mock.return_value = ([
+                {"title": "To Do", "cards": [
+                    {"id": 1, "title": "Task F", "description": "",
+                     "duedate": None}
+                ]}
+            ], None)
+            context = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+            result = _call_deck(context)
+            assert result.state == PASS
+            cards_data = result.result_data.get("deck_cards", [])
+            assert len(cards_data) == 1
+            assert cards_data[0]["labels"] == []
