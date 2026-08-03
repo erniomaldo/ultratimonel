@@ -1,5 +1,9 @@
 # Ultratimonel — Pre-flight Gate Enforcement + Missions + Dashboard
 
+<p align="center">
+  <img src="docs/logo.png" alt="Ultratimonel logo" width="323">
+</p>
+
 **Ultratimonel** es un servidor MCP (Model Context Protocol) que implementa el
 protocolo **pre-flight** para Hermes Agent. Actúa como un "guardia de
 seguridad" que se ejecuta **antes de cada generación** del LLM, verificando que
