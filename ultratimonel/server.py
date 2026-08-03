@@ -1122,11 +1122,17 @@ def begin_turn(
     project: str,
     mission_id: int = 0,
     checklist_item_id: int = 0,
+    message: str = "",
+    sender: str = "user",
 ) -> str:
-    """Begin a new turn: create an intento and capture current gate states.
+    """Begin a new turn: execute gates fresh and create an intento.
 
     This is the first call of the consolidated 2-call turn workflow:
       begin_turn → trabajo → end_turn
+
+    begin_turn EJECUTA INTERNAMENTE los 4 gates (1a/1b/1c/1e) de forma fresca,
+    persistiendo los resultados en gate_state y capturándolos en el intento.
+    Esto elimina la necesidad de llamar assert_gates manualmente antes del turno.
 
     If an orphaned turn exists (active in memory but not matching this request),
     it is auto-completed as "fail" so the new turn can proceed — this prevents
@@ -1137,9 +1143,11 @@ def begin_turn(
         project:            Project slug (e.g. "voy-rojo").
         mission_id:         Numeric mission ID (same as record_intento).
         checklist_item_id:  Numeric checklist item ID (same as record_intento).
+        message:            The user's raw message / query (used for context extraction).
+        sender:             Optional sender name (default: "user").
 
     Returns:
-        JSON string with intento_id, status, and captured gates count.
+        JSON string with intento_id, status, and real fresh gate counts.
     """
     # 1. Check for orphaned/active turn — auto-cleanup if needed
     active = _get_active_intento()
@@ -1160,38 +1168,97 @@ def begin_turn(
                 logger.error("Failed to auto-complete orphaned intento #%d: %s", active["intento_id"], exc)
             _clear_active_intento()
 
-    # 2. Capturar gates del estado actual
-    try:
-        gates = persistence.list_gate_states(session_id, project)
-    except Exception as exc:
-        logger.warning("Failed to capture gate states for begin_turn: %s", exc)
-        gates = []
+    # 2. Ejecutar los 4 gates de forma fresca
+    context = extract_context(message, session_id, sender=sender)
 
-    # 3. Crear intento con gates capturados
+    try:
+        persistence.upsert_session(
+            session_id=session_id,
+            sender=context["sender"],
+            topic=context["topic"],
+            project=context["project"],
+        )
+    except Exception as exc:
+        logger.warning("Session persistence failed (degraded): %s", exc)
+
+    try:
+        gate_results = run_triple_match(context)
+    except Exception as exc:
+        logger.warning("Gate execution failed (degraded): %s", exc)
+        gate_results = []
+
+    # 3. Agregar info de mandatory a cada resultado
+    for r in gate_results:
+        cfg = GATE_CONFIG_MAP.get(r.name)
+        if cfg:
+            r.mandatory = cfg.mandatory
+
+    overall, gate_dicts = aggregate(gate_results)
+    context_envelope = build_context_envelope(gate_results)
+
+    # 4. Persistir cada gate state fresco
+    resolved_project = context["project"]
+    try:
+        for r in gate_results:
+            persistence.upsert_gate_state(
+                session_id=session_id,
+                project=resolved_project,
+                gate_name=r.name,
+                state=r.state,
+                mandatory=r.mandatory,
+                duration_ms=int(r.duration_ms),
+                message=r.message,
+                result_data=r.result_data,
+            )
+
+        # Solo persistir misión si es un proyecto conocido
+        if is_known_project(resolved_project):
+            gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
+            persistence.upsert_action(
+                session_id=session_id,
+                project=resolved_project,
+                gates_passed=gates_passed,
+                gates_total=len(DEFAULT_GATES),
+            )
+        else:
+            logger.info(
+                "Skipping mission persistence: project '%s' is not a known project",
+                resolved_project,
+            )
+    except Exception as exc:
+        logger.warning("Gate state persistence failed (degraded): %s", exc)
+
+    # 5. Crear intento con los gates frescos
     intento_id = persistence.create_intento(
         session_id=session_id,
-        project=project,
+        project=resolved_project,
         mission_id=mission_id,
         checklist_item_id=checklist_item_id,
     )
 
-    # 4. Persistir snapshot de gates en el intento
-    if gates:
+    # 6. Persistir snapshot de gates en el intento
+    if gate_results:
         try:
-            persistence.capture_gates_for_intento(intento_id, gates)
+            persistence.capture_gates_for_intento(intento_id, gate_dicts)
         except Exception as exc:
             logger.warning("Failed to capture gates for intento #%d: %s", intento_id, exc)
 
-    # 5. Registrar como turno activo
-    _set_active_intento(intento_id, session_id, project)
+    # 7. Registrar como turno activo
+    _set_active_intento(intento_id, session_id, resolved_project)
 
-    gates_passed = sum(1 for g in gates if g.get("state") in ("PASS", "SKIP"))
+    gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
     return json.dumps(
         {
             "status": "started",
             "intento_id": intento_id,
-            "gates_captured": len(gates),
+            "gates_captured": len(gate_results),
             "gates_passed_so_far": gates_passed,
+            "overall": overall,
+            "context": {
+                "sender": context["sender"],
+                "topic": context["topic"],
+                "project": resolved_project,
+            },
         },
         ensure_ascii=False,
         default=str,

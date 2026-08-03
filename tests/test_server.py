@@ -131,7 +131,7 @@ class TestAssertGates:
     def test_assert_gates_uses_status_key(self, mock_triple, mock_persistence):
         """assert_gates returns 'status' (not 'overall')."""
         from ultratimonel.server import assert_gates
-        from ultratimonel.gate_engine import GateResult, PASS, WARN
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP, WARN
 
         mock_triple.return_value = [
             GateResult(name="1a", state=PASS, message="ok"),
@@ -149,66 +149,105 @@ class TestAssertGates:
 
 
 class TestBeginTurn:
-    """begin_turn tool behavior."""
+    """begin_turn tool behavior — executes fresh gates internally."""
 
     def setup_method(self):
         """Reset turn state before each test."""
         import ultratimonel.server as srv
         srv._clear_active_intento()
 
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
-    def test_begin_turn_creates_intento_with_gates(self, mock_persistence):
-        """begin_turn creates intento and captures gate states."""
+    def test_begin_turn_executes_fresh_gates(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn executes 4 gates fresh and persists them."""
         from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
 
-        mock_persistence.list_gate_states.return_value = [
-            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-            {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
-            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
-            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok", result_data={"memory_snippets": []}),
+            GateResult(name="1b", state=PASS, message="ok", result_data={"checkpoint_state": {}}),
+            GateResult(name="1c", state=SKIP, message="n/a", result_data={"steering_docs": []}),
+            GateResult(name="1e", state=PASS, message="deck ok", result_data={"deck_cards": []}),
         ]
         mock_persistence.create_intento.return_value = 42
 
-        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "test msg", "user"))
         assert result["status"] == "started"
         assert result["intento_id"] == 42
         assert result["gates_captured"] == 4
         assert result["gates_passed_so_far"] == 4
+        assert result["overall"] == "PASS"
 
-        mock_persistence.create_intento.assert_called_once_with(
-            session_id="sess-1", project="voy-rojo", mission_id=5, checklist_item_id=10
-        )
+        # Verify gates were executed fresh, not read from DB
+        mock_triple.assert_called_once()
+        mock_extract.assert_called_once_with("test msg", "sess-1", sender="user")
+
+        # Verify each gate was persisted via upsert_gate_state
+        assert mock_persistence.upsert_gate_state.call_count == 4
+
+        # Verify intento created with correct project (from context, not param)
+        create_call = mock_persistence.create_intento.call_args
+        assert create_call[1]["project"] == "voy-rojo"
+
         mock_persistence.capture_gates_for_intento.assert_called_once()
 
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
-    def test_begin_turn_no_prev_gates(self, mock_persistence):
-        """begin_turn with no prior gates creates intento with empty array."""
+    def test_begin_turn_services_unavailable_returns_warn(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn with services down returns WARN gates and still creates intento."""
         from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, WARN
 
-        mock_persistence.list_gate_states.return_value = []
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        # All gates fail (services unavailable)
+        mock_triple.return_value = [
+            GateResult(name="1a", state=WARN, message="AgentMemory timeout"),
+            GateResult(name="1b", state=WARN, message="Checkpoint timeout"),
+            GateResult(name="1c", state=WARN, message="Collective unavailable"),
+            GateResult(name="1e", state=WARN, message="Deck error: timeout"),
+        ]
         mock_persistence.create_intento.return_value = 43
 
-        result = json.loads(begin_turn("sess-2", "alpha", 1, 1))
+        result = json.loads(begin_turn("sess-2", "voy-rojo", 1, 1, "msg", "user"))
         assert result["status"] == "started"
         assert result["intento_id"] == 43
-        assert result["gates_captured"] == 0
-        assert result["gates_passed_so_far"] == 0
+        assert result["gates_captured"] == 4
+        assert result["gates_passed_so_far"] == 0  # WARN gates don't count as passed
+        assert result["overall"] == "WARN"
 
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
-    def test_begin_turn_orphaned_auto_cleanup(self, mock_persistence):
+    def test_begin_turn_orphaned_auto_cleanup(self, mock_persistence, mock_extract, mock_triple):
         """begin_turn auto-cleans orphaned active turn instead of blocking."""
         from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
         import ultratimonel.server as srv
 
         # Simulate orphaned active turn (different session/project)
         srv._set_active_intento(99, "sess-old", "old-proj")
 
-        mock_persistence.list_gate_states.return_value = []
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
         mock_persistence.create_intento.return_value = 60
         # _resolve_requesting_intento returns None (no running intento for new session)
         mock_persistence._conn.return_value.__enter__.return_value.execute.fetchone.return_value = None
 
-        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
         assert result["status"] == "started"
         assert result["intento_id"] == 60
         # Orphaned intento 99 should have been auto-completed as fail
@@ -218,23 +257,38 @@ class TestBeginTurn:
 
         srv._clear_active_intento()
 
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
-    def test_begin_turn_after_failed_turn(self, mock_persistence):
+    def test_begin_turn_after_failed_turn(self, mock_persistence, mock_extract, mock_triple):
         """begin_turn works fine after a previous turn ended as fail."""
         from ultratimonel.server import begin_turn, end_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
         import ultratimonel.server as srv
 
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        all_pass_gates = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
+
+        mock_triple.return_value = all_pass_gates
+
         # First turn: all PASS → success
+        mock_persistence.create_intento.side_effect = [70, 71]  # two begin_turn calls
+        # end_turn needs list_gate_states for validation + final capture
         mock_persistence.list_gate_states.return_value = [
             {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
             {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
-            {"gate_name": "1c", "state": "PASS", "mandatory": 1, "message": "ok"},
-            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
         ]
-        mock_persistence.create_intento.side_effect = [70, 71]  # two begin_turn calls
 
-        # First begin + end (success)
-        begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+        begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
         assert begin_result["status"] == "started"
         assert begin_result["intento_id"] == 70
 
@@ -249,9 +303,103 @@ class TestBeginTurn:
         mock_persistence.get_intento.return_value = {
             "id": 71, "session_id": "sess-1", "project": "voy-rojo"
         }
-        begin_result2 = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+        begin_result2 = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
         assert begin_result2["status"] == "started"
         assert begin_result2["intento_id"] == 71
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_begin_turn_returns_context_info(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn response includes extracted context."""
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {
+            "sender": "alice", "topic": "design review", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
+        mock_persistence.create_intento.return_value = 44
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "review please", "alice"))
+        assert result["status"] == "started"
+        assert result["context"]["sender"] == "alice"
+        assert result["context"]["topic"] == "design review"
+        assert result["context"]["project"] == "voy-rojo"
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_begin_turn_backward_compat_no_message(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn works with old signature (no message/sender)."""
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {
+            "sender": "user", "topic": "", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
+        mock_persistence.create_intento.return_value = 45
+
+        # Old signature: only session_id, project, mission_id, checklist_item_id
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+        assert result["status"] == "started"
+        assert result["intento_id"] == 45
+        assert result["gates_captured"] == 4
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_begin_turn_gate_execution_failure_degraded(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn degrades gracefully when run_triple_match raises."""
+        from ultratimonel.server import begin_turn
+
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        mock_triple.side_effect = RuntimeError("MCP bridge down")
+        mock_persistence.create_intento.return_value = 46
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
+        assert result["status"] == "started"
+        assert result["intento_id"] == 46
+        assert result["gates_captured"] == 0
+        assert result["gates_passed_so_far"] == 0
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_begin_turn_persistence_failure_degraded(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn still creates intento even if gate persistence fails."""
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
+        # First call (upsert_session) works, second (create_intento) works, third (upsert_gate_state) fails
+        mock_persistence.upsert_gate_state.side_effect = Exception("DB locked")
+        mock_persistence.create_intento.return_value = 47
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
+        assert result["status"] == "started"
+        assert result["intento_id"] == 47
 
 
 class TestEndTurn:
@@ -347,28 +495,35 @@ class TestEndTurn:
         import ultratimonel.server as srv
         assert srv._get_active_intento() is None
 
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
-    def test_end_turn_gate_capture_failure_completes(self, mock_persistence):
+    def test_end_turn_gate_capture_failure_completes(self, mock_persistence, mock_extract, mock_triple):
         """end_turn when list_gate_states fails in step 5 still completes."""
         from ultratimonel.server import begin_turn, end_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
 
-        # First call (begin_turn) succeeds, second+third (end_turn capture + validation) fail
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        # begin_turn: all gates PASS
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=PASS, message="ok"),
+            GateResult(name="1e", state=PASS, message="ok"),
+        ]
+        # end_turn: list_gate_states fails for both validation and final capture
         mock_persistence.list_gate_states.side_effect = [
-            [  # begin_turn capture — all PASS
-                {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1c", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
-            ],
-            Exception("DB connection lost"),  # end_turn capture fails
-            Exception("DB connection lost again"),  # end_turn validation also fails
+            Exception("DB connection lost"),  # end_turn validation fails
+            Exception("DB connection lost again"),  # end_turn final capture fails
         ]
         mock_persistence.create_intento.return_value = 51
         mock_persistence.get_intento.return_value = {
             "id": 51, "session_id": "sess-1", "project": "voy-rojo"
         }
 
-        begin_turn("sess-1", "voy-rojo", 5, 10)
+        begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user")
 
         # Should complete with empty gates, not crash
         result = json.loads(end_turn(51))
@@ -552,55 +707,50 @@ class TestCompleteIntentoBackwardCompat:
 
 
 class TestFluxConsolidated:
-    """Full consolidated 2-call workflow."""
+    """Full consolidated 2-call workflow — begin_turn executes gates fresh."""
 
     def setup_method(self):
         import ultratimonel.server as srv
         srv._clear_active_intento()
 
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
-    def test_full_workflow_begin_then_end(self, mock_persistence):
-        """begin_turn → work → end_turn = complete workflow."""
+    def test_full_workflow_begin_then_end(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn → work → end_turn = complete workflow WITHOUT assert_gates manual."""
         from ultratimonel.server import begin_turn, end_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
 
-        # Simulate gates that pass during the turn
-        # begin_turn: 1 call to list_gate_states
-        # end_turn: 2 calls (validate + final capture)
-        mock_persistence.list_gate_states.side_effect = [
-            # 1st: begin_turn captures initial state (all PASS)
-            [
-                {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1c", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
-            ],
-            # 2nd: end_turn validation (all still PASS)
-            [
-                {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1c", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
-            ],
-            # 3rd: end_turn final capture (all still PASS)
-            [
-                {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1c", "state": "PASS", "mandatory": 1, "message": "ok"},
-                {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
-            ],
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        # begin_turn executes 4 gates fresh (ALL PASS)
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
+        # end_turn: list_gate_states for validation + final capture
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
         ]
         mock_persistence.create_intento.return_value = 140
         mock_persistence.get_intento.return_value = {
             "id": 140, "session_id": "sess-1", "project": "voy-rojo"
         }
 
-        # Step 1: begin_turn
-        begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+        # Step 1: begin_turn — executes gates FRESH, no assert_gates needed
+        begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
         assert begin_result["status"] == "started"
         assert begin_result["intento_id"] == 140
         assert begin_result["gates_captured"] == 4
+        assert begin_result["gates_passed_so_far"] == 4
 
-        # Step 2: [work happens here — gates already PASS]
+        # Step 2: [work happens here — gates already executed fresh]
 
         # Step 3: end_turn (classical signature)
         end_result = json.loads(end_turn(140))
@@ -618,3 +768,87 @@ class TestFluxConsolidated:
         # Verify turno limpio despues de end_turn
         import ultratimonel.server as srv
         assert srv._get_active_intento() is None
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_workflow_no_assert_gates_required(self, mock_persistence, mock_extract, mock_triple):
+        """The 2-call workflow does NOT require manual assert_gates call."""
+        from ultratimonel.server import begin_turn, end_turn
+        from ultratimonel.gate_engine import GateResult, PASS, WARN, SKIP
+
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        # Gates: 1a=PASS, 1b=WARN (agentmemory down), 1c=SKIP, 1e=PASS
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=WARN, message="AgentMemory timeout"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=PASS, message="deck ok"),
+        ]
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1b", "state": "WARN", "mandatory": 1, "message": "AgentMemory timeout"},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
+        ]
+        mock_persistence.create_intento.return_value = 141
+        mock_persistence.get_intento.return_value = {
+            "id": 141, "session_id": "sess-1", "project": "voy-rojo"
+        }
+
+        # begin_turn executes gates fresh — NO assert_gates call needed
+        begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
+        assert begin_result["status"] == "started"
+        assert begin_result["intento_id"] == 141
+        assert begin_result["gates_captured"] == 4
+        assert begin_result["overall"] == "WARN"
+
+        # end_turn completes as fail (only 3/4 PASS+SKIP)
+        end_result = json.loads(end_turn(141))
+        assert end_result["status"] == "ok"
+        assert end_result["final_status"] == "fail"
+        assert end_result["gates_passed"] == 3
+
+        # Verify no manual assert_gates was needed (triple_match was called directly)
+        mock_triple.assert_called_once()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_workflow_with_block_gate(self, mock_persistence, mock_extract, mock_triple):
+        """begin_turn with BLOCK gate -> intent created, end_turn completes as fail."""
+        from ultratimonel.server import begin_turn, end_turn
+        from ultratimonel.gate_engine import GateResult, PASS, BLOCK, SKIP
+
+        mock_extract.return_value = {
+            "sender": "user", "topic": "test", "project": "voy-rojo"
+        }
+        # 1e is BLOCK (overdue cards)
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS, message="ok"),
+            GateResult(name="1b", state=PASS, message="ok"),
+            GateResult(name="1c", state=SKIP, message="n/a"),
+            GateResult(name="1e", state=BLOCK, message="overdue cards"),
+        ]
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+            {"gate_name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue cards"},
+        ]
+        mock_persistence.create_intento.return_value = 142
+        mock_persistence.get_intento.return_value = {
+            "id": 142, "session_id": "sess-1", "project": "voy-rojo"
+        }
+
+        begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
+        assert begin_result["status"] == "started"
+        assert begin_result["intento_id"] == 142
+        assert begin_result["overall"] == "BLOCK"
+
+        end_result = json.loads(end_turn(142))
+        assert end_result["status"] == "ok"
+        assert end_result["final_status"] == "fail"
+        assert end_result["gates_passed"] == 3
