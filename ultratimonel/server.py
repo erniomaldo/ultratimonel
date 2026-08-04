@@ -1018,6 +1018,11 @@ def sync_tasks(project: str) -> str:
                                 }
                             )
 
+                # Fallback: if stacks didn't provide description, use card_detail's full description
+                # so the markdown checkbox parser below can still extract checklists.
+                if not description and isinstance(card_detail, dict):
+                    description = card_detail.get("description", "") or ""
+
                 # No checklist items from Deck API? Parse description for markdown checkboxes
                 if checklist_total == 0 and description:
                     lines = description.strip().split("\n")
@@ -1465,6 +1470,9 @@ def record_intento(
 ) -> str:
     """Create an intento (assert_gates cycle) for a specific checklist item.
 
+    DEPRECATED — use begin_turn() instead (consolidated 2-call flow:
+    begin_turn → trabajo → end_turn). Mantenida por compatibilidad.
+
     Args:
         session_id: Active Hermes session identifier.
         project:    Project slug (e.g. "voy-rojo").
@@ -1605,6 +1613,9 @@ def complete_intento(
     project: str = "",
 ) -> str:
     """Update an intento with gate results after assert_gates completes.
+
+    DEPRECATED — use end_turn() instead (consolidated 2-call flow:
+    begin_turn → trabajo → end_turn). Mantenida por compatibilidad.
 
     Args:
         intento_id:      Numeric intento ID to update.

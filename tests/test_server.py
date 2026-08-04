@@ -12,6 +12,140 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 
+class TestSyncTasksMarkdownFallback:
+    """Test sync_tasks markdown checklist fallback (card #141)."""
+
+    _SAMPLE_MARKDOWN_DESC = (
+        "Tarea de prueba\n\n"
+        "- [ ] Paso uno sin completar\n"
+        "- [x] Paso dos ya hecho\n"
+        "- [ ] Paso tres pendiente\n"
+    )
+    _SAMPLE_STACKS_DESC = "Descripción desde stacks (no markdown)"
+
+    def _make_stacks_response(self, cards):
+        return {"stacks": [{"id": 1, "title": "To Do", "cards": cards}]}
+
+    def _make_card(self, card_id, title, description=""):
+        card = {"id": card_id, "title": title}
+        if description:
+            card["description"] = description
+        return card
+
+    def _make_card_detail(self, desc_with_checklist):
+        return {"id": 99, "description": desc_with_checklist}
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_fallback_uses_card_detail_description(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """Stacks no trae description; card_detail sí tiene markdown con checklists.
+
+        El fallback debe reactivar el parseo de `- [ ]` / `- [x]`.
+        """
+        from ultratimonel.server import sync_tasks
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+
+        card = self._make_card(106, "Card sin desc en stacks")
+        card_detail = self._make_card_detail(self._SAMPLE_MARKDOWN_DESC)
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 1
+        mock_persistence.upsert_checklist_item.return_value = None
+
+        result = json.loads(sync_tasks("testproj"))
+
+        assert result["synced"] == 1
+        # Verificar que upsert_mission se llamó con checklist_total=3, done=1
+        upsert_mission_calls = mock_persistence.upsert_mission.call_args_list
+        assert len(upsert_mission_calls) >= 1
+        mission_kwargs = upsert_mission_calls[0][1]
+        assert mission_kwargs["checklist_total"] == 3
+        assert mission_kwargs["checklist_done"] == 1
+        # La descripción debe ser la del card_detail (fallback)
+        assert mission_kwargs["description"] == self._SAMPLE_MARKDOWN_DESC
+
+        # Verificar que se crearon los items de checklist
+        assert mock_persistence.upsert_checklist_item.call_count == 3
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_stacks_description_takes_priority(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """Stacks SÍ trae description: debe usarse esa (regresión).
+
+        El fallback NO SHALL interferir cuando stacks ya provee descripción.
+        """
+        from ultratimonel.server import sync_tasks
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+
+        card = self._make_card(
+            99, "Card con desc en stacks", description=self._SAMPLE_STACKS_DESC
+        )
+        card_detail = self._make_card_detail(self._SAMPLE_MARKDOWN_DESC)
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 2
+        mock_persistence.upsert_checklist_item.return_value = None
+
+        result = json.loads(sync_tasks("testproj"))
+
+        assert result["synced"] == 1
+        mission_kwargs = mock_persistence.upsert_mission.call_args_list[0][1]
+        # Debe usar la descripción de stacks, no la del card_detail
+        assert mission_kwargs["description"] == self._SAMPLE_STACKS_DESC
+        # Y no debe haber items de checklist parseados (stacks description no tiene markdown)
+        assert mock_persistence.upsert_checklist_item.call_count == 0
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_neither_has_description_no_crash(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """Ni stacks ni card_detail tienen description: debe completar sin crash."""
+        from ultratimonel.server import sync_tasks
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+
+        card = self._make_card(77, "Card sin descripción en ningún lado")
+        card_detail = {"id": 77}  # sin campo description
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 3
+
+        result = json.loads(sync_tasks("testproj"))
+        assert result["synced"] == 1
+        assert result["total_errors"] == 0
+
+
 class TestCompleteGate:
     """complete_gate output schema and no-op behavior."""
 

@@ -21,3 +21,4 @@ project_maps.json
 
 # Tooling caches
 .atl/
+.spec
