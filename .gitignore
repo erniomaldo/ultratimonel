@@ -18,3 +18,7 @@ __pycache__/
 
 # Machine-specific project maps (see project_maps.json.template)
 project_maps.json
+
+# Tooling caches
+.atl/
+.spec
