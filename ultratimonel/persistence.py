@@ -794,6 +794,17 @@ class Persistence:
                 """, (mission_id,)).fetchall()
                 return [dict(r) for r in rows]
 
+    def get_checklist_item_by_id(self, checklist_item_id: int) -> "Optional[dict]":
+        """Retrieve a single checklist item by its primary key."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT id, mission_id, item_index, text, done"
+                    " FROM checklist_items WHERE id = ?",
+                    (checklist_item_id,),
+                ).fetchone()
+                return dict(row) if row else None
+
     # ── intentos ────────────────────────────────────────────────────────
 
     def create_intento(

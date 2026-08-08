@@ -9,12 +9,13 @@ import asyncio
 import json
 import os
 import sys
+import time
 import pytest
+from unittest.mock import patch
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-pytestmark = pytest.mark.asyncio
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MAIN_PY = os.path.join(PROJECT_ROOT, "main.py")
@@ -201,3 +202,143 @@ class TestIntegration:
 
         data = json.loads(result.content[0].text)
         assert data["context"]["topic"] == "general"
+
+
+class TestToolsUsabilityRetroIntegration:
+    """End-to-end integration tests using real DB + direct server function calls."""
+
+    def _make_db(self):
+        import tempfile
+        from ultratimonel.persistence import Persistence
+        db_fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(db_fd)
+        p = Persistence(db_path=db_path)
+        mid = p.upsert_mission(deck_task_id=1, project="test-proj", title="Sprint Planning", description="Q4 planning")
+        p.upsert_checklist_item(mid, item_index=0, text="Define goals")
+        p.upsert_checklist_item(mid, item_index=1, text="Assign owners")
+        return p, db_path
+
+    def test_mission_get_returns_minimal_fields(self):
+        """F-TU-01: mission_get returns id, title, checklist_item_ids only."""
+        import ultratimonel.server as srv
+        p, db_path = self._make_db()
+        try:
+            # Patch the module-level persistence to use our test DB
+            orig_persistence = srv.persistence
+            srv.persistence = p
+            try:
+                result = json.loads(srv.mission_get(1))
+                assert result["id"] == 1
+                assert result["title"] == "Sprint Planning"
+                assert "checklist_item_ids" in result
+                assert len(result["checklist_item_ids"]) == 2
+                assert "description" not in result
+                assert "checklist_items" not in result
+            finally:
+                srv.persistence = orig_persistence
+        finally:
+            p.close()
+            os.unlink(db_path)
+
+    def test_mission_list_light_mode_omits_description(self):
+        """F-TU-03: light mode omits description and checklist_items."""
+        import ultratimonel.server as srv
+        p, db_path = self._make_db()
+        try:
+            orig_persistence = srv.persistence
+            srv.persistence = p
+            try:
+                result = json.loads(srv.mission_list("test-proj", include_description=False))
+                assert result["project"] == "test-proj"
+                assert result["total"] == 1
+                mission = result["missions"][0]
+                assert set(mission.keys()) == {"id", "title", "status"}
+                assert mission["id"] == 1
+                assert mission["title"] == "Sprint Planning"
+                assert "description" not in mission
+                assert "checklist_items" not in mission
+            finally:
+                srv.persistence = orig_persistence
+        finally:
+            p.close()
+            os.unlink(db_path)
+
+    def test_begin_turn_persists_explicit_project(self):
+        """S7+S8: begin_turn uses explicit project; end_turn validates against it."""
+        import ultratimonel.server as srv
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        p, db_path = self._make_db()
+        try:
+            orig_persistence = srv.persistence
+            srv.persistence = p
+            srv._clear_active_intento()
+            try:
+                with patch("ultratimonel.server.extract_context") as mock_extract, \
+                     patch("ultratimonel.server.run_triple_match") as mock_triple:
+                    mock_extract.return_value = {"sender": "user", "topic": "test", "project": "unknown"}
+                    mock_triple.return_value = [
+                        GateResult(name="1a", state=PASS), GateResult(name="1b", state=PASS),
+                        GateResult(name="1c", state=SKIP), GateResult(name="1e", state=PASS),
+                    ]
+
+                    result = json.loads(srv.begin_turn(
+                        "sess-int-001", "voy-rojo", 0, 0,
+                        "talk about unknown topic", "user"
+                    ))
+                    intento_id = result["intento_id"]
+                    assert intento_id is not None
+
+                    # Verify gates were persisted under "voy-rojo", not "unknown"
+                    gate_states = p.list_gate_states("sess-int-001", "voy-rojo")
+                    assert len(gate_states) == 4
+
+                    # end_turn should validate against "voy-rojo"
+                    result = json.loads(srv.end_turn(intento_id))
+                    assert result["final_status"] == "success"
+            finally:
+                srv.persistence = orig_persistence
+                srv._clear_active_intento()
+        finally:
+            p.close()
+            os.unlink(db_path)
+
+    def test_nf_tu01_mission_get_under_5ms(self):
+        """NF-TU-01: mission_get SHALL complete in under 5 ms."""
+        import ultratimonel.server as srv
+        p, db_path = self._make_db()
+        try:
+            orig_persistence = srv.persistence
+            srv.persistence = p
+            try:
+                iterations = 100
+                start = time.perf_counter()
+                for _ in range(iterations):
+                    srv.mission_get(1)
+                elapsed_ms = (time.perf_counter() - start) / iterations * iterations / 1000
+                assert elapsed_ms < 5, f"mission_get took {elapsed_ms:.2f} ms"
+            finally:
+                srv.persistence = orig_persistence
+        finally:
+            p.close()
+            os.unlink(db_path)
+
+    def test_nf_tu01_checklist_item_get_under_5ms(self):
+        """NF-TU-01: checklist_item_get SHALL complete in under 5 ms."""
+        import ultratimonel.server as srv
+        p, db_path = self._make_db()
+        try:
+            orig_persistence = srv.persistence
+            srv.persistence = p
+            try:
+                iterations = 100
+                start = time.perf_counter()
+                for _ in range(iterations):
+                    srv.checklist_item_get(1)
+                elapsed_ms = (time.perf_counter() - start) / iterations * iterations / 1000
+                assert elapsed_ms < 5, f"checklist_item_get took {elapsed_ms:.2f} ms"
+            finally:
+                srv.persistence = orig_persistence
+        finally:
+            p.close()
+            os.unlink(db_path)

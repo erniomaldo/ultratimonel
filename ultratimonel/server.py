@@ -1149,26 +1149,61 @@ def sync_all() -> str:
 
 
 @app.tool()
-def mission_list(project: str) -> str:
+def mission_list(project: str, include_description: bool = True) -> str:
     """List missions (Deck tasks) for a project.
 
     Args:
         project: Project slug.
+        include_description: If True (default), returns full payload
+            including description and nested checklist_items (backward compatible).
+            When False, returns lightweight {id, title, status} per mission.
 
     Returns:
-        JSON with missions list, each including checklist items and
-        latest intento status per item.
+        JSON with missions list.
     """
     missions = persistence.list_missions(project)
-    return json.dumps(
-        {
+
+    if not include_description:
+        light_missions = [
+            {"id": m["id"], "title": m["title"], "status": m["status"]}
+            for m in missions
+        ]
+        payload = {
+            "project": project,
+            "missions": light_missions,
+            "total": len(light_missions),
+        }
+    else:
+        payload = {
             "project": project,
             "missions": missions,
             "total": len(missions),
-        },
+        }
+
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+@app.tool()
+def mission_get(mission_id: int) -> str:
+    """Retrieve a single mission by ID with minimal fields."""
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps({"error": f"Mission {mission_id} not found"})
+    item_ids = [ci["id"] for ci in persistence.list_checklist_items(mission["id"])]
+    return json.dumps(
+        {"id": mission["id"], "title": mission["title"], "checklist_item_ids": item_ids},
         ensure_ascii=False,
         default=str,
     )
+
+
+@app.tool()
+def checklist_item_get(checklist_item_id: int) -> str:
+    """Retrieve a single checklist item by ID."""
+    item = persistence.get_checklist_item_by_id(checklist_item_id)
+    if not item:
+        return json.dumps({"error": f"Checklist item {checklist_item_id} not found"})
+    return json.dumps(item, ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -1252,7 +1287,7 @@ def begin_turn(
     context_envelope = build_context_envelope(gate_results)
 
     # 4. Persistir cada gate state fresco
-    resolved_project = context["project"]
+    resolved_project = project if project else context["project"]
     try:
         for r in gate_results:
             persistence.upsert_gate_state(

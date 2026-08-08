@@ -1180,3 +1180,148 @@ class TestDashboardStability:
             assert "error" in result
         finally:
             srv._dashboard_port = original_port
+
+
+class TestMissionListLightMode:
+    @patch("ultratimonel.server.persistence")
+    def test_default_returns_full_payload_backward_compatible(self, mock_persistence):
+        """F-TU-07: default (no param) returns full payload — dashboard unchanged."""
+        from ultratimonel.server import mission_list
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        mock_persistence.list_missions.return_value = [full_mission]
+
+        result = json.loads(mission_list("testproj"))
+        assert result["missions"][0]["description"] == "desc"
+        assert result["missions"][0]["checklist_items"] == [{"id": 10}]
+        assert result["total"] == 1
+
+    @patch("ultratimonel.server.persistence")
+    def test_include_description_false_returns_light_mode(self, mock_persistence):
+        """F-TU-03: opt-in light mode omits description and checklist_items."""
+        from ultratimonel.server import mission_list
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        mock_persistence.list_missions.return_value = [full_mission]
+
+        result = json.loads(mission_list("testproj", include_description=False))
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert "description" not in result["missions"][0]
+        assert "checklist_items" not in result["missions"][0]
+
+
+class TestMissionGet:
+    @patch("ultratimonel.server.persistence")
+    def test_mission_get_returns_minimal_fields(self, mock_persistence):
+        """F-TU-01: mission_get returns id, title, checklist_item_ids only."""
+        from ultratimonel.server import mission_get
+        mock_persistence.get_mission.return_value = {"id": 123, "title": "Sprint Planning", "description": "..."}
+        mock_persistence.list_checklist_items.return_value = [{"id": 456}, {"id": 457}]
+
+        result = json.loads(mission_get(123))
+        assert result == {"id": 123, "title": "Sprint Planning", "checklist_item_ids": [456, 457]}
+        assert "description" not in result
+        assert "checklist_items" not in result
+
+    @patch("ultratimonel.server.persistence")
+    def test_mission_get_not_found(self, mock_persistence):
+        """F-TU-05: returns error for non-existent mission."""
+        from ultratimonel.server import mission_get
+        mock_persistence.get_mission.return_value = None
+
+        result = json.loads(mission_get(9999))
+        assert "error" in result
+        assert "9999" in result["error"]
+
+
+class TestChecklistItemGet:
+    @patch("ultratimonel.server.persistence")
+    def test_checklist_item_get_returns_item(self, mock_persistence):
+        """F-TU-02: returns item by ID."""
+        from ultratimonel.server import checklist_item_get
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 456, "mission_id": 123, "item_index": 1, "text": "Review backlog", "done": 0
+        }
+
+        result = json.loads(checklist_item_get(456))
+        assert result["id"] == 456
+        assert result["text"] == "Review backlog"
+
+    @patch("ultratimonel.server.persistence")
+    def test_checklist_item_get_not_found(self, mock_persistence):
+        """F-TU-06: returns error for non-existent item."""
+        from ultratimonel.server import checklist_item_get
+        mock_persistence.get_checklist_item_by_id.return_value = None
+
+        result = json.loads(checklist_item_get(9999))
+        assert "error" in result
+
+
+class TestBeginTurnProjectFix:
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_explicit_project_wins_over_context(self, mock_persistence, mock_extract, mock_triple):
+        """S7: explicit project param preferred over context extraction."""
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {"sender": "user", "topic": "test", "project": "unknown"}
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS), GateResult(name="1b", state=PASS),
+            GateResult(name="1c", state=SKIP), GateResult(name="1e", state=PASS),
+        ]
+        mock_persistence.create_intento.return_value = 70
+
+        result = json.loads(begin_turn("sess-x", "voy-rojo", 5, 10, "some context extracting unknown", "user"))
+
+        create_call = mock_persistence.create_intento.call_args
+        assert create_call[1]["project"] == "voy-rojo"
+
+        upsert_calls = mock_persistence.upsert_gate_state.call_args_list
+        for call in upsert_calls:
+            assert call[1]["project"] == "voy-rojo"
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_empty_project_falls_back_to_context(self, mock_persistence, mock_extract, mock_triple):
+        """S9: empty project param falls back to context extraction."""
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS), GateResult(name="1b", state=PASS),
+            GateResult(name="1c", state=SKIP), GateResult(name="1e", state=PASS),
+        ]
+        mock_persistence.create_intento.return_value = 71
+
+        begin_turn("sess-x", "", 5, 10, "talk about ultratimonel", "user")
+
+        create_call = mock_persistence.create_intento.call_args
+        assert create_call[1]["project"] == "ultratimonel"
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_validates_against_persisted_project(self, mock_persistence):
+        """S8: end_turn gates validated against correct project (regression)."""
+        from ultratimonel.server import begin_turn, end_turn
+
+        mock_persistence.get_intento.return_value = {
+            "id": 70, "session_id": "sess-x", "project": "voy-rojo"
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1},
+        ]
+        mock_persistence.create_intento.return_value = 70
+
+        begin_turn("sess-x", "voy-rojo", 5, 10, "msg", "user")
+        result = json.loads(end_turn(70))
+
+        assert result["final_status"] == "success"
+        list_call = mock_persistence.list_gate_states.call_args
+        if list_call[1]:
+            assert list_call[1]["project"] == "voy-rojo"
+        else:
+            assert list_call[0][1] == "voy-rojo"

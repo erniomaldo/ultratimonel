@@ -282,6 +282,21 @@ class TestGatesDetail:
         assert intento["gates_passed"] == 4
         assert intento["completed_at"] is not None
 
+class TestChecklistItemById:
+    def test_get_checklist_item_by_id(self, db):
+        mid = db.upsert_mission(deck_task_id=1, project="p", title="T")
+        cid = db.upsert_checklist_item(mid, item_index=0, text="Item 1")
+        item = db.get_checklist_item_by_id(cid)
+        assert item is not None
+        assert item["id"] == cid
+        assert item["text"] == "Item 1"
+        assert item["mission_id"] == mid
+
+    def test_get_checklist_item_by_id_not_found(self, db):
+        assert db.get_checklist_item_by_id(99999) is None
+
+
+class TestDbMigrationV2ToV3:
     def test_migration_v2_to_v3(self):
         """Simulate migration from v2 to v3."""
         import tempfile, os
