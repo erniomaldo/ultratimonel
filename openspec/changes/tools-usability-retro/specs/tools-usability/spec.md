@@ -15,7 +15,7 @@ Provide Hermes with lightweight mission/item lookup tools, an opt-in light mode 
 | F-TU-01 | The server SHALL expose `mission_get(mission_id)` returning minimal fields: id, title, checklist_item_ids only (no description, no nested items) | MUST |
 | F-TU-02 | The server SHALL expose `checklist_item_get(checklist_item_id)` returning a single item by ID or a clear "not found" error | MUST |
 | F-TU-03 | `mission_list` SHALL accept optional `include_description`; when `false`, omit `description` and skip nested `checklist_items`. Default is `true` per F-TU-07. | MUST |
-| F-TU-04 | `begin_turn` SHALL prefer the explicit `project` parameter over context-extracted project; fall back to `context["project"]` only when the explicit param is empty/unset | MUST |
+| F-TU-04 | `begin_turn` SHALL prefer the explicit `project` parameter over the context-extracted project and SHALL execute the gates (`run_triple_match`) against that resolved project; it SHALL fall back to `context["project"]` only when the explicit param is empty/unset | MUST |
 | F-TU-05 | `mission_get` with a non-existent ID SHALL return `{"error": "Mission <id> not found"}` | MUST |
 | F-TU-06 | `checklist_item_get` with a non-existent ID SHALL return `{"error": "Checklist item <id> not found"}` | MUST |
 | F-TU-07 | Default behavior of `mission_list` SHALL remain full payload (backward compatible with dashboard consumers); include_description=false is an opt-in for lightweight mode | MUST |
@@ -40,9 +40,12 @@ Returns `{id, mission_id, item_index, text, done}` or error if not found.
 **Light mode (`include_description=false`, opt-in):** `{project, missions: [{id, title, status}], total}` per mission. No description, no nested items.
 
 ### `begin_turn` Project Resolution Fix
-At server.py:1255, change `resolved_project = context["project"]` to prefer explicit param:
+The explicit `project` parameter wins over context extraction. The resolved project is computed BEFORE running the gates, and `context["project"]` is overwritten so gates 1c/1e execute against the resolved project (not the `"unknown"` fallback from `extract_context`). Regression: intento #234 — message not mentioning any known project + explicit `project="voy-rojo"` → gates 1c/1e silently SKIPped ("No collective/Deck board mapped for project unknown").
+
 ```python
+# In begin_turn, BEFORE persistence and BEFORE run_triple_match(context):
 resolved_project = project if project else context["project"]
+context["project"] = resolved_project   # gates EXECUTE against the resolved project
 ```
 
 ## Scenarios
@@ -77,12 +80,13 @@ GIVEN project "voy-rojo" has full-data missions in DB
 WHEN `mission_list(project="voy-rojo", include_description=false)` is called
 THEN response contains all 3 missions, each with only `{id, title, status}` — no description, no checklist_items
 
-### S7 — Regression: begin_turn Prefers Explicit Project
+### S7 — Regression: begin_turn Prefers Explicit Project (Persistence + Execution)
 GIVEN Hermes calls `begin_turn(session_id="sess-x", project="voy-rojo", mission_id=5, checklist_item_id=10, message="some context extracting 'unknown'", sender="user")`
 AND context extraction would resolve to `"unknown"`
-WHEN `begin_turn` executes step 4 (server.py:1255)
+WHEN `begin_turn` resolves `resolved_project` BEFORE running the gates and overwrites `context["project"]`
 THEN `resolved_project` is `"voy-rojo"` (explicit param), NOT `"unknown"`
 AND persisted intento has `project="voy-rojo"`
+AND `run_triple_match` receives a context whose `project` is `"voy-rojo"`
 
 ### S8 — Regression: end_turn Gates Against Correct Project
 GIVEN `begin_turn(project="voy-rojo", ...)` returned intento_id=70 with project correctly persisted as "voy-rojo"
@@ -94,3 +98,12 @@ GIVEN Hermes calls `begin_turn(session_id="sess-x", project="", mission_id=5, ch
 AND context extraction resolves to `"ultratimonel"`
 WHEN `begin_turn` executes
 THEN `resolved_project` falls back to `"ultratimonel"` (from context) since explicit param is empty
+AND gates execute against `"ultratimonel"` (`context["project"]` overwritten to `"ultratimonel"` before `run_triple_match`)
+
+### S10 — Regression: Gates Execute Against Explicit Project (mensaje neutro + project explícito)
+GIVEN Hermes calls `begin_turn(session_id="sess-x", project="voy-rojo", mission_id=5, checklist_item_id=10, message="neutral message not mentioning any project", sender="user")`
+AND `extract_context` returns `context["project"]="unknown"`
+WHEN `begin_turn` runs the gates via `run_triple_match(context)`
+THEN `run_triple_match` receives a context with `project="voy-rojo"` (overwritten from the explicit param)
+AND gates 1c/1e execute against the "voy-rojo" project maps (collective_id=6, deck_board_id=7) — NOT SKIP on `"unknown"`
+AND `end_turn` validates against the persisted "voy-rojo" project (verified E2E in production, intento #236)

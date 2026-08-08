@@ -114,15 +114,16 @@ def mission_list(project: str, include_description: bool = True) -> str:
 
 ### ADR-3: Fix de project en `begin_turn` — preferir param explícito sobre context extraction
 
-**Contexto:** En `server.py:1255`, `resolved_project = context["project"]` ignora completamente el parámetro `project` pasado por Hermes. Cuando la extracción de contexto resuelve a `"unknown"`, todos los gates se persisten bajo project `"unknown"`, y `end_turn` valida contra ese project incorrecto.
+**Contexto:** En `server.py:1255` (original), `resolved_project = context["project"]` ignora completamente el parámetro `project` pasado por Hermes. Cuando la extracción de contexto resuelve a `"unknown"`, salen dos problemas:
 
-**Decisión:** Cambiar línea 1255 para preferir el parámetro explícito:
+1. **Persistencia:** los gates se persisten bajo project `"unknown"` y `end_turn` valida contra ese project incorrecto (arreglado parcialmente por el commit `1cb0567`).
+2. **Ejecución (bug raíz):** `run_triple_match(context)` usa `context["project"]` para ejecutar los gates, así que 1c/1e corren contra `"unknown"` y SKIPean ("No collective/Deck board mapped for project unknown") aunque `begin_turn` haya recibido un project explícito correcto. Reproducido en intento #234.
+
+**Decisión (fix completo, commit `fb51b44`):** Resolver `resolved_project` ANTES de `run_triple_match` y pisar `context["project"]` con el project resuelto. Los gates 1c/1e leen `context["project"]` para buscar sus maps (`get_project_maps()`), así que al sobrescribirlo ejecutan contra el project correcto:
 ```python
-# BEFORE (bug)
-resolved_project = context["project"]
-
-# AFTER (fix)
+# ANTES DE run_triple_match(context) — server.py, begin_turn
 resolved_project = project if project else context["project"]
+context["project"] = resolved_project   # los gates 1c/1e ejecutan contra el project resuelto
 ```
 
 **Análisis del fallback:**
@@ -141,7 +142,7 @@ resolved_project = project if project else context["project"]
 
 **Impacto en callers existentes:** Cualquier caller que pasara un `project` explícito con valor real ya estaba esperando que se usara ese valor. El bug hacía que el parámetro fuera ignorado. Este fix alinea el comportamiento con la semántica esperada del parámetro.
 
-**Testing:** Ver sección 5 (Impacto en tests). Se requiere test de regresión S7+S8.
+**Testing:** Ver sección 5 (Impacto en tests). Se requieren tests de regresión S7+S8+S9 (persistencia) y S9-ejecución+S10 (ejecución de gates contra el project resuelto).
 
 ---
 
@@ -206,7 +207,7 @@ server.py
 | `TestMissionGet` | 2 | Happy path + not found (F-TU-01, F-TU-05) |
 | `TestChecklistItemGet` | 2 | Happy path + not found (F-TU-02, F-TU-06) |
 | `TestMissionListLightMode` | 2 | Default full payload + opt-in light mode (F-TU-03, F-TU-07) |
-| `TestBeginTurnProjectFix` | 3 | Explicit project wins, empty fallback, end_turn validation (S7, S8, S9) |
+| `TestBeginTurnProjectFix` | 5 | Explicit project wins, empty fallback, end_turn validation (S7, S8, S9) + ejecución de gates contra project explícito y fallback (S9-ejecución, S10) |
 
 **`tests/test_persistence.py`:**
 - Clase `TestChecklistItemsById` → 2 tests (found + not found)
@@ -236,20 +237,20 @@ Hermes → mission_get(mission_id=123)
     └─→ Response: {id:123, title:"...", checklist_item_ids:[456,457]}
 ```
 
-### 3.2 `begin_turn` project resolution flow (post-fix)
+### 3.2 `begin_turn` project resolution flow (post-fix `fb51b44`)
 
 ```
 begin_turn(session_id, project="voy-rojo", ..., message="talk about unknown topic")
     │
     ├─→ extract_context(message) → {project: "unknown", ...}
     │
-    ├─→ run_triple_match(context)  # gates against "unknown" context
+    ├─→ resolved_project = project if project else context["project"]   → "voy-rojo"
+    │       └─→ context["project"] = "voy-rojo"   (sobrescribe "unknown")
     │
-    └─→ resolved_project = project if project else context["project"]
-                              │                         │
-                           "voy-rojo"              "unknown" (fallback)
-                              │
-                    ✅ persists gates under "voy-rojo"
+    ├─→ run_triple_match(context)   # los gates ejecutan contra "voy-rojo"
+    │       └─→ 1c → collective_id=6, 1e → deck_board_id=7   (NO SKIP por "unknown")
+    │
+    └─→ persiste gates (gate_state) + intento bajo "voy-rojo"
 ```
 
 ### 3.3 `mission_list` dual-mode flow
@@ -446,6 +447,12 @@ class TestBeginTurnProjectFix:
         list_call = mock_persistence.list_gate_states.call_args
         assert list_call[1]["project"] == "voy-rojo" or list_call[0][1] == "voy-rojo"
 ```
+
+> **Retrospectiva (`fb51b44`):** El diseño original preveía 3 tests de persistencia. El fix de EJECUCIÓN agregó 2 tests que verifican que `run_triple_match` recibe `context["project"]` con el project correcto (no `"unknown"`):
+> - `test_gates_execute_against_explicit_project` — S10: extract→`"unknown"`, project="voy-rojo", assert `mock_triple.call_args[0][0]["project"] == "voy-rojo"`
+> - `test_gates_execute_with_fallback_to_context` — S9-ejecución: project="", extract→`"ultratimonel"`, assert `context["project"] == "ultratimonel"`
+>
+> **Verificación:** 132 unit tests pasan (0 failures) + E2E en producción (intento #236: mensaje neutro + project='voy-rojo' → 1b checkpoint 'voy-rojo', 1c collective 6, 1e board 7 — sin SKIP por "unknown").
 
 **`tests/test_persistence.py`:**
 

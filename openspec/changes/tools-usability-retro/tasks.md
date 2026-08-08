@@ -160,30 +160,32 @@ T6 (integration tests) — depends on T1+T2+T3+T4+T5
 
 ---
 
-### T5 — Fix project resolution in `begin_turn` + regression tests (F-TU-04, S7-S9)
+### T5 — Fix project resolution in `begin_turn` + regression tests (F-TU-04, S7-S10)
 
 **Files:** `ultratimonel/server.py`, `tests/test_server.py`
 
-**What:** At `server.py:1255`, change the single line that ignores the explicit `project` parameter. Add 3 regression tests covering: (S7) explicit project wins over context extraction, (S8) end_turn validates against persisted project, (S9) empty project falls back to context extraction.
+**What:** Fix project resolution in `begin_turn` so the explicit `project` parameter wins over context extraction AND the gates EXECUTE against the resolved project (not the `"unknown"` fallback from `extract_context`). Add 5 regression tests covering persistence (S7, S8, S9) and gate execution (S9-ejecución, S10). Regression: intento #234 — 1c/1e SKIP silencioso por "unknown".
 
 **How:**
-1. In `server.py` line 1255, change:
+1. In `begin_turn` (server.py), resolve the project BEFORE running the gates and overwrite `context["project"]` so `run_triple_match` executes against the resolved project:
    ```python
-   # BEFORE
-   resolved_project = context["project"]
-   # AFTER
    resolved_project = project if project else context["project"]
+   context["project"] = resolved_project   # gates 1c/1e execute against the resolved project
    ```
-2. In `tests/test_server.py`, add class `TestBeginTurnProjectFix` with 3 tests (patterns from design.md lines 376-448):
+2. In `tests/test_server.py`, class `TestBeginTurnProjectFix` with 5 tests:
    - `test_explicit_project_wins_over_context`: mock extract→"unknown", pass project="voy-rojo", assert create_intento and upsert_gate_state called with "voy-rojo"
    - `test_empty_project_falls_back_to_context`: pass project="", context resolves to "ultratimonel", assert fallback works
    - `test_end_turn_validates_against_persisted_project`: simulate begin_turn persisting project="voy-rojo", call end_turn, assert gates validated against correct project
+   - `test_gates_execute_against_explicit_project`: extract→"unknown", project="voy-rojo", assert `run_triple_match` received `context["project"] == "voy-rojo"` (S10 — gates execute against explicit project)
+   - `test_gates_execute_with_fallback_to_context`: project="", extract→"ultratimonel", assert `run_triple_match` received `context["project"] == "ultratimonel"` (fallback at execution)
 
 **Done when:**
-- [ ] Line 1255 uses `project if project else context["project"]`
-- [ ] S7 test: explicit param wins over "unknown" context extraction
+- [ ] `resolved_project` computed BEFORE `run_triple_match` and `context["project"]` overwritten with it
+- [ ] S7 test: explicit param wins over "unknown" context extraction (persistence)
 - [ ] S8 test: end_turn gates run against persisted project, not "unknown"
-- [ ] S9 test: empty string falls back to context extraction
+- [ ] S9 test: empty string falls back to context extraction (persistence + execution)
+- [ ] S10 test: `run_triple_match` receives `context["project"]` with the explicit project when extraction returns "unknown"
+- [ ] Verified E2E in production: intento #236 — mensaje neutro + project='voy-rojo' → 1b checkpoint 'voy-rojo', 1c collective 6, 1e board 7 (no SKIP por "unknown")
 - [ ] All existing `TestBeginTurn` tests still pass (especially `test_begin_turn_executes_fresh_gates`)
 - [ ] No regression in any other server test
 

@@ -2,7 +2,7 @@
 
 ## Intent
 
-Hermes (the MCP client) struggles to use Ultratimonel's tool surface efficiently. Three retro items from Hermes brother #108 (2026-08-05) block smooth turn workflows: `mission_list` returns bloated payloads, there's no way to look up a checklist item by ID without fetching everything, and a bug in `begin_turn` causes `end_turn` gates to run against the wrong project ("unknown") when context extraction fails to match.
+Hermes (the MCP client) struggles to use Ultratimonel's tool surface efficiently. Three retro items from Hermes brother #108 (2026-08-05) block smooth turn workflows: `mission_list` returns bloated payloads, there's no way to look up a checklist item by ID without fetching everything, and a bug in `begin_turn` makes gates execute AND persist against the wrong project ("unknown") when context extraction fails to match — gates 1c/1e silently SKIP because no collective/Deck board is mapped for "unknown" (reproduced in intento #234).
 
 ## Scope
 
@@ -10,7 +10,7 @@ Hermes (the MCP client) struggles to use Ultratimonel's tool surface efficiently
 - Add lightweight mission lookup: `mission_get(mission_id)` returning minimal fields (id, title, checklist_item_ids only)
 - Add `checklist_item_get(checklist_item_id)` for direct ID-based lookup
 - Add `include_description=false` opt-in to `mission_list` to skip heavy payload when not needed
-- Fix `begin_turn` to prefer the explicit `project` parameter over context-extracted project, falling back to extracted only when parameter is empty/default
+- Fix `begin_turn` to prefer the explicit `project` parameter over context-extracted project, falling back to extracted only when parameter is empty/default; the resolved project drives BOTH gate execution (`run_triple_match(context)`) and persistence (gate_state / intento)
 - Add integration test covering the begin_turn → end_turn project-persistence bug (intents #219–#225 pattern)
 
 ### Out of Scope
@@ -56,7 +56,7 @@ Hermes (the MCP client) struggles to use Ultratimonel's tool surface efficiently
 All changes are additive (new tools) or narrow parameter fixes. To rollback:
 1. Revert commit on `feature_147_tools-usability-retro` branch.
 2. New tools are harmless no-ops if not called; removing them requires only deleting the function defs and persistence methods.
-3. The `begin_turn` project fix is a one-line change — revert to `resolved_project = context["project"]`.
+3. The `begin_turn` project fix is a small change — revert to `resolved_project = context["project"]` and remove the `context["project"]` overwrite before `run_triple_match`.
 
 ## Dependencies
 
@@ -69,4 +69,5 @@ All changes are additive (new tools) or narrow parameter fixes. To rollback:
 - [ ] `mission_list(project, include_description=false)` omits description and checklist_items from response
 - [ ] `begin_turn(project="voy-rojo", ...)` persists intento with project="voy-rojo" even when context extraction would return "unknown"
 - [ ] `end_turn(intento_id)` validates gates against the persisted project (not "unknown")
-- [ ] Regression test passes: begin_turn with explicit project → end_turn gates run against correct project
+- [ ] Gates EXECUTE against the resolved project: neutral message + project="voy-rojo" → `run_triple_match` receives `context["project"]="voy-rojo"` and gates 1c/1e run against collective 6 / board 7 (not SKIP on "unknown") — verified E2E in production, intento #236
+- [ ] Regression tests pass: begin_turn with explicit project → gates execute + persist against correct project
