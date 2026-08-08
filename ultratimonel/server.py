@@ -1261,6 +1261,12 @@ def begin_turn(
     # 2. Ejecutar los 4 gates de forma fresca
     context = extract_context(message, session_id, sender=sender)
 
+    # El project explícito manda sobre el extraído del topic. Se resuelve
+    # ANTES de ejecutar los gates para que 1c/1e corran contra el project
+    # correcto (no contra "unknown" cuando el message no lo menciona).
+    resolved_project = project if project else context["project"]
+    context["project"] = resolved_project
+
     try:
         persistence.upsert_session(
             session_id=session_id,
@@ -1287,7 +1293,6 @@ def begin_turn(
     context_envelope = build_context_envelope(gate_results)
 
     # 4. Persistir cada gate state fresco
-    resolved_project = project if project else context["project"]
     try:
         for r in gate_results:
             persistence.upsert_gate_state(

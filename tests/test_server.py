@@ -1283,6 +1283,54 @@ class TestBeginTurnProjectFix:
     @patch("ultratimonel.server.run_triple_match")
     @patch("ultratimonel.server.extract_context")
     @patch("ultratimonel.server.persistence")
+    def test_gates_execute_against_explicit_project(self, mock_persistence, mock_extract, mock_triple):
+        """Regression: gates execute against explicit project, not "unknown" from extraction.
+
+        S7 execution check: extract_context returns project="unknown" (message doesn't
+        mention a known project) but begin_turn receives explicit "voy-rojo". run_triple_match
+        MUST receive a context whose project is "voy-rojo", so gates 1c/1e execute against
+        the correct project maps instead of SKIPping on "unknown".
+        """
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {"sender": "user", "topic": "test", "project": "unknown"}
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS), GateResult(name="1b", state=PASS),
+            GateResult(name="1c", state=SKIP), GateResult(name="1e", state=PASS),
+        ]
+        mock_persistence.create_intento.return_value = 72
+
+        begin_turn("sess-x", "voy-rojo", 5, 10, "some context extracting unknown", "user")
+
+        assert mock_triple.call_count == 1
+        context_arg = mock_triple.call_args[0][0]
+        assert context_arg["project"] == "voy-rojo"
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_gates_execute_with_fallback_to_context(self, mock_persistence, mock_extract, mock_triple):
+        """S9 execution check: empty project param falls back to extracted project."""
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_extract.return_value = {"sender": "user", "topic": "test", "project": "ultratimonel"}
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS), GateResult(name="1b", state=PASS),
+            GateResult(name="1c", state=SKIP), GateResult(name="1e", state=PASS),
+        ]
+        mock_persistence.create_intento.return_value = 73
+
+        begin_turn("sess-x", "", 5, 10, "talk about ultratimonel", "user")
+
+        assert mock_triple.call_count == 1
+        context_arg = mock_triple.call_args[0][0]
+        assert context_arg["project"] == "ultratimonel"
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
     def test_empty_project_falls_back_to_context(self, mock_persistence, mock_extract, mock_triple):
         """S9: empty project param falls back to context extraction."""
         from ultratimonel.server import begin_turn
