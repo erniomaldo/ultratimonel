@@ -41,11 +41,11 @@ rules:
 testing:
   strict_tdd: false
   test_runner:
-    framework: null    # pytest not installed yet (greenfield)
-    command: null
+    framework: pytest
+    command: .venv/bin/pytest
   layers:
-    unit: { available: false, tool: null }
-    integration: { available: false, tool: null }
+    unit: { available: true, tool: .venv/bin/pytest }
+    integration: { available: true, tool: .venv/bin/pytest }
     e2e: { available: false, tool: null }
   coverage:
     available: false
