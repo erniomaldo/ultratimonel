@@ -7,20 +7,108 @@ enviar tools/call.
 
 import json
 import logging
+import os
+import shutil
 import subprocess
+import sys
 import uuid
 
 logger = logging.getLogger(__name__)
 
-ULTRATIMONEL_CMD = "/home/ernesto-personal/Proyectos/ultratimonel/.venv/bin/python3"
-ULTRATIMONEL_ARGS = ["/home/ernesto-personal/Proyectos/ultratimonel/main.py"]
+# ── Rutas parametrizables (12-factor — ver config_loader.py) ──────────────
+# NUNCA hardcodear rutas de máquina en el repo: se resuelven por env var con
+# fallback portable (sys.executable / shutil.which). Ejemplo de config:
+#   ULTRATIMONEL_MCP_CMD=/home/<user>/Proyectos/ultratimonel/.venv/bin/python3
+#   ULTRATIMONEL_MCP_ARGS=/home/<user>/Proyectos/ultratimonel/main.py
+# Si no hay env vars, se intenta leer la config MCP activa de Hermes
+# (~/.hermes/config.yaml → mcp.servers.ultratimonel) — misma fuente que el
+# runtime. Solo como último recurso cae a sys.executable.
+
+def _hermes_mcp_config() -> dict:
+    """Lee la config MCP de Hermes para el server ultratimonel (fuente de verdad).
+
+    Soporta ambas estructuras: ``mcp.servers.ultratimonel`` (nuevo) y
+    ``mcp_servers.ultratimonel`` (estructura actual de la config activa).
+    """
+    try:
+        import yaml
+        from pathlib import Path
+
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        if not cfg_path.is_file():
+            return {}
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        servers = (
+            (data.get("mcp") or {}).get("servers")
+            or data.get("mcp_servers")
+            or {}
+        )
+        return servers.get("ultratimonel") or {}
+    except Exception:
+        return {}
+
+
+def _resolve_mcp_cmd() -> str:
+    """Resuelve el comando del MCP server: env var → config Hermes → portable."""
+    env = os.environ.get("ULTRATIMONEL_MCP_CMD", "").strip()
+    if env:
+        return env
+    cfg = _hermes_mcp_config()
+    cmd = cfg.get("command", "")
+    if cmd:
+        return cmd
+    return sys.executable or shutil.which("python3") or "python3"
+
+
+def _resolve_mcp_args() -> list[str]:
+    """Resuelve los args del MCP server: env var → config Hermes → vacío."""
+    env = os.environ.get("ULTRATIMONEL_MCP_ARGS", "").strip()
+    if env:
+        return [env]
+    cfg = _hermes_mcp_config()
+    args = cfg.get("args") or []
+    if args:
+        return list(args)
+    return []
+
+
+def _resolve_nextcloud_args() -> str:
+    env = os.environ.get("ULTRATIMONEL_NEXTCLOUD_ARGS", "").strip()
+    if env:
+        return env
+    cfg = _hermes_mcp_config()
+    return (
+        cfg.get("env", {}).get("ULTRATIMONEL_NEXTCLOUD_ARGS")
+        or "http_to_stdio_mcp.py"
+    )
+
+
+def _resolve_nextcloud_url() -> str:
+    env = os.environ.get("ULTRATIMONEL_NEXTCLOUD_URL", "").strip()
+    if env:
+        return env
+    cfg = _hermes_mcp_config()
+    return (
+        cfg.get("env", {}).get("ULTRATIMONEL_NEXTCLOUD_URL")
+        or "http://localhost:2993/mcp"
+    )
+
+
+ULTRATIMONEL_CMD = _resolve_mcp_cmd()
+ULTRATIMONEL_ARGS = _resolve_mcp_args()
 ULTRATIMONEL_ENV = {
-    "ULTRATIMONEL_CHECKPOINT_COMMAND": "agentcheckpoint",
-    "ULTRATIMONEL_CHECKPOINT_ARGS": "",
-    "ULTRATIMONEL_NEXTCLOUD_COMMAND": "/home/ernesto-personal/Proyectos/ultratimonel/.venv/bin/python3",
-    "ULTRATIMONEL_NEXTCLOUD_ARGS": "/home/ernesto-personal/Proyectos/http-to-stdio/http_to_stdio_mcp.py",
-    "ULTRATIMONEL_NEXTCLOUD_URL": "https://mcpnextcloud.agendasencilla.com/mcp",
-    "ULTRATIMONEL_NEXTCLOUD_TIMEOUT": "600",
+    "ULTRATIMONEL_CHECKPOINT_COMMAND": os.environ.get(
+        "ULTRATIMONEL_CHECKPOINT_COMMAND", "agentcheckpoint"
+    ),
+    "ULTRATIMONEL_CHECKPOINT_ARGS": os.environ.get("ULTRATIMONEL_CHECKPOINT_ARGS", ""),
+    "ULTRATIMONEL_NEXTCLOUD_COMMAND": os.environ.get(
+        "ULTRATIMONEL_NEXTCLOUD_COMMAND", _resolve_mcp_cmd()
+    ),
+    "ULTRATIMONEL_NEXTCLOUD_ARGS": _resolve_nextcloud_args(),
+    "ULTRATIMONEL_NEXTCLOUD_URL": _resolve_nextcloud_url(),
+    "ULTRATIMONEL_NEXTCLOUD_TIMEOUT": os.environ.get(
+        "ULTRATIMONEL_NEXTCLOUD_TIMEOUT", "600"
+    ),
 }
 
 
