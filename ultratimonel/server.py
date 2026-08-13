@@ -2,7 +2,7 @@
 server.py - FastMCP server with tools for gates, dashboard, and project maps.
 
 Tools:
-  - assert_gates(message, session_id)  -> run all gates, return status
+  - assert_gates(message, session_id)  -> ~~DEPRECATED~~ run all gates (use begin_turn)
   - check_gate(name, session_id)       -> read gate status from SQLite
   - complete_gate(name, session_id, reason) -> BLOCK->PASS / WARN->PASS
   - server(action)                     -> control dashboard web UI
@@ -168,104 +168,6 @@ def _resolve_requesting_intento(
 
 #
 # ── Tool handlers ───────────────────────────────────────────────────────
-
-
-@app.tool()
-def assert_gates(
-    message: str,
-    session_id: str,
-    sender: str = "user",
-) -> str:
-    """Run all pre-flight gates and return structured results.
-
-    Executes:
-      1. Context extraction (sender, topic, project)
-      2. Triple-match (1a AgentMemory → 1b Checkpoint → 1e Deck)
-      3. Aggregation (determine overall PASS/BLOCK/WARN)
-      4. Persistence (store gate state, update mission)
-
-    Args:
-        message:    The user's raw message / query.
-        session_id: Active Hermes session identifier.
-        sender:     Optional sender name (default: "user").
-
-    Returns:
-        JSON string with:
-          - gates:    list of per-gate results
-          - overall:  PASS | BLOCK | WARN
-          - context:  extracted sender, topic, project
-          - context_envelope: aggregated memory, checkpoint, deck data
-          - timestamp
-    """
-    # 1. Extract context
-    context = extract_context(message, session_id, sender=sender)
-
-    try:
-        persistence.upsert_session(
-            session_id=session_id,
-            sender=context["sender"],
-            topic=context["topic"],
-            project=context["project"],
-        )
-    except Exception as exc:
-        logger.warning("Session persistence failed (degraded): %s", exc)
-
-    # 2. Run triple match
-    gate_results = run_triple_match(context)
-
-    # 3. Aggregate
-    overall, gate_dicts = aggregate(gate_results)
-    context_envelope = build_context_envelope(gate_results)
-
-    # 4. Persist results
-    # ⛔ Solo persistimos misión si el proyecto es conocido.
-    # Si project == "unknown" (fallback sin match), skip para evitar
-    # contaminar la DB con proyectos fantasma.
-    project = context["project"]
-    gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
-    try:
-        for r in gate_results:
-            persistence.upsert_gate_state(
-                session_id=session_id,
-                project=project,
-                gate_name=r.name,
-                state=r.state,
-                mandatory=r.mandatory,
-                duration_ms=int(r.duration_ms),
-                message=r.message,
-                result_data=r.result_data,
-            )
-
-        # Solo persistir acción si es un proyecto conocido
-        if is_known_project(project):
-            persistence.upsert_action(
-                session_id=session_id,
-                project=project,
-                gates_passed=gates_passed,
-                gates_total=len(DEFAULT_GATES),
-            )
-        else:
-            logger.info(
-                "Skipping mission persistence: project '%s' is not a known project",
-                project,
-            )
-    except Exception as exc:
-        logger.warning("Gate state persistence failed (degraded): %s", exc)
-
-    # 5. Build response
-    response = {
-        "gates": gate_dicts,
-        "status": overall,
-        "context": {
-            "sender": context["sender"],
-            "topic": context["topic"],
-            "project": context["project"],
-        },
-        "context_envelope": context_envelope,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-    return json.dumps(response, ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -1499,6 +1401,121 @@ def end_turn(
         ensure_ascii=False,
         default=str,
     )
+
+
+#
+# ── Legacy / archived tools ─────────────────────────────────────────────
+# Deprecated in favor of the consolidated 2-call flow
+# (begin_turn → trabajo → end_turn). Kept for compatibility only.
+#
+
+
+@app.tool()
+def assert_gates(
+    message: str,
+    session_id: str,
+    sender: str = "user",
+) -> str:
+    """~~DEPRECATED~~ Run all pre-flight gates and return structured results.
+
+    DEPRECATED — use begin_turn() instead (consolidated 2-call flow:
+    begin_turn → trabajo → end_turn). begin_turn executes the 4 gates
+    internally (fresh assert) and persists the snapshot in the intento;
+    it is the replacement for this tool.
+
+    Do NOT use assert_gates as an agent step: the plugin bouncer treats it
+    as if it were the gate step, when begin_turn already runs them.
+
+    Kept for compatibility — the plugin still invokes it in pre_llm_call.
+
+    Executes:
+      1. Context extraction (sender, topic, project)
+      2. Triple-match (1a AgentMemory → 1b Checkpoint → 1e Deck)
+      3. Aggregation (determine overall PASS/BLOCK/WARN)
+      4. Persistence (store gate state, update mission)
+
+    Args:
+        message:    The user's raw message / query.
+        session_id: Active Hermes session identifier.
+        sender:     Optional sender name (default: "user").
+
+    Returns:
+        JSON string with:
+          - gates:    list of per-gate results
+          - overall:  PASS | BLOCK | WARN
+          - context:  extracted sender, topic, project
+          - context_envelope: aggregated memory, checkpoint, deck data
+          - timestamp
+    """
+    # 1. Extract context
+    context = extract_context(message, session_id, sender=sender)
+
+    try:
+        persistence.upsert_session(
+            session_id=session_id,
+            sender=context["sender"],
+            topic=context["topic"],
+            project=context["project"],
+        )
+    except Exception as exc:
+        logger.warning("Session persistence failed (degraded): %s", exc)
+
+    # 2. Run triple match
+    gate_results = run_triple_match(context)
+
+    # 3. Aggregate
+    overall, gate_dicts = aggregate(gate_results)
+    context_envelope = build_context_envelope(gate_results)
+
+    # 4. Persist results
+    # ⛔ Solo persistimos misión si el proyecto es conocido.
+    # Si project == "unknown" (fallback sin match), skip para evitar
+    # contaminar la DB con proyectos fantasma.
+    project = context["project"]
+    gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
+    try:
+        for r in gate_results:
+            persistence.upsert_gate_state(
+                session_id=session_id,
+                project=project,
+                gate_name=r.name,
+                state=r.state,
+                mandatory=r.mandatory,
+                duration_ms=int(r.duration_ms),
+                message=r.message,
+                result_data=r.result_data,
+            )
+
+        # Solo persistir acción si es un proyecto conocido
+        if is_known_project(project):
+            persistence.upsert_action(
+                session_id=session_id,
+                project=project,
+                gates_passed=gates_passed,
+                gates_total=len(DEFAULT_GATES),
+            )
+        else:
+            logger.info(
+                "Skipping mission persistence: project '%s' is not a known project",
+                project,
+            )
+    except Exception as exc:
+        logger.warning("Gate state persistence failed (degraded): %s", exc)
+
+    # 5. Build response
+    response = {
+        "gates": gate_dicts,
+        "status": overall,
+        "context": {
+            "sender": context["sender"],
+            "topic": context["topic"],
+            "project": context["project"],
+        },
+        "context_envelope": context_envelope,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return json.dumps(response, ensure_ascii=False, default=str)
 
 
 @app.tool()
