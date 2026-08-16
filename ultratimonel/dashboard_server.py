@@ -10,6 +10,36 @@ Static root resolution (see ``resolve_static_root``):
     build validation on 3007, or a cut test on any other port).
   - Any other port without the env var serves the legacy ``dashboard/``.
 
+Hierarchical routes (Ejecución 8, card #154 — approved 2026-08-15): the URL
+path IS the hierarchy. New route structure (replaces the flat
+``/proyectos/{project}/``, ``/misiones/{id}/``, ``/intentos/{id}/`` schema):
+
+  /{proyectoName}/                          → missions of a project
+  /{proyectoName}/{misionId}/               → mission detail + checklist items
+  /{proyectoName}/{misionId}/{checklistItemId}/ → intentos of a checklist item
+  /{proyectoName}/{misionId}/{checklistItemId}/{intentoId}/ → intento detail
+    + gate logs (Ejecución 9: el nivel faltante de la propuesta original —
+    el detalle del intento es una PÁGINA con URL propia, ya no un dialog).
+
+Legacy routes get permanent redirects (301) to their equivalent new route:
+  /proyectos/{project}   → /{project}/
+  /misiones/{id}         → /{project}/{id}/          (project resolved from DB)
+  /intentos/{id}         → /{project}/{mission}/{checklist_item}/{id}/  (DB)
+If the entity cannot be resolved, the legacy route answers 404.
+
+Post-build detail fallback (card #154, adapted to hierarchical routes): the
+Astro build is static (``output: 'static'``, ADR-2) and ``getStaticPaths`` only
+enumerates ids that exist at build time. Entities created after the build have
+no shell in ``dist/``. For each hierarchical level whose shell is missing, this
+server serves the generic fallback shell for that level
+(``fallback/proyecto/index.html`` / ``fallback/mision/index.html`` /
+``fallback/item/index.html`` / ``fallback/intento/index.html``) ONLY when the
+entity exists (the same check the API performs, including project/mission/
+item consistency). Unknown entities keep a real 404 (S8). The fallback shells
+hydrate an island that resolves the path segments from
+``window.location.pathname`` at runtime, so one file serves any entity of
+that level.
+
 Hierarchy flow:
   /api/projects                        → project list
   /api/projects/{project}/missions      → Deck-synced missions
@@ -188,6 +218,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif path == "" or path == "/":
                 self._serve_index()
             else:
+                # Legacy routes → permanent redirect (301) to the new
+                # hierarchical structure (Ejecución 8). Unresolvable entities
+                # answer 404 instead.
+                redirect = self._match_legacy_redirect(path)
+                if redirect == "LEGACY_UNRESOLVED":
+                    return self._html("<h1>Not found</h1>", 404)
+                if redirect:
+                    return self._redirect(redirect, path)
+
+                # Post-build fallback: hierarchical routes whose static shell
+                # was not enumerated at build time get the generic fallback
+                # shell for that level when the entity exists.
+                route = self._match_hierarchical_route(path)
+                if route and not self._hierarchical_shell_exists(*route):
+                    return self._serve_hierarchical_fallback(*route)
                 super().do_GET()
         except Exception as exc:
             logger.exception("Request failed: %s", path)
@@ -222,6 +267,221 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         else:
             self._not_found(f"Unknown API path: {path}")
+
+    # ── hierarchical routes: legacy redirects + post-build fallback (Ejecución 8) ──
+
+    def _redirect(self, location: str, original_path: str) -> None:
+        """Answer 301 with a Location header pointing at the new route."""
+        body = (
+            f"<html><head><title>301 Moved Permanently</title></head>"
+            f"<body><h1>301 Moved Permanently</h1>"
+            f"<p><a href=\"{location}\">{location}</a></p></body></html>"
+        ).encode("utf-8")
+        self.send_response(301)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        logger.info("301 %s → %s", original_path, location)
+
+    def _match_legacy_redirect(self, path: str):
+        """Return the new-route Location for legacy URLs, or None when the
+        path is not a legacy route.
+
+        - ``/proyectos/{project}`` → ``/{project}/`` (direct mapping).
+        - ``/misiones/{id}`` → ``/{project}/{id}/`` — project resolved from DB.
+        - ``/intentos/{id}`` → ``/{project}/{mission}/{checklist_item}/{id}/`` — DB.
+
+        When the entity cannot be resolved (unknown id / no project), this
+        returns a marker ``(None)`` via ``_legacy_unresolved`` semantics:
+        the caller distinguishes "not a legacy route" (no redirect, fall
+        through) from "legacy route but unknown entity" (404).
+        """
+        parts = [p for p in path.split("/") if p]
+
+        # /proyectos/{project} → /{project}/
+        if len(parts) == 2 and parts[0] == "proyectos":
+            return f"/{unquote(parts[1])}/"
+
+        # /misiones/{id} → /{project}/{id}/
+        if len(parts) == 2 and parts[0] == "misiones" and parts[1].isdigit():
+            project = self._mission_project(parts[1])
+            if project is None:
+                return "LEGACY_UNRESOLVED"
+            return f"/{project}/{parts[1]}/"
+
+        # /intentos/{id} → /{project}/{mission}/{checklist_item}/{id}/
+        if len(parts) == 2 and parts[0] == "intentos" and parts[1].isdigit():
+            location = self._intento_location(parts[1])
+            if location is None:
+                return "LEGACY_UNRESOLVED"
+            return location
+
+        return None
+
+    def _mission_project(self, mission_id: str):
+        """Resolve the project slug for a mission, or None."""
+        if not self._db_available():
+            return None
+        conn = self._db()
+        try:
+            row = conn.execute(
+                "SELECT project FROM missions WHERE id = ?", (mission_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        conn.close()
+        return row["project"] if row and row["project"] else None
+
+    def _intento_location(self, intento_id: str):
+        """Resolve the new hierarchical route for an intento, or None."""
+        if not self._db_available():
+            return None
+        conn = self._db()
+        try:
+            row = conn.execute(
+                """SELECT i.project AS intento_project, i.mission_id,
+                          i.checklist_item_id, m.project AS mission_project
+                   FROM intentos i
+                   LEFT JOIN missions m ON m.id = i.mission_id
+                   WHERE i.id = ?""",
+                (intento_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        conn.close()
+        if not row:
+            return None
+        project = row["intento_project"] or row["mission_project"]
+        mission_id = row["mission_id"]
+        item_id = row["checklist_item_id"]
+        if not project or mission_id is None or item_id is None:
+            return None
+        return f"/{project}/{mission_id}/{item_id}/{intento_id}/"
+
+    def _match_hierarchical_route(self, path: str):
+        """Return ``(level, *segments)`` for hierarchical routes, else None.
+
+        Levels (with or without a trailing slash; the caller strips it):
+          ``/{proyectoName}``                        → ("proyecto", slug)
+          ``/{proyectoName}/{misionId}``             → ("mision", slug, id)
+          ``/{proyectoName}/{misionId}/{checklistItemId}`` → ("item", slug, id, id)
+          ``/{proyectoName}/{misionId}/{checklistItemId}/{intentoId}``
+                                                      → ("intento", slug, id, id, id)
+
+        Only numeric ids count for the mission/item/intento levels — anything
+        else falls through to regular static serving (S8: nonsense ids end in
+        a real 404).
+        """
+        parts = [p for p in path.split("/") if p]
+        if len(parts) == 1 and "." not in parts[0] and parts[0] not in ("static",):
+            return ("proyecto", unquote(parts[0]))
+        if len(parts) == 2 and parts[1].isdigit():
+            return ("mision", unquote(parts[0]), parts[1])
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            return ("item", unquote(parts[0]), parts[1], parts[2])
+        if (
+            len(parts) == 4
+            and parts[1].isdigit()
+            and parts[2].isdigit()
+            and parts[3].isdigit()
+        ):
+            return ("intento", unquote(parts[0]), parts[1], parts[2], parts[3])
+        return None
+
+    def _hierarchical_shell_exists(self, level: str, *segments: str) -> bool:
+        """True when the build enumerated a static shell for this route."""
+        target = STATIC_ROOT.joinpath(*segments) / "index.html"
+        return target.exists() and target.is_file()
+
+    def _entity_exists_hierarchical(self, level: str, *segments: str) -> bool:
+        """True when the entity exists and matches the URL hierarchy (same
+        checks the API performs). Guards the fallback: it only applies when the
+        API would resolve the route. Unknown entities keep a real 404 (S8).
+
+        - proyecto: the project slug exists (project_maps.json or missions.project).
+        - mision: the mission exists AND its project matches the URL segment.
+        - item: the checklist item exists AND its mission + project match.
+        - intento: the intento exists AND its mission + checklist item +
+          project match the URL segments (Ejecución 9).
+        """
+        if level == "proyecto":
+            slug = segments[0]
+            if slug in self._load_project_maps():
+                return True
+            if not self._db_available():
+                return False
+            conn = self._db()
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM missions WHERE project = ? LIMIT 1", (slug,)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            conn.close()
+            return row is not None
+
+        if level == "mision":
+            if len(segments) != 2 or not self._db_available():
+                return False
+            conn = self._db()
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM missions WHERE id = ? AND project = ?",
+                    (segments[1], segments[0]),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            conn.close()
+            return row is not None
+
+        if level == "item":
+            if len(segments) != 3 or not self._db_available():
+                return False
+            conn = self._db()
+            try:
+                row = conn.execute(
+                    """SELECT 1 FROM checklist_items ci
+                       JOIN missions m ON m.id = ci.mission_id
+                       WHERE ci.id = ? AND ci.mission_id = ? AND m.project = ?""",
+                    (segments[2], segments[1], segments[0]),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            conn.close()
+            return row is not None
+
+        if level == "intento":
+            if len(segments) != 4 or not self._db_available():
+                return False
+            conn = self._db()
+            try:
+                row = conn.execute(
+                    """SELECT 1 FROM intentos i
+                       JOIN missions m ON m.id = i.mission_id
+                       WHERE i.id = ?
+                         AND i.mission_id = ?
+                         AND i.checklist_item_id = ?
+                         AND m.project = ?""",
+                    (segments[3], segments[1], segments[2], segments[0]),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            conn.close()
+            return row is not None
+
+        return False
+
+    def _serve_hierarchical_fallback(self, level: str, *segments: str) -> None:
+        """Serve the generic fallback shell for a level when the entity exists,
+        else 404."""
+        if self._entity_exists_hierarchical(level, *segments):
+            fallback = STATIC_ROOT / "fallback" / level / "index.html"
+            if fallback.exists() and fallback.is_file():
+                content = fallback.read_text(encoding="utf-8")
+                return self._html(content)
+        self._html("<h1>Not found</h1>", 404)
 
     # ── API handlers ───────────────────────────────────────────────────
 

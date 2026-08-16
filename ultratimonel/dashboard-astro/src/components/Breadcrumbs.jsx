@@ -1,9 +1,16 @@
-// Breadcrumbs — navigable chain Dashboard → Proyecto → Misión → Intento (T5, F-DA-08, F-DA-15).
+// Breadcrumbs — navigable chain Dashboard → Proyecto → Misión → Ítem → Intento
+// (T5, F-DA-08, F-DA-15; 5 niveles desde Ejecución 9, card #154). The depth is
+// driven entirely by the `crumbs` array + `current`, so any level count works.
 //
 // Props:
-//   crumbs:  array of parent levels, each { label, href } — rendered as real
-//            `<a href>` links to the route of that level (F-DA-08).
-//   current: label of the current level — rendered as plain (non-link) text.
+//   crumbs:     array of parent levels, each { label, href } — rendered as real
+//               `<a href>` links to the route of that level (F-DA-08).
+//   current:    label of the current level — rendered as plain (non-link) text
+//               unless `currentHref` is set.
+//   currentHref: when set, the current level renders as a link to that href
+//               (post-corte fix, card #154): the detail pages link to their own
+//               route (`/{project}/`, `/{project}/{missionId}/`), so clicking
+//               the current level performs a full reload of the live view.
 //
 // F-DA-08 enforcement: the chain always starts at `Dashboard` → `/`. When the
 // island did not include it and the current level is not Dashboard itself, the
@@ -17,7 +24,7 @@
 
 import React from 'react';
 
-export default function Breadcrumbs({ crumbs = [], current = '' }) {
+export default function Breadcrumbs({ crumbs = [], current = '', currentHref = '' }) {
   const chain =
     current === 'Dashboard'
       ? []
@@ -36,8 +43,9 @@ export default function Breadcrumbs({ crumbs = [], current = '' }) {
       ? [
           {
             key: 'crumb-current',
-            type: 'current',
+            type: currentHref ? 'link' : 'current',
             label: current,
+            href: currentHref || undefined,
           },
         ]
       : []),

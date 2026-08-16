@@ -10,7 +10,8 @@
  */
 
 :root {
-  --layout-max-width: 60rem;
+  /* --layout-max-width removed (card #154 post-corte layout fix): it was only
+     consumed by .app-shell, which is now full-width. No other consumers existed. */
   --layout-gutter: 1.5rem;
   --layout-gap: 1rem;
 }
@@ -30,13 +31,13 @@ body {
   min-height: 100vh;
 }
 
-/* Page shell: flex column, centered, constrained width */
+/* Page shell: flex column, full viewport width. No max-width — the post-corte
+   layout fix (card #154) removed the 60rem cap so wide windows use all the
+   space; NES.css .nes-container.is-rounded keeps its own 4px visual margin. */
 .app-shell {
   display: flex;
   flex-direction: column;
   gap: var(--layout-gap);
-  max-width: var(--layout-max-width);
-  margin: 0 auto;
   padding: var(--layout-gutter);
   min-height: 100vh;
 }

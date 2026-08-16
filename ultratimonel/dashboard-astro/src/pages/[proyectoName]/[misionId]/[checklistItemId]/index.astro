@@ -1,0 +1,57 @@
+---
+// Checklist item route — intentos of a checklist item at the THIRD level:
+// /{proyectoName}/{misionId}/{checklistItemId}/ (Ejecución 8, hierarchical routes
+// approved 2026-08-15, card #154). NUEVO nivel (antes los intentos vivían en
+// /intentos/{id}/).
+//
+// Static shell + hydrated <ItemDetail /> island. The path IS the hierarchy:
+// Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId}.
+//
+// output:'static' requires getStaticPaths for dynamic routes (Astro). We
+// enumerate checklist items per mission per project from the dashboard SQLite
+// DB (same resolution as dashboard_server.py) so each real item gets a static
+// shell in dist/. The shell is empty of content — the island fetches /api/*
+// in the browser (ADR-3), so build-time enumeration never freezes data.
+import { DatabaseSync } from 'node:sqlite';
+import BaseLayout from '../../../../layouts/BaseLayout.astro';
+import ItemDetail from '../../../../components/checklist/ItemDetail.jsx';
+
+export async function getStaticPaths() {
+  try {
+    const dbPath =
+      process.env.ULTRATIMONEL_DB_PATH || `${process.env.HOME}/.hermes/ultratimonel.db`;
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db
+      .prepare(
+        `SELECT ci.id AS item_id, ci.mission_id, m.project
+         FROM checklist_items ci
+         JOIN missions m ON m.id = ci.mission_id
+         WHERE m.project IS NOT NULL`
+      )
+      .all();
+    db.close();
+    return rows.map((r) => ({
+      params: {
+        proyectoName: String(r.project),
+        misionId: String(r.mission_id),
+        checklistItemId: String(r.item_id),
+      },
+    }));
+  } catch (err) {
+    console.error('[getStaticPaths] checklist item enumeration failed:', err && err.message);
+    // DB unavailable at build time — no static shells (dev 3006 still works).
+    return [];
+  }
+}
+
+const { proyectoName, misionId, checklistItemId } = Astro.params;
+---
+
+<BaseLayout title={`Ítem ${checklistItemId} · Ultratimonel`}>
+  <ItemDetail
+    client:load
+    project={proyectoName}
+    missionId={misionId}
+    itemId={checklistItemId}
+  />
+</BaseLayout>

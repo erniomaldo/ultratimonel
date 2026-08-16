@@ -181,6 +181,18 @@ No existen `Panel` ni `TextField` (verificado en `dist/index.d.ts`): panel con t
 
 ### 2.3 Breadcrumbs (F-DA-08, F-DA-15)
 
+> **NOTA (Ejecución 8, 2026-08-15, card #154):** el usuario aprobó explícitamente
+> rutas **jerárquicas** que reemplazan el esquema plano F-DA-15 de esta sección
+> (`/proyectos/[project]/`, `/misiones/[id]/`, `/intentos/[id]/`). La estructura
+> vigente desde esa fecha es:
+> `/`, `/{proyectoName}/`, `/{proyectoName}/{misionId}/`,
+> `/{proyectoName}/{misionId}/{checklistItemId}/`. Las rutas planas redirigen
+> 301 a su equivalente jerárquico (server Python). Los breadcrumbs se derivan
+> del path (el path ES la jerarquía) y el nivel actual se renderiza como
+> `<a>` clickeable que refresca. Las tablas/diagramas de las secciones 2.3 y 3.x
+> quedan como registro histórico del diseño original; la implementación actual
+> sigue la estructura jerárquica.
+
 | Ruta | Crumbs | Resolución del parent |
 |------|--------|-----------------------|
 | `/` | `Dashboard` (actual) | — |

@@ -2,7 +2,8 @@
 //
 // Fetches `/api/projects` via the shared useApi hook and renders a ProjectCard
 // per project. Handles loading / error (retry) / empty states without crashing
-// (NF-DA-06). Each card navigates to `/proyectos/{project}/` (S2).
+// (NF-DA-06). Each card navigates to `/{project}/` (S2, Ejecución 8: the
+// project route is now the top-level hierarchical route).
 
 import React from 'react';
 import useApi from '../../hooks/useApi';

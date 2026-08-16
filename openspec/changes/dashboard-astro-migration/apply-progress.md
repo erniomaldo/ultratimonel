@@ -293,3 +293,136 @@ El proceso legacy 3005 (pid 80794) **no se reinició** en este run: el cambio de
 ### Siguiente fase
 
 - **Verify** del cambio completo (`sdd-verify`): dispatcher `verify: ready`; `archive` seguirá `blocked` hasta completar tasks (ya todos done) y pasar verify.
+
+---
+
+## Ejecución 7: Post-corte — Fix 404 shells + breadcrumb actual (card #154) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m6-corte` (card #154). Fix de 2 bugs reales reportados en producción (3005 ya sirve dist/): `/intentos/296/` y `/intentos/297/` → HTTP 404 (isla ni se montaba) y breadcrumb de `/misiones/1454/` con el TÍTULO largo como nivel actual no navegable. Ejecutado inline (regla de terminación: sin sub-agentes, sin commits, trabajo en working tree). No había task nuevo en `tasks.md` (T1–T12 ya done); este run registra el fix en apply-progress como Ejecución 7.
+
+### Solución elegida para el 404 (opción b + fallback dedicado)
+
+El build sigue siendo `output: 'static'` (ADR-2/ADR-5): `getStaticPaths` no puede enumerar ids creados después del build. Solución: **shell fallback dedicado por tipo + server Python como guardián**:
+
+1. **Astro — id en runtime (opción b):** las islas `MissionDetail.jsx` / `IntentoDetail.jsx` resuelven el id con `prop ?? window.location.pathname` (regex `/\/misiones\/([^/]+)\//`, `/\/intentos\/([^/]+)\//`). Un mismo shell sirve para CUALQUIER id; la isla además fija `document.title` en mount para que el tab coincida con el id real.
+2. **Astro — shells fallback dedicados:** `src/pages/intentos/fallback.astro` y `src/pages/misiones/fallback.astro` (isla `client:load` SIN prop `id` → resuelve del pathname). Emiten `dist/intentos/fallback/index.html` y `dist/misiones/fallback/index.html` SIEMPRE, incluso con DB vacía en build (a diferencia de copiar una shell enumerada).
+3. **Python — guardián (S8 intacto):** en `do_GET`, para `/intentos/{id}` y `/misiones/{id}` (solo id numérico) con shell faltante en `dist/`:
+   - `_entity_exists(table, id)` = misma check que el API (SELECT por id en `missions`/`intentos`) → si el id existe (API habría respondido 200), sirve el fallback shell con 200;
+   - si el id NO existe en DB (API → 404, ej. `/misiones/999999/`) → **404 real** (`<h1>Not found</h1>`).
+   - Si la shell enumerada existe → `super().do_GET()` normal (los ids del build ni tocan DB).
+
+### Fix breadcrumb
+
+- `Breadcrumbs.jsx`: nueva prop `currentHref` — cuando está seteada, el nivel actual se renderiza como `<a class="nes-btn" href={currentHref}>` (navegable, mismo href que la vista → click = recarga completa, "refresca").
+- `/misiones/{id}/`: nivel actual ahora `Misión #1454` (formato `Misión #{id}`, NO el título largo) + `currentHref="/misiones/{id}/"`.
+- `/intentos/{id}/`: nivel actual `Intento #{id}` (ya era) + `currentHref="/intentos/{id}/"`. Crumb de misión en el breadcrumb de intento ahora `Misión #{mission.id}` (antes `mission.title`).
+- Jerarquía completa: `Dashboard › {proyecto} › Misión #{id} › Intento #{id}`; niveles intermedios (Dashboard, proyecto) navegan normal.
+
+### Evidencia de smokes (build nuevo + server de prueba 3011, handler real)
+
+- `npm run build` (dashboard-astro): **450 pages OK**, incluye `dist/intentos/fallback/index.html` y `dist/misiones/fallback/index.html` (isla con `props="{}"`).
+- Servidor: `.venv/bin/python3 ultratimonel/dashboard_server.py 3011` con `ULTRATIMONEL_DASHBOARD_STATIC_ROOT=…/dashboard-astro/dist` (puerto no-3005, producción intacta).
+- **HTTP status (curl):** `/intentos/296/` → 200 · `/intentos/297/` → 200 · `/intentos/155/` → 200 · `/intentos/24/` → 200 · `/misiones/1454/` → 200 · `/intentos/fallback/` → 200 · `/misiones/fallback/` → 200 · **`/misiones/999999/` → 404** · `/intentos/999999/` → 404 (S8). API: `/api/intentos/296` → 200, `/api/missions/999999` → 404.
+- **Render headless chromium (dump-dom + virtual-time-budget 10000):**
+  - `/intentos/296/` (fallback): `<title>Intento 296 · Ultratimonel</title>`; breadcrumb `Dashboard › ultratimonel › Misión #1454 › Intento #296` (3 links navegables); marcadores de contenido (`Intento #296`, `Proyecto: ultratimonel`, `gates`, `Sesión:`) presentes → isla montada e hidratada.
+  - `/misiones/1454/` (enumerada): breadcrumb `Dashboard › ultratimonel › Misión #1454` con `href="/misiones/1454/"` (nivel actual = `Misión #1454`, clickeable); título contenido `M6 — Corte…` presente en header (no en breadcrumb).
+  - `/intentos/155/` (enumerada): breadcrumb `Dashboard › voy-rojo › Misión #1 › Intento #155` (regresión OK).
+  - Prueba dirigida de fallback misión: moviendo temporalmente `dist/misiones/1454/index.html` fuera → `/misiones/1454/` → 200 con shell fallback, isla hidrató (`Misión #1454` breadcrumb + contenido `M6 — Corte`) → restaurado.
+
+### Estado del árbol (rama `feature_148_m6-corte`)
+
+- Modificado: `ultratimonel/dashboard_server.py`, `ultratimonel/dashboard-astro/src/components/Breadcrumbs.jsx`, `ultratimonel/dashboard-astro/src/components/missions/MissionDetail.jsx`, `ultratimonel/dashboard-astro/src/components/intentos/IntentoDetail.jsx`, `apply-progress.md` (este archivo)
+- Nuevos: `ultratimonel/dashboard-astro/src/pages/intentos/fallback.astro`, `ultratimonel/dashboard-astro/src/pages/misiones/fallback.astro`
+- `tasks.md`: sin cambios (no había task para este fix). Sin commits ni PR — working tree listo.
+
+### Limpieza
+
+- Server de prueba 3011 detenido · `.tmp-dash-test.log`, `.tmp-render-*.html`, `.tmp-fallback-m1454.html`, `.tmp-logs/` borrados · Producción 3005 (pid 2143265) NO reiniciada, intacta (HTTP 200 verificado al cierre).
+
+### Siguiente fase
+
+- **Verify** del cambio completo (`sdd-verify`) cubrirá este fix (S8/404 + shells post-corte) junto con el resto del cambio; luego `archive`.
+
+---
+
+## Ejecución 8: Rutas jerárquicas — reestructuración completa de URLs (card #154) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m6-corte` (card #154). El usuario aprobó explícitamente (2026-08-15) la estructura de URLs jerárquicas — slugs EXACTOS, sin variaciones — que reemplaza el esquema plano F-DA-15:
+
+- `/` → lista de proyectos (ya existía, se mantiene)
+- `/[proyectoName]/` → misiones del proyecto (slug con guiones, ej. `/ultratimonel/`, `/voy-rojo/`). REEMPLAZA `/proyectos/[project]/`
+- `/[proyectoName]/[misionId]/` → checklist de la misión. REEMPLAZA `/misiones/[id]/`
+- `/[proyectoName]/[misionId]/[checklistItemId]/` → intentos del item del checklist (nivel NUEVO)
+
+Ejecutado inline (regla de terminación: sin sub-agentes, sin commits, trabajo en working tree). No había task nuevo en `tasks.md` (T1–T12 ya done); este run registra la reestructuración como Ejecución 8. **RESTRICCIÓN RESPETADA:** nada leído/ejecutado bajo `~/.hermes` (ni sqlite3 ni project_maps); datos de dominio SOLO vía API del server 3005; el build (getStaticPaths con node:sqlite) resuelve la DB por sí mismo.
+
+### Decisión del usuario (registrada)
+
+Rutas jerárquicas aprobadas 2026-08-15 reemplazan el esquema plano F-DA-15. Nota agregada en `design.md` sección 2.3 (sin reescribir el documento). El path ES la jerarquía: los breadcrumbs se derivan del path (Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId}) con nivel actual como `<a>` clickeable que refresca (patrón `currentHref` de Ejecución 7).
+
+### Código — páginas Astro nuevas (estructura jerárquica)
+
+- **`src/pages/[proyectoName]/index.astro`** (nuevo, REEMPLAZA `proyectos/[project]/`): `getStaticPaths` enumera `SELECT DISTINCT project FROM missions` (node:sqlite en build-time). Shell + isla `<ProjectDetail client:load project={proyectoName} />`.
+- **`src/pages/[proyectoName]/[misionId]/index.astro`** (nuevo, REEMPLAZA `misiones/[id]/`): enumera `SELECT id, project FROM missions`. Shell + `<MissionDetail client:load project id />`.
+- **`src/pages/[proyectoName]/[misionId]/[checklistItemId]/index.astro`** (NUEVO nivel): enumera `checklist_items JOIN missions` (item_id, mission_id, project). Shell + `<ItemDetail client:load project missionId itemId />`.
+- **Fallbacks por tipo (post-build):** `src/pages/fallback/proyecto.astro`, `fallback/mision.astro`, `fallback/item.astro` → emiten SIEMPRE `dist/fallback/{tipo}/index.html` (isla sin props; resuelve los segmentos del pathname en runtime y fija `<title>` en mount). Reemplazan a `intentos/fallback.astro` y `misiones/fallback.astro` (borrados).
+- **Borradas las páginas planas:** `proyectos/[project]`, `misiones/[id]` (+ fallback), `intentos/[id]` (+ fallback) — sus rutas ahora redirigen 301.
+
+### Código — componentes (links internos a estructura nueva, cero links viejos)
+
+- **`ItemDetail.jsx` (NUEVO):** vista de intentos por ítem — cards de intentos (estado, gates, progreso, fecha, sesión) con slot al detalle que reutiliza `<IntentoDetail />` dentro de un `NesDialog` (logs on-demand, S6/S7). Breadcrumb completo con `currentHref`.
+- **`ProjectDetail.jsx`:** ahora renderiza su propio Breadcrumbs (Dashboard → proyecto actual clickeable) + pasa `project` a `MissionCard`.
+- **`MissionDetail.jsx`:** breadcrumb `Dashboard › {project} › Misión #{id}` (actual clickeable con `currentHref`), links de proyecto → `/{project}/`; pasa `project`+`missionId` a `ChecklistCard`.
+- **`IntentoDetail.jsx`:** ya no es página; se usa como slot de detalle. Breadcrumbs a rutas nuevas (project → `/{project}/`, misión → `/{project}/{mission.id}/`); nivel actual (Intento) como texto (no tiene ruta propia).
+- **`MissionCard.jsx`:** href `/{project}/{mission.id}/` (usa prop `project` o `mission.project`).
+- **`ChecklistCard.jsx`:** ítem + botón "Ver intentos" → `/{project}/{missionId}/{item.id}/`; intentos embebidos linkean a la misma ruta del ítem.
+- **`ProjectCard.jsx`:** href `/{project.project}/`; botón renombrado "Ver misiones".
+- **`Breadcrumbs.jsx`:** comentario actualizado; lógica intacta (currentHref ya soportado).
+
+### Código — `ultratimonel/dashboard_server.py` (redirects 301 + guard fallback jerárquico)
+
+- **`_match_legacy_redirect(path)`:** rutas planas → 301 a la nueva estructura:
+  - `/proyectos/{project}` → `/{project}/` (mapeo directo)
+  - `/misiones/{id}` → `/{project}/{id}/` (resuelve `project` por DB)
+  - `/intentos/{id}` → `/{project}/{mission}/{checklist_item}/` (resuelve por DB)
+  - Si la entidad NO se resuelve → **404** (marcador `LEGACY_UNRESOLVED`), no redirect.
+- **`_mission_project(id)` / `_intento_location(id)`:** consultas DB para resolver project/mission/item de la ruta destino.
+- **`_match_hierarchical_route(path)`:** niveles `proyecto` (1 segmento, sin `.`), `mision` (2, id numérico), `item` (3, ids numéricos). Nonsense → static serving normal → 404 real (S8).
+- **`_hierarchical_shell_exists(level, *segments)`:** shell enumerada en `dist/{proyecto}/{mision}/{item}/index.html`.
+- **`_entity_exists_hierarchical(level, *segments)`:** guard del fallback — mismo check que el API, con consistencia jerárquica: proyecto existe (project_maps.json o `missions.project`); misión existe Y `project` coincide; ítem existe Y `mission_id` Y `project` coinciden.
+- **`_serve_hierarchical_fallback(level, *segments)`:** sirve `dist/fallback/{tipo}/index.html` cuando la entidad existe; si no → 404. El fallback de ítem se sirve aunque la shell no exista en dist.
+- `do_GET`: `/api/*` → API; `/` → index; legacy 301; fallback jerárquico; `super().do_GET()`.
+- Docstring actualizado (jerarquía + redirects + fallback).
+
+### Evidencia de smokes (build nuevo + server de prueba 3012, handler real)
+
+- `npm run build` (dashboard-astro): **1088 pages OK**, incluye `dist/{proyecto}/`, `dist/{proyecto}/{mision}/`, `dist/{proyecto}/{mision}/{item}/` y `dist/fallback/{proyecto,mision,item}/index.html`. Las rutas planas YA NO existen en dist.
+- Servidor: `.venv/bin/python3 ultratimonel/dashboard_server.py 3012` con `ULTRATIMONEL_DASHBOARD_STATIC_ROOT=…/dashboard-astro/dist` (puerto no-3005, producción intacta).
+- **HTTP status (curl):** `/` → 200 · `/ultratimonel/` → 200 · `/ultratimonel/1454/` → 200 · `/ultratimonel/1454/7226/` → 200 · `/voy-rojo/` → 200 · `/voy-rojo/1/` → 200 · `/voy-rojo/1/8/` → 200.
+- **404 (S8):** `/ultratimonel/999999/` → 404 · `/ultratimonel/1454/999999/` → 404 · `/voy-rojo/1/24/` → 404 (ítem no pertenece a esa misión — jerarquía inconsistente) · `/misiones/999999/` → 404 · `/intentos/999999/` → 404.
+- **Redirects 301 verificados (Location exacta):** `/proyectos/ultratimonel/` → `/ultratimonel/` · `/misiones/1454/` → `/ultratimonel/1454/` · `/intentos/296/` → `/ultratimonel/1454/7226/` · `/intentos/155/` → `/voy-rojo/1/8/` · `/intentos/24/` → `/ultratimonel/482/2285/`.
+- **Fallback post-build (id real, ítem 7226):** moviendo temporalmente `dist/ultratimonel/1454/7226/` → `/ultratimonel/1454/7226/` → **200** con shell `fallback/item` (title "Ítem · Ultratimonel") → restaurado. Idem misión 1454 (shell movida → 200 fallback misión) y proyecto `/solcrm/` (existe en project_maps sin misiones → 200 fallback proyecto).
+- **Render headless chromium (dump-dom + virtual-time-budget 10000):**
+  - `/ultratimonel/1454/7226/` (enumerada): `<title>Ítem 7226 · Ultratimonel</title>`; breadcrumb `Dashboard › ultratimonel › Misión #1454 › Ítem #7226` (links a `/ultratimonel/`, `/ultratimonel/1454/`, y nivel actual con href `…/7226/` que refresca); **Intento #296–#299 presentes** con 3 EXITO + 1 EJECUTANDO, progreso, Inicio/Fin/Sesión y botón "Ver detalle y logs".
+  - `/ultratimonel/1454/7226/` (fallback, shell movida): mismo resultado hidratado (title + 4 intentos + currentHref) → restaurado.
+  - `/ultratimonel/` (proyecto): breadcrumb `Dashboard › ultratimonel` + links de misiones `href="/ultratimonel/{id}/"`.
+  - `/ultratimonel/1454/` (misión): link de ítem `href="/ultratimonel/1454/7226/"` + botón "Ver intentos".
+- **API intacta (S12):** `/api/projects`, `/api/projects/ultratimonel/missions`, `/api/missions/1454`, `/api/checklist/7226/intentos`, `/api/intentos/299` → 200; `/api/missions/999999` → 404.
+- **pytest:** `tests/test_server.py` → **55 passed** (3.76s). Sin cambios en `tests/`; suite intacta (NF-DA-07).
+
+### Estado del árbol (rama `feature_148_m6-corte`)
+
+- Nuevos: `src/pages/[proyectoName]/index.astro`, `src/pages/[proyectoName]/[misionId]/index.astro`, `src/pages/[proyectoName]/[misionId]/[checklistItemId]/index.astro`, `src/pages/fallback/{proyecto,mision,item}.astro`, `src/components/checklist/ItemDetail.jsx`
+- Modificados: `ultratimonel/dashboard_server.py`, `src/components/{MissionCard,ChecklistCard,ProjectCard}.jsx`, `src/components/projects/{ProjectDetail,ProjectsIndex}.jsx`, `src/components/missions/MissionDetail.jsx`, `src/components/intentos/IntentoDetail.jsx`, `src/components/Breadcrumbs.jsx` (comentario), `design.md` (nota 2.3), `apply-progress.md` (este archivo)
+- Borrados: `src/pages/proyectos/`, `src/pages/misiones/`, `src/pages/intentos/` (incluye fallbacks viejos)
+- `tasks.md`: sin cambios. Sin commits ni PR — working tree listo.
+
+### Limpieza
+
+- Server de prueba 3012 detenido · `.tmp-e8-*.log`, `.tmp-e8-*.html`, `.tmp-e8-chromium.err` borrados · Producción 3005 (pid 2143265) NO reiniciada, intacta (HTTP 200 verificado al cierre).
+
+### Siguiente fase
+
+- **Verify** del cambio completo (`sdd-verify`) deberá cubrir la nueva jerarquía (S1–S12 adaptados a rutas jerárquicas + redirects 301 + fallbacks por tipo); luego `archive`.
