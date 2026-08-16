@@ -3,6 +3,13 @@
 Serves the NES-style mission viewer GUI using Python's built-in http.server.
 Reads directly from the same SQLite DB as the MCP server.
 
+Static root resolution (see ``resolve_static_root``):
+  - Main port 3005 serves the Astro build output ``dashboard-astro/dist/``
+    (final cut, ADR-5). The legacy ``dashboard/`` files leave the served tree.
+  - ``ULTRATIMONEL_DASHBOARD_STATIC_ROOT`` overrides the root (staging, e.g.
+    build validation on 3007, or a cut test on any other port).
+  - Any other port without the env var serves the legacy ``dashboard/``.
+
 Hierarchy flow:
   /api/projects                        → project list
   /api/projects/{project}/missions      → Deck-synced missions
@@ -12,7 +19,7 @@ Hierarchy flow:
   /api/intentos/{id}/gate/{name}/logs   → gate transition log timeline
 
 Endpoints:
-  GET  /                  → index.html (SPA)
+  GET  /                  → index.html (SPA, from the configured static root)
   GET  /api/projects      → list of active projects (from project_maps.json + mission counts)
   GET  /api/projects/{project}/missions → missions (Deck tasks) for a project
   GET  /api/missions/{id} → mission detail with checklist items
@@ -76,8 +83,33 @@ logger = logging.getLogger("dashboard")
 
 HERE = Path(__file__).parent.resolve()
 DASHBOARD_DIR = HERE / "dashboard"
+ASTRO_DIST_DIR = HERE / "dashboard-astro" / "dist"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3005
+
+# Static root resolved per port in create_server(); set to the legacy dir
+# until a server is created (safety default for imports/tests).
+STATIC_ROOT: Path = DASHBOARD_DIR
+
+
+def resolve_static_root(port: int) -> Path:
+    """Resolve the static root for a server bound to ``port``.
+
+    Resolution order (first match wins):
+    1. ``ULTRATIMONEL_DASHBOARD_STATIC_ROOT`` env var — explicit override
+       (used for staging/validation, e.g. 3007 build validation).
+    2. Main port (``DEFAULT_PORT``, 3005) → Astro build output
+       ``dashboard-astro/dist/`` — the final cut (ADR-5): the production
+       port serves the build. The legacy files leave the served tree.
+    3. Any other port → legacy ``dashboard/`` — keeps staging/test servers
+       on the legacy tree unless the env override says otherwise.
+    """
+    env_root = os.environ.get("ULTRATIMONEL_DASHBOARD_STATIC_ROOT")
+    if env_root:
+        return Path(env_root)
+    if port == DEFAULT_PORT:
+        return ASTRO_DIST_DIR
+    return DASHBOARD_DIR
 
 # DB path — same env var as the MCP server uses
 DB_PATH = os.environ.get(
@@ -451,7 +483,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     # ── SPA entry ─────────────────────────────────────────────────────
 
     def _serve_index(self):
-        index_path = DASHBOARD_DIR / "index.html"
+        index_path = STATIC_ROOT / "index.html"
         if not index_path.exists():
             return self._html("<h1>Dashboard UI not found</h1>", 404)
         content = index_path.read_text(encoding="utf-8")
@@ -466,12 +498,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         path = self._strip_query(path)
         if path.startswith("/static/"):
             rel = path[len("/static/"):]
-            return str(DASHBOARD_DIR / rel)
+            return str(STATIC_ROOT / rel)
         rel = path.lstrip("/")
-        target = DASHBOARD_DIR / rel
+        target = STATIC_ROOT / rel
         if target.exists() and target.is_file():
             return str(target)
-        return str(DASHBOARD_DIR / rel)
+        return str(STATIC_ROOT / rel)
 
     def end_headers(self):
         # No-cache for JS/HTML files so browser always picks up changes
@@ -491,6 +523,9 @@ def create_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT) -> HTTPS
     kernel keeps the socket in TIME_WAIT for ~60-120s and any new bind fails
     with OSError errno 98.
 
+    Resolves the static root for the port (see ``resolve_static_root``) and
+    makes it available to every handler instance.
+
     Args:
         host: Bind address (default: DASHBOARD_HOST, "127.0.0.1").
         port: Bind port (default: DEFAULT_PORT, 3005).
@@ -498,6 +533,13 @@ def create_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT) -> HTTPS
     Returns:
         Configured HTTPServer instance.
     """
+    global STATIC_ROOT
+    STATIC_ROOT = resolve_static_root(port)
+    if not STATIC_ROOT.is_dir():
+        logger.warning(
+            "Static root %s does not exist — dashboard will 404 until a build exists",
+            STATIC_ROOT,
+        )
     server = HTTPServer((host, port), DashboardHandler)
     # SO_REUSEADDR — permite reocupar puerto inmediatamente tras caída
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -523,7 +565,7 @@ def run_server(host: str = DASHBOARD_HOST, port: int = DEFAULT_PORT) -> None:
     logger.info("Dashboard listening on %s", url)
     print(f"🌐 ULTRATIMONEL DASHBOARD — {url}")
     print(f"📁 DB: {DB_PATH}")
-    print(f"📂 Static: {DASHBOARD_DIR}")
+    print(f"📂 Static: {STATIC_ROOT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

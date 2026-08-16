@@ -351,11 +351,11 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 7. Repeat smoke scenarios S1–S12 on the main port; `.venv/bin/pytest tests/ -q --tb=short`
 
 **Done when:**
-- [ ] `dashboard_server.py` serves `dist/` on 3005 and `/api/*` still works (S12)
-- [ ] MIME types correct for JS/CSS/woff2 from `dist/`
-- [ ] Legacy files deprecated from the served tree (decision recorded)
-- [ ] README documents the new workflow
-- [ ] pytest suite green
+- [x] `dashboard_server.py` serves `dist/` on 3005 and `/api/*` still works (S12)
+- [x] MIME types correct for JS/CSS/woff2 from `dist/`
+- [x] Legacy files deprecated from the served tree (decision recorded)
+- [x] README documents the new workflow
+- [x] pytest suite green
 
 ---
 

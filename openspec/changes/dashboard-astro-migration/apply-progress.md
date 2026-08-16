@@ -227,3 +227,69 @@ Rama: `feature_148_m4-vista-intento` (card #154). T11 es un gate manual sin PR: 
 
 ### Siguiente fase
 - **M6 · PR5** (T12): corte final — Python sirve `dist/` en 3005 con `/api` intacto (S12), MIME correctos, legacy deprecado, README actualizado. Gate T11 superado: M6 desbloqueado.
+
+---
+
+## Ejecución 6: M6 — Corte final (T12, PR5) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m6-corte` (card #154). Este run ejecutó T12 completo inline (regla de terminación: sin sub-agentes, sin commits, trabajo en working tree). Dispatcher nativo: `apply: ready`, sin blockers. `strict_tdd: false` (no aplica). Marcó los 5 checkboxes de done-when en `tasks.md` y registró resultados aquí (merge, sin overwrite).
+
+### Código — `ultratimonel/dashboard_server.py` (root estático configurable)
+
+- **Override de static root:** `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` (env) + `resolve_static_root(port)`.
+  Orden de resolución: (1) env → override explícito; (2) puerto principal `3005` → `ultratimonel/dashboard-astro/dist/` (corte, ADR-5); (3) cualquier otro puerto → legacy `DASHBOARD_DIR`.
+  El default del override es el legacy (`dashboard/`) — item 1 del task; el "seteado en el puerto principal" es el default por-puerto (3005 → dist/) — item 3.
+- **`_serve_index()`** sirve `index.html` desde `STATIC_ROOT` (funciona con `dist/index.html` del build Astro).
+- **`translate_path()`** resuelve estáticos (`/_astro/*`, `/fonts/*`, `/static/*`, rutas de página) desde `STATIC_ROOT`; el resto del routing (`/api/*`, `do_GET`) queda INTACTO.
+- **`create_server()`** resuelve `STATIC_ROOT` por puerto y loguea warning si el root no existe (deploy sin build → 404 consciente, no silencioso).
+- `run_server()` imprime el root servido (`📂 Static:`).
+- Verificación de resolución: `resolve_static_root(3005) → dist`, `(3008) → dashboard`, `(3007) → dashboard`, env → override.
+
+### Decisión de deprecación legacy (item 5, default del task)
+
+**Mantener** `ultratimonel/dashboard/index.html` + `app.js` en el repo, **fuera del árbol servido** (el puerto principal sirve `dist/`; `/app.js` → 404). Nota de deprecación en README.md/README.en.md (sección Dashboard) y en el árbol de arquitectura (`~~DEPRECATED~~`). No se tocó ningún archivo bajo `ultratimonel/dashboard/` (`git diff` de ese dir vacío). Rollback trivial: restaurar root legacy (ADR-5).
+
+### Decisión de corte en el puerto principal (regla de terminación)
+
+El proceso legacy 3005 (pid 80794) **no se reinició** en este run: el cambio de puerto principal queda en código (default por-puerto 3005 → dist/) y queda documentado para que el deploy real lo efectúe (restart del server 3005 con el código nuevo = sirve dist/). La validación del corte se hizo en **3008** con el handler real y el nuevo root (`ULTRATIMONEL_DASHBOARD_STATIC_ROOT=…/dashboard-astro/dist`), el mismo mecanismo que usará producción.
+
+### Smoke S1–S12 (validación 3008 con dist/ + handler real)
+
+- **Rutas 200 + `text/html`:** `/`, `/proyectos/ultratimonel/`, `/misiones/1/`, `/intentos/24/` (S1–S7 shells)
+- **MIME desde `dist/` (item 4, Python 3.13 mimetypes):**
+  - `/_astro/*.css` → `text/css` ✓
+  - `/_astro/*.js` → `text/javascript` ✓
+  - `/` (index) → `text/html` ✓
+  - `/fonts/press-start-2p-latin.woff2` → `font/woff2` ✓
+- **`/api/*` intacto (S12):** `/api/projects`, `/api/projects/ultratimonel/missions`, `/api/missions/1`, `/api/intentos/24` → **JSON idéntico** (diff vacío vs 3005), mismo origen, sin CORS. `/api/missions/999999` → 404.
+- **Legacy fuera del árbol servido (S12):** `/app.js` → 404, `/dashboard/app.js` → 404.
+- **Render headless (chromium, virtual-time-budget 8000):** `/` nes-btn OK · `/proyectos/ultratimonel/` nes-progress OK · `/misiones/1/` checkbox/empty OK · `/intentos/24/` "Intento #24" OK (mismos marcadores que T11 sobre el mismo `dist/`).
+- **Contenido shell:** `index.html` del build (title "Ultratimonel Dashboard", `app-shell`, `_astro/*.js`) — no el fallback "Dashboard UI not found".
+
+### pytest (`.venv/bin/pytest tests/ -q --tb=short`, por archivo, timeout)
+
+- `test_context_extractor.py`: **11 passed** (0.01s)
+- `test_gate_engine.py`: **19 passed** (0.03s)
+- `test_persistence.py`: **28 passed** (5.22s)
+- `test_server.py`: **55 passed** (3.79s)
+- `test_integration.py`: 1 passed (`test_server_initializes`) luego **HANG** (timeout) — preexistente, mismo punto MCP stdio bajo pytest que en T11
+- `test_triple_match.py`: **HANG** en el primer test (timeout) — preexistente (executors 1a/1b/1c con red a agentmemory/checkpoint/deck)
+- **Total suite ejecutable: 113 passed.** Ambos hangs PREEXISTENTES e inalterados (sin cambios en `tests/` en este run; verificado en Ejecución 5). NF-DA-07: suite intacta, sin regresiones.
+
+### Documentación (item 6)
+
+- `README.md` + `README.en.md`: sección Dashboard reescrita — tabla de puertos (3005 producción / 3006 dev / 3007 validación build), comandos `cd ultratimonel/dashboard-astro && npm run dev/build`, root estático por puerto + `ULTRATIMONEL_DASHBOARD_STATIC_ROOT`, nota de deprecación legacy. Fila de features actualizada (Astro + NES.css). Env var agregada a la tabla de configuración. Árbol de arquitectura con `dashboard-astro/` + legacy marcado deprecado.
+
+### Estado del árbol (rama `feature_148_m6-corte`)
+
+- Modificado: `ultratimonel/dashboard_server.py`, `README.md`, `README.en.md`, `openspec/changes/dashboard-astro-migration/tasks.md` (T12 [x]), `apply-progress.md` (este archivo)
+- Sin cambios bajo `ultratimonel/dashboard/` · sin commits ni PR — working tree listo para revisión de PR5 (M6)
+
+### Limpieza
+
+- Server de prueba 3008 detenido · `.tmp-t12-3008.log` borrado · sin `.tmp-*` restantes · Legacy 3005 (pid 80794) sigue vivo e intacto (HTTP 200 verificado al cierre)
+
+### Siguiente fase
+
+- **Verify** del cambio completo (`sdd-verify`): dispatcher `verify: ready`; `archive` seguirá `blocked` hasta completar tasks (ya todos done) y pasar verify.
