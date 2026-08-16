@@ -93,9 +93,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 7. `npm run build` with no pages yet (verify toolchain resolves; expected: empty dist or missing-pages warning)
 
 **Done when:**
-- [ ] `ultratimonel/dashboard-astro/package.json` lists `astro`, `@astrojs/react`, `react@^18`, `react-dom@^18`, `nes-react`, `nes.css`
-- [ ] Root `.gitignore` covers `node_modules/` and `dist/` of the app
-- [ ] `npm install` resolves (with `--legacy-peer-deps` if required) and `astro` CLI runs
+- [x] `ultratimonel/dashboard-astro/package.json` lists `astro`, `@astrojs/react`, `react@^18`, `react-dom@^18`, `nes-react`, `nes.css`
+- [x] Root `.gitignore` covers `node_modules/` and `dist/` of the app
+- [x] `npm install` resolves (with `--legacy-peer-deps` if required) and `astro` CLI runs
 
 ---
 
@@ -130,9 +130,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 3. Verify proxy: with the legacy server running on 3005, `curl http://127.0.0.1:3006/api/projects` returns JSON
 
 **Done when:**
-- [ ] Dev server binds `127.0.0.1:3006`
-- [ ] `curl 127.0.0.1:3006/api/projects` returns the same JSON as `127.0.0.1:3005/api/projects`
-- [ ] No CORS headers involved (same-origin via proxy — S10)
+- [x] Dev server binds `127.0.0.1:3006`
+- [x] `curl 127.0.0.1:3006/api/projects` returns the same JSON as `127.0.0.1:3005/api/projects`
+- [x] No CORS headers involved (same-origin via proxy — S10)
 
 ---
 
@@ -151,9 +151,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Body/root classes: apply `nes-*` container classes at layout level where structural (e.g., page background via `.nes-container`)
 
 **Done when:**
-- [ ] Layout renders with NES.css styles in the static HTML (no JS hydration needed for base styles)
-- [ ] Font loads from `public/fonts/` (self-hosted) with fallback
-- [ ] `layout.css` contains no design CSS (grep: no `color:`, `border:`, `background:` except structural)
+- [x] Layout renders with NES.css styles in the static HTML (no JS hydration needed for base styles)
+- [x] Font loads from `public/fonts/` (self-hosted) with fallback
+- [x] `layout.css` contains no design CSS (grep: no `color:`, `border:`, `background:` except structural)
 
 ---
 
@@ -173,9 +173,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 5. All components consume NES.css classes only; zero inline styles
 
 **Done when:**
-- [ ] `useApi` exposes `{ data, loading, error, retry }` and is used by all islands
-- [ ] UI components use only `.nes-*` classes from the bundle
-- [ ] No design CSS written in this layer (ADR-6)
+- [x] `useApi` exposes `{ data, loading, error, retry }` and is used by all islands
+- [x] UI components use only `.nes-*` classes from the bundle
+- [x] No design CSS written in this layer (ADR-6)
 
 ---
 

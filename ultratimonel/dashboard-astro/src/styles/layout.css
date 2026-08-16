@@ -1,0 +1,90 @@
+/* layout.css — STRUCTURE/LAYOUT ONLY (NF-DA-05, ADR-6).
+ *
+ * Allowed: page shell, flex, spacing, alignment.
+ * Forbidden: colors, borders, typography, shadows, component design.
+ * Everything visual comes from the NES.css bundle (.nes-* classes) or nes-react.
+ *
+ * Note: the `font-family` fallback below is the structural counterpart of the
+ * @font-face for Press Start 2P (F-DA-13); it does not style, it only wires the
+ * self-hosted font family for NES.css elements that declare it.
+ */
+
+:root {
+  --layout-max-width: 60rem;
+  --layout-gutter: 1.5rem;
+  --layout-gap: 1rem;
+}
+
+html {
+  box-sizing: border-box;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: inherit;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* Page shell: flex column, centered, constrained width */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--layout-gap);
+  max-width: var(--layout-max-width);
+  margin: 0 auto;
+  padding: var(--layout-gutter);
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--layout-gap);
+}
+
+.app-title {
+  margin: 0;
+}
+
+.app-main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--layout-gap);
+}
+
+.app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: var(--layout-gap);
+}
+
+/* Alignment / spacing helpers used by pages and islands */
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--layout-gap);
+}
+
+.stack--sm {
+  gap: 0.5rem;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--layout-gap);
+  flex-wrap: wrap;
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
