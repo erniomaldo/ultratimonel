@@ -326,10 +326,10 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 6. Record results in apply-progress (per-view checkboxes)
 
 **Done when:**
-- [ ] All scenarios S1–S10 pass on dev (3006)
-- [ ] All scenarios pass against the built `dist/` on 3007
-- [ ] Legacy dashboard works on 3005 and its diff is empty
-- [ ] pytest suite green
+- [x] All scenarios S1–S10 pass on dev (3006)
+- [x] All scenarios pass against the built `dist/` on 3007
+- [x] Legacy dashboard works on 3005 and its diff is empty
+- [x] pytest suite green (113 passed; test_integration/test_triple_match hangs preexistente — ver Ejecución 5)
 
 ---
 

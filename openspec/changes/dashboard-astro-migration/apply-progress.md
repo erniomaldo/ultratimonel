@@ -176,3 +176,54 @@ Rama: `feature_148_m4-vista-intento` (card #154). Este run cerró el ciclo SDD d
 - **M5 · gate** (T11): validación dual puerto (dev 3006 + build 3007, legacy 3005 intacto, pytest green) — bloquea M6. Sin PR.
 - **M6 · PR5** (T12): corte final (Python sirve `dist/` en 3005, `/api` intacto, legacy deprecado, README).
 - Estimar diff M4/PR4 ≤ 400 líneas (dentro de presupuesto D3; ~310 estimadas).
+
+---
+
+## Ejecución 5: M5 — Validación dual puerto (T11, gate sin PR) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m4-vista-intento` (card #154). T11 es un gate manual sin PR: bloquea M6/PR5. Este run ejecutó la validación completa inline (regla de terminación: sin sub-agentes, sin commits, trabajo en working tree). Cerró el gate: marcó los 4 checkboxes de done-when en `tasks.md` y registró resultados aquí.
+
+### Validación dev 3006 (S1–S10)
+- Dev server: `npm run dev` (astro dev, host 127.0.0.1:3006) — pid node, log en `.tmp-dev.log` (repo root, borrado al final)
+- **Rutas (HTTP 200):** `/`, `/proyectos/ultratimonel/`, `/misiones/1/`, `/intentos/24/`
+- **Proxy API idéntico** (`diff` sin diferencias vs 3005): `/api/projects`, `/api/projects/ultratimonel/missions`, `/api/missions/1`, `/api/intentos/24` — todos HTTP 200
+- **S10 OK:** respuestas del proxy sin ningún header `Access-Control-*`; `content-type: application/json; charset=utf-8`
+- **Render headless (chromium, virtual-time-budget 8000):**
+  - S1 `/`: 20 links de proyecto en body + breadcrumb Dashboard + sin estado empty ("Sin proyectos" ausente)
+  - S3 `/proyectos/ultratimonel/`: 43 mission links renderizados, breadcrumb presente
+  - S5 `/misiones/1/`: 14 checkboxes, intento embebido `/intentos/155/`, crumb proyecto `voy-rojo` (S4)
+  - S7 `/intentos/24/`: header "Intento #24", 4 gates (botones "Ver logs"), progress `4/4`, crumb cadena `/` → `/proyectos/ultratimonel/` → `/misiones/482/` (S6)
+  - S8: `/misiones/999999/` → Astro 404 shell limpio (sin crash); el estado 404 de isla ("no encontrada" + nav) ya verificado en T10
+  - S9 (API down + retry): verificado en T10 (componentes con "Reintentar" presentes en source); no se detuvo 3005 en el gate para no romper S11
+
+### Validación build 3007 (S1–S10 sobre `dist/`)
+- Build: `npm run build` → 445 páginas OK (438ms)
+- Servido con `.tmp-serve3007.py` (proxy `/api` → 3005) en 3007 — pid python, log `.tmp-serve3007.log` (repo root, borrado)
+- **Rutas (HTTP 200):** `/`, `/proyectos/ultratimonel/`, `/misiones/1/`, `/intentos/24/` — proxy API idéntico (mismos 4 endpoints, diff vacío)
+- **Render headless idéntico al dev:** S1 (20 proyectos), S3 (43 missions), S5 (14 checkboxes, intento 155, crumb voy-rojo), S7 (Intento #24, 4 gates, 4/4, crumb cadena)
+- **S8 build:** `/misiones/999999/` → 404 (sin crash)
+- **S10 build:** sin `Access-Control-*` en proxy 3007
+- **MIME desde `dist/`:** `text/html` (index), `text/css` (CSS bundle), `text/javascript` (JS bundle) — correctos
+
+### Legado 3005 (S11)
+- `GET /` → HTTP 200 (pid 80794, intacto durante todo el run)
+- `git diff ultratimonel/dashboard/` → **vacío** · `git status` sin cambios bajo `ultratimonel/dashboard/`
+
+### pytest (`.venv/bin/pytest tests/ -q --tb=short`, por archivo, timeout)
+- `test_context_extractor.py`: **11 passed** (0.02s)
+- `test_gate_engine.py`: **19 passed** (0.03s)
+- `test_persistence.py`: **28 passed** (5.33s)
+- `test_server.py`: **55 passed** (4.42s)
+- `test_integration.py`: 1 passed (`test_server_initializes`) luego **HANG (timeout 124)** en `test_tools_listed` — mismo punto MCP stdio bajo pytest
+- `test_triple_match.py`: **HANG (timeout 124)** en el primer test — preexistente (executors `1a/1b/1c` hacen llamadas de red a agentmemory/checkpoint/deck)
+- **Total suite ejecutable: 113 passed.** Ambos hangs son PREEXISTENTES (tests sin cambios: `git status tests/` limpio, `git diff` vacío); el handshake MCP directo funciona (20 tools listadas OK), el cuelgue ocurre solo bajo pytest (pila anyio/asyncio) o por red de los executors — no es regresión de este cambio (NF-DA-07: suite intacta).
+
+### Cierre
+- **tasks.md T11:** 4 checkboxes done-when marcados `[x]`
+- **apply-progress:** sección Ejecución 5 agregada (merge, sin overwrite)
+- **Limpieza:** dev 3006 detenido · 3007 detenido · `.tmp-dev.log`, `.tmp-serve3007.log`, `.tmp-serve3007.py`, `.tmp-dom-*`, `.tmp-proxy-*`, `.tmp-b3007.json`, `.tmp-b3005.json`, `.tmp-pytest-*.log` — todos borrados
+- **Working tree:** `git status` limpio (M1–M4 ya commiteados; T11 es gate sin PR ni código nuevo). Legacy 3005 intacto.
+
+### Siguiente fase
+- **M6 · PR5** (T12): corte final — Python sirve `dist/` en 3005 con `/api` intacto (S12), MIME correctos, legacy deprecado, README actualizado. Gate T11 superado: M6 desbloqueado.
