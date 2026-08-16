@@ -228,3 +228,24 @@ Detalle completo (criterios done por misión y mapeo por tarea): `tasks.md`.
   estilos (ADR-6)
 - `tasks.md` — tareas T1–T12 con trazabilidad a specs y design, organizadas en
   la partición de entrega aprobada M1–M6 / PR1–PR5
+
+---
+
+## Nota de actualización (2026-08-15/16, card #154)
+
+La implementación adoptó **jerarquía de URLs** + **fallbacks post-build** +
+**redirects 301** (decisión del usuario 2026-08-15), desviándose del esquema
+plano original de este documento:
+
+- Estructura vigente: `/`, `/{proyectoName}/`, `/{proyectoName}/{misionId}/`,
+  `/{proyectoName}/{misionId}/{checklistItemId}/` y
+  `/{proyectoName}/{misionId}/{checklistItemId}/{intentoId}/` (el 4º nivel —
+  detalle del intento como página propia — agregado el 2026-08-16).
+- Las rutas planas (`/proyectos/*`, `/misiones/*`, `/intentos/*`) responden 301
+  hacia su equivalente jerárquico; el server Python resuelve la `Location` por DB.
+- Fallbacks post-build: entidad existente sin shell enumerado en el build → 200
+  con shell genérico hidratado; entidad inexistente → 404 real.
+
+El cuerpo de este documento (Reactivos 1–4) describe el diseño original plano;
+la especificación y el diseño vigentes (`spec.md`, `design.md`,
+`apply-progress.md`) documentan la estructura jerárquica real.

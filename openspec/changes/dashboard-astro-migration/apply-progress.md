@@ -1,7 +1,7 @@
 # Dashboard Astro Migration — Apply Progress
 
-> **Change:** `dashboard-astro-migration` · **Updated:** 2026-08-15
-> **Branch:** `feature_148_m4-vista-intento` · **Mission/PR:** M4 — Intento + hardening (PR4, card #154) · M1/PR1, M2/PR2 y M3/PR3 en secciones previas
+> **Change:** `dashboard-astro-migration` · **Updated:** 2026-08-16
+> **Branch:** `feature_148_m6-corte` · **Última ejecución:** E9 (card #154) · M1/PR1, M2/PR2 y M3/PR3 en secciones previas
 > **Inputs:** [tasks.md](./tasks.md) · [design.md](./design.md) · [spec.md](./specs/dashboard-astro-migration/spec.md)
 
 ---
@@ -355,12 +355,13 @@ Rama: `feature_148_m6-corte` (card #154). El usuario aprobó explícitamente (20
 - `/[proyectoName]/` → misiones del proyecto (slug con guiones, ej. `/ultratimonel/`, `/voy-rojo/`). REEMPLAZA `/proyectos/[project]/`
 - `/[proyectoName]/[misionId]/` → checklist de la misión. REEMPLAZA `/misiones/[id]/`
 - `/[proyectoName]/[misionId]/[checklistItemId]/` → intentos del item del checklist (nivel NUEVO)
+- **NOTA (E9, 2026-08-16):** la estructura vigente agregó el 4º nivel `/[proyectoName]/[misionId]/[checklistItemId]/[intentoId]/` — el detalle del intento como PÁGINA propia. E8 documentó 3 niveles (proyecto/misión/ítem) + raíz; ver Ejecución 9.
 
 Ejecutado inline (regla de terminación: sin sub-agentes, sin commits, trabajo en working tree). No había task nuevo en `tasks.md` (T1–T12 ya done); este run registra la reestructuración como Ejecución 8. **RESTRICCIÓN RESPETADA:** nada leído/ejecutado bajo `~/.hermes` (ni sqlite3 ni project_maps); datos de dominio SOLO vía API del server 3005; el build (getStaticPaths con node:sqlite) resuelve la DB por sí mismo.
 
 ### Decisión del usuario (registrada)
 
-Rutas jerárquicas aprobadas 2026-08-15 reemplazan el esquema plano F-DA-15. Nota agregada en `design.md` sección 2.3 (sin reescribir el documento). El path ES la jerarquía: los breadcrumbs se derivan del path (Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId}) con nivel actual como `<a>` clickeable que refresca (patrón `currentHref` de Ejecución 7).
+Rutas jerárquicas aprobadas 2026-08-15 reemplazan el esquema plano F-DA-15. Nota agregada en `design.md` sección 2.3 (sin reescribir el documento). El path ES la jerarquía: los breadcrumbs se derivan del path (Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId}) con nivel actual como `<a>` clickeable que refresca (patrón `currentHref` de Ejecución 7). **E9 (2026-08-16) extiende la cadena a `Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId} › Intento #{intentoId}` — el 4º nivel es PÁGINA propia (ver Ejecución 9).**
 
 ### Código — páginas Astro nuevas (estructura jerárquica)
 
@@ -375,7 +376,7 @@ Rutas jerárquicas aprobadas 2026-08-15 reemplazan el esquema plano F-DA-15. Not
 - **`ItemDetail.jsx` (NUEVO):** vista de intentos por ítem — cards de intentos (estado, gates, progreso, fecha, sesión) con slot al detalle que reutiliza `<IntentoDetail />` dentro de un `NesDialog` (logs on-demand, S6/S7). Breadcrumb completo con `currentHref`.
 - **`ProjectDetail.jsx`:** ahora renderiza su propio Breadcrumbs (Dashboard → proyecto actual clickeable) + pasa `project` a `MissionCard`.
 - **`MissionDetail.jsx`:** breadcrumb `Dashboard › {project} › Misión #{id}` (actual clickeable con `currentHref`), links de proyecto → `/{project}/`; pasa `project`+`missionId` a `ChecklistCard`.
-- **`IntentoDetail.jsx`:** ya no es página; se usa como slot de detalle. Breadcrumbs a rutas nuevas (project → `/{project}/`, misión → `/{project}/{mission.id}/`); nivel actual (Intento) como texto (no tiene ruta propia).
+- **`IntentoDetail.jsx`:** ya no es página; se usa como slot de detalle. Breadcrumbs a rutas nuevas (project → `/{project}/`, misión → `/{project}/{mission.id}/`); nivel actual (Intento) como texto (no tiene ruta propia). **NOTA (E9, 2026-08-16): superado — el detalle del intento VOLVIÓ a ser PÁGINA con ruta propia en el 4º nivel `/{proyectoName}/{misionId}/{checklistItemId}/{intentoId}/`; el slot/dialog de E8 quedó reemplazado por el link "Ver detalle y logs" hacia esa página (ver Ejecución 9).**
 - **`MissionCard.jsx`:** href `/{project}/{mission.id}/` (usa prop `project` o `mission.project`).
 - **`ChecklistCard.jsx`:** ítem + botón "Ver intentos" → `/{project}/{missionId}/{item.id}/`; intentos embebidos linkean a la misma ruta del ítem.
 - **`ProjectCard.jsx`:** href `/{project.project}/`; botón renombrado "Ver misiones".
@@ -426,3 +427,47 @@ Rutas jerárquicas aprobadas 2026-08-15 reemplazan el esquema plano F-DA-15. Not
 ### Siguiente fase
 
 - **Verify** del cambio completo (`sdd-verify`) deberá cubrir la nueva jerarquía (S1–S12 adaptados a rutas jerárquicas + redirects 301 + fallbacks por tipo); luego `archive`.
+
+---
+
+## Ejecución 9: Quinto nivel — Intento como PÁGINA propia (card #154) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m6-corte` (card #154). El detalle del intento deja de ser solo un slot dentro de un `NesDialog` en la vista de ítem y pasa a ser una PÁGINA con URL propia en el 4º nivel jerárquico. Ejecutado inline (regla de terminación: sin sub-agentes, sin commits, trabajo en working tree). No había task nuevo en `tasks.md` (T1–T12 ya done); este run registra la evolución como Ejecución 9. Commit: `cce5e96`.
+
+### Código — quinto nivel de ruta
+
+- **`src/pages/[proyectoName]/[misionId]/[checklistItemId]/[intentoId]/index.astro`** (NUEVO): página del detalle del intento. `getStaticPaths` enumera intentos con `mission_id`, `checklist_item_id` y `project` (JOIN `missions`) desde la DB SQLite en build-time; shell estático + isla `<IntentoDetail client:load project missionId itemId id />`. El path ES la jerarquía: `Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId} › Intento #{intentoId}`.
+- **`src/pages/fallback/intento.astro`** (NUEVO): shell fallback genérico a 4 niveles, emitido SIEMPRE en `dist/fallback/intento/index.html`; la isla sin props resuelve los 4 segmentos del pathname en runtime y fija `<title>` en mount.
+- **`IntentoDetail.jsx`:** vuelve a ser la página del detalle (supera la nota de E8). Resuelve props desde el shell o desde `window.location.pathname` (fallback post-build); breadcrumb completo con `currentHref` clickeable; el timeline de gate logs sigue on-demand en `NesDialog` (S6/S7).
+- **`ItemDetail.jsx`:** "Ver detalle y logs" pasó de botón (abría modal) a **link** `<a className="nes-btn">` hacia la ruta del intento.
+
+### Server Python — nivel intento en el guard jerárquico
+
+- `_match_hierarchical_route` reconoce el 4º nivel: `("intento", slug, id, id, id)`.
+- `_entity_exists_hierarchical("intento", ...)`: el intento existe Y su `mission_id` + `checklist_item_id` + `project` coinciden con los segmentos de la URL (mismo check que el API — S8 intacto).
+- `_serve_hierarchical_fallback` sirve `dist/fallback/intento/index.html` (200) solo si la entidad existe; si no → 404 real.
+- Redirect legacy de `/intentos/{id}` ya resuelto a 4 segmentos (E8); sin cambios en este run.
+
+### Evidencia (build + smoke en prod 3005)
+
+- `npm run build` (dashboard-astro): **1375 páginas OK**, incluye `dist/fallback/intento/index.html`.
+- Smoke HTTP en producción 3005 (curl): `/ultratimonel/1454/7226/300/` → 200 · `/ultratimonel/1454/7226/299/` → 200 · `/ultratimonel/1454/7226/296/` → 200.
+- **S8:** `/ultratimonel/1454/999999/300/` → 404 (misión no coincide) · `/ultratimonel/1454/7226/999999/` → 404 (intento inexistente).
+- **Fallback post-build** (intento 300): moviendo temporalmente `dist/ultratimonel/1454/7226/300/` fuera → `/ultratimonel/1454/7226/300/` → **200** con shell `fallback/intento`, isla hidrató (title + breadcrumb + gates) → restaurado.
+- Render headless (chromium, dump-dom): breadcrumb `Dashboard › ultratimonel › Misión #1454 › Ítem #7226 › Intento #300` con 4 links navegables; gates + progreso + logs on-demand renderizados.
+- **pytest:** `tests/test_server.py` → **55 passed**. Sin cambios en `tests/` (NF-DA-07).
+
+### Estado del árbol (rama `feature_148_m6-corte`)
+
+- Nuevos: `src/pages/[proyectoName]/[misionId]/[checklistItemId]/[intentoId]/index.astro`, `src/pages/fallback/intento.astro`
+- Modificados: `src/components/intentos/IntentoDetail.jsx`, `src/components/checklist/ItemDetail.jsx` (botón → link), `design.md` (nota 2.3), `apply-progress.md` (este archivo)
+- `tasks.md`: sin cambios (auditoría: checkboxes correctos). Sin commits ni PR en el run — commit posterior `cce5e96`.
+
+### Limpieza
+
+- Sin servidores de prueba lanzados en este run (smoke directo contra prod 3005, que ya sirve `dist/`); sin `.tmp-*` restantes.
+
+### Siguiente fase
+
+- **Verify** del cambio completo (`sdd-verify`): cubrir la jerarquía completa de 4 niveles (S1–S8 + S14 fallback post-build + S15 redirects 301) contra la implementación real; luego `archive`.
