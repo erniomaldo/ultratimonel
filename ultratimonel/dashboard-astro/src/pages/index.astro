@@ -1,14 +1,12 @@
 ---
-// Index route — static shell (M1 placeholder).
-// T6 (M2/PR2) fills this with the <ProjectsIndex client:load /> island.
+// Index route — project list (T6, F-DA-09, S1/S2).
+// Static shell + Breadcrumbs (Dashboard, current) + hydrated <ProjectsIndex /> island.
 import BaseLayout from '../layouts/BaseLayout.astro';
+import Breadcrumbs from '../components/Breadcrumbs.jsx';
+import ProjectsIndex from '../components/projects/ProjectsIndex.jsx';
 ---
 
 <BaseLayout title="Ultratimonel Dashboard">
-  <section class="stack">
-    <div class="nes-container is-rounded with-title">
-      <p class="title">Dashboard</p>
-      <p class="nes-text is-disabled">Cargando proyectos…</p>
-    </div>
-  </section>
+  <Breadcrumbs current="Dashboard" />
+  <ProjectsIndex client:load />
 </BaseLayout>

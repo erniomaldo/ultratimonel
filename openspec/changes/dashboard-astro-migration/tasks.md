@@ -194,9 +194,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Keep the component framework-agnostic (no fetch inside — resolution happens in the island per F-DA-15)
 
 **Done when:**
-- [ ] Breadcrumb renders for all 4 route levels (S1/S2/S4/S6)
-- [ ] Every non-current crumb is an `<a>` to the correct real route
-- [ ] Clicking any crumb navigates and the target route loads correctly
+- [x] Breadcrumb renders for all 4 route levels (S1/S2/S4/S6)
+- [x] Every non-current crumb is an `<a>` to the correct real route
+- [x] Clicking any crumb navigates and the target route loads correctly
 
 ---
 
@@ -215,9 +215,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Handle `loading` / `error` (retry) / empty project list states (S9)
 
 **Done when:**
-- [ ] `/` lists projects with counts (S1)
-- [ ] Clicking a project navigates to `/proyectos/{project}/` (S2)
-- [ ] Error and empty states render without crashing
+- [x] `/` lists projects with counts (S1)
+- [x] Clicking a project navigates to `/proyectos/{project}/` (S2)
+- [x] Error and empty states render without crashing
 
 ---
 

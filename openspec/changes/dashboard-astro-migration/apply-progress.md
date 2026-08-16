@@ -1,7 +1,7 @@
 # Dashboard Astro Migration — Apply Progress
 
 > **Change:** `dashboard-astro-migration` · **Updated:** 2026-08-15
-> **Branch:** `feature_148_m1-fundacion` · **Mission/PR:** M1 — Fundación (PR1, card #154)
+> **Branch:** `feature_148_m2-navegacion` · **Mission/PR:** M2 — Navegación + Índice (PR2, card #154) · M1/PR1 en sección previa
 > **Inputs:** [tasks.md](./tasks.md) · [design.md](./design.md) · [spec.md](./specs/dashboard-astro-migration/spec.md)
 
 ---
@@ -53,6 +53,33 @@ Dispatched state: `nextRecommended: apply`, sin blockers. Legado 3005 corriendo 
 
 ---
 
+## Ejecución 2: M2 — Navegación + Índice (T5–T6) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m2-navegacion` (card #154). Este run cerró el ciclo SDD de M2: marcó `tasks.md` y actualizó apply-progress. Sin commits ni PR — el trabajo queda en el working tree (regla de terminación).
+
+### T5 — Breadcrumbs component ✅
+- [x] `src/components/Breadcrumbs.jsx`: cadena navegable `Dashboard → Proyecto → Misión → Intento`; props `{ crumbs: [{ label, href }], current }`
+- [x] Cada crumb no-current es `<a className="nes-btn" href={...}>` con la ruta real del nivel; el current es texto plano `.nes-text`
+- [x] Prepende automáticamente `Dashboard` → `/` cuando el island no lo incluye y current ≠ Dashboard (fix: legacy no tenía nivel Dashboard) — F-DA-08
+- [x] Sin fetch interno: la resolución de padres ocurre en el island desde datos API (F-DA-15); componente framework-agnostic
+- [x] Solo clases `.nes-*` del bundle + helper estructural `.row` (NF-DA-05, ADR-6); cero inline styles
+- Soportado para los 4 niveles (S1/S2/S4/S6) vía crumbs arbitrarios + current
+
+### T6 — Index view: project list ✅
+- [x] `src/pages/index.astro`: shell + `<Breadcrumbs current="Dashboard" />` + `<ProjectsIndex client:load />` (reemplaza el placeholder mínimo de T3)
+- [x] `src/components/projects/ProjectsIndex.jsx`: `useApi('/api/projects')` → un `ProjectCard` por proyecto; header con count total; estados `loading` / `error`+retry / empty ("Sin proyectos configurados.") sin crash (S9)
+- [x] `src/components/ProjectCard.jsx`: `Container` (title link) + `List`/`Icon` mostrando `project`, `mission_count`, `completed_count`; título y botón `.nes-btn` linkean a `/proyectos/{project}/` (S2)
+- [x] Smoke verificado en el run de implementación: `/` HTTP 200 y JSON `/api/projects` idéntico vía proxy (mismo contrato que T2)
+- [x] ADR-6: grep sin `style=` inline en los componentes nuevos
+
+### Estado del árbol (rama `feature_148_m2-navegacion`)
+- Modificado: `src/pages/index.astro`
+- Untracked (M2): `src/components/Breadcrumbs.jsx`, `src/components/ProjectCard.jsx`, `src/components/projects/ProjectsIndex.jsx`
+- Sin commits ni PR — working tree listo para revisión de PR2
+
+---
+
 ## Siguiente fase
-- **M2 · PR2** (T5–T6): Breadcrumbs + index view. `index.astro` actual es un placeholder mínimo (T3 shell) que T6 reemplaza con `<ProjectsIndex client:load />`.
-- Estimar diff M1/PR1 ≤ 400 líneas (dentro de presupuesto D3).
+- **M3 · PR3** (T7–T8): Project detail (`/proyectos/[project]/`) + Mission detail (`/misiones/[id]/`). Depende de T6 (done).
+- Estimar diff M2/PR2 ≤ 400 líneas (dentro de presupuesto D3; ~220 estimadas).
