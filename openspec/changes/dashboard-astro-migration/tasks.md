@@ -237,9 +237,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 5. Empty state: "no missions" NES-styled message (S3)
 
 **Done when:**
-- [ ] `/proyectos/{project}/` lists missions with progress (S3)
-- [ ] Breadcrumb shows Dashboard link + project current (S2)
-- [ ] Empty and error states render without crashing
+- [x] `/proyectos/{project}/` lists missions with progress (S3)
+- [x] Breadcrumb shows Dashboard link + project current (S2)
+- [x] Empty and error states render without crashing
 
 ---
 
@@ -259,9 +259,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 5. Empty checklist: "Sin checklist" NES-styled message (S5)
 
 **Done when:**
-- [ ] `/misiones/{id}/` renders mission + checklist items + embedded intentos (S5)
-- [ ] Breadcrumb shows full Dashboard → project → mission chain with working links (S4)
-- [ ] Clicking an intento navigates to `/intentos/{id}/` (S6)
+- [x] `/misiones/{id}/` renders mission + checklist items + embedded intentos (S5)
+- [x] Breadcrumb shows full Dashboard → project → mission chain with working links (S4)
+- [x] Clicking an intento navigates to `/intentos/{id}/` (S6)
 
 ---
 

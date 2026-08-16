@@ -1,7 +1,7 @@
 # Dashboard Astro Migration — Apply Progress
 
 > **Change:** `dashboard-astro-migration` · **Updated:** 2026-08-15
-> **Branch:** `feature_148_m2-navegacion` · **Mission/PR:** M2 — Navegación + Índice (PR2, card #154) · M1/PR1 en sección previa
+> **Branch:** `feature_148_m3-proyecto-mision` · **Mission/PR:** M3 — Proyecto + Misión (PR3, card #154) · M1/PR1 y M2/PR2 en secciones previas
 > **Inputs:** [tasks.md](./tasks.md) · [design.md](./design.md) · [spec.md](./specs/dashboard-astro-migration/spec.md)
 
 ---
@@ -83,3 +83,49 @@ Rama: `feature_148_m2-navegacion` (card #154). Este run cerró el ciclo SDD de M
 ## Siguiente fase
 - **M3 · PR3** (T7–T8): Project detail (`/proyectos/[project]/`) + Mission detail (`/misiones/[id]/`). Depende de T6 (done).
 - Estimar diff M2/PR2 ≤ 400 líneas (dentro de presupuesto D3; ~220 estimadas).
+
+---
+
+## Ejecución 3: M3 — Proyecto + Misión (T7–T8) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m3-proyecto-mision` (card #154). Este run cerró el ciclo SDD de M3: marcó `tasks.md` y actualizó apply-progress (merge, sin overwrite). Sin commits ni PR — el trabajo queda en el working tree (regla de terminación).
+
+### T7 — Project view: missions ✅ VERIFICADO
+- [x] `src/pages/proyectos/[project]/index.astro`: shell + `Breadcrumbs current={project}` (auto-pre-pone Dashboard → `/`, S2) + `<ProjectDetail client:load project={project} />`
+- [x] `src/components/projects/ProjectDetail.jsx`: `useApi('/api/projects/{project}/missions')` → `MissionCard` por misión; estados loading / error+retry / empty ("Sin misiones sincronizadas para este proyecto.") sin crash (S3/S9)
+- [x] `src/components/MissionCard.jsx`: `Container` (title link) + `NesBadge` estado + `Progress` (`checklist_done`/`checklist_total`, verde al completar) + `List` con items y última sync; botón `.nes-btn` → `/misiones/{id}/` (S4)
+- [x] **getStaticPaths (output static):** enumera slugs de proyecto desde la DB SQLite (`node:sqlite`, mismo path que `dashboard_server.py`: `ULTRATIMONEL_DB_PATH` o `~/.hermes/ultratimonel.db`) — genera un shell estático por proyecto en `dist/`; el contenido lo carga la isla en cliente (ADR-3, sin datos congelados)
+- Verificación ejecutada:
+  - `npm run build` OK → `dist/proyectos/*/index.html` (13 proyectos generados; total build 158 páginas)
+  - Dev 3006 + proxy: `/proyectos/ultratimonel/` HTTP 200; `/api/projects/ultratimonel/missions` JSON idéntico vía proxy
+  - Smoke headless (chromium, virtual-time-budget): 43 mission cards renderizadas, progress bar `.nes-progress` presente, breadcrumb Dashboard link OK (S2/S3)
+
+### T8 — Mission view: checklist + embedded intentos ✅ VERIFICADO
+- [x] `src/pages/misiones/[id]/index.astro`: shell + `<MissionDetail client:load id={id} />` + getStaticPaths desde la DB (`SELECT id FROM missions` → 144 misiones en `dist/`)
+- [x] `src/components/missions/MissionDetail.jsx`: `useApi('/api/missions/{id}')`; breadcrumbs resueltos desde `mission.project` (F-DA-15): `Dashboard` (link `/`) → proyecto (link `/proyectos/{project}/`) → título (current) (S4); header con estado + contador items; estados loading / error+retry (S9) / 404 island "Misión no encontrada" con link al Dashboard (S8) / empty checklist "Sin checklist." (S5)
+- [x] `src/components/ChecklistCard.jsx`: `Checkbox` (done state) + texto del item + `List` con intentos embebidos (`Intento #<id>`, `NesBadge` estado, `gates_passed/gates_total`) — cada intento linkea a `/intentos/{id}/` (S6)
+- Verificación ejecutada:
+  - Dev 3006: `/misiones/1/` (checklist 14 items, 1 intento) HTTP 200; `/misiones/26/` (sin checklist) HTTP 200
+  - Smoke headless (chromium): misión con items → 59 checkboxes, 1 link a `/intentos/155/`, breadcrumb proyecto `voy-rojo` OK (S4/S5/S6); misión sin checklist → "Sin checklist." (S5 empty); id inexistente → 404 sin crash (S8)
+  - `/api/missions/1` contrato: `mission.project`, `mission.checklist[].intentos[].{id,status,gates_passed,gates_total}` — coincide con el consumo de los componentes
+
+### Decisiones de implementación (ADR/Diseño)
+- **getStaticPaths (output static):** el diseño (ADR-3: fetch en cliente, shells estáticos) no enumeró explícitamente las rutas dinámicas; con `output: 'static'` Astro las exige. Resolución: enumerar desde la DB SQLite en build-time (`node:sqlite`, experimental pero disponible en Node 22), generando solo el shell — los datos siguen viniendo de `/api/*` en el navegador. Si la DB no está disponible el build no falla (devuelve `[]`; dev 3006 sigue funcionando).
+- **Mapa de estados:** STATUS_META local en `MissionCard`/`ChecklistCard`/`MissionDetail` espejando `STATUS_LABEL`/`STATUS_CLASS` del legacy (`app.js`); T9 lo centraliza en `StatusBadge` (según tasks).
+- ADR-6 verificado: grep `style=` en los archivos nuevos → sin coincidencias; solo clases `.nes-*` + helpers estructurales de `layout.css`.
+
+### Estado del árbol (rama `feature_148_m3-proyecto-mision`)
+- Untracked (M3): `src/pages/proyectos/[project]/index.astro`, `src/pages/misiones/[id]/index.astro`, `src/components/projects/ProjectDetail.jsx`, `src/components/missions/MissionDetail.jsx`, `src/components/MissionCard.jsx`, `src/components/ChecklistCard.jsx`
+- Modificado: `openspec/changes/dashboard-astro-migration/tasks.md`, `apply-progress.md`
+- Sin commits ni PR — working tree listo para revisión de PR3
+
+### Limpieza
+- Dev server 3006 detenido · `.tmp-dev.log` y archivos smoke (`/home/ernesto-personal/Proyectos/ultratimonel/.tmp-*`) eliminados · Legacy 3005 intacto (pid 80794)
+
+---
+
+## Siguiente fase (tras M3)
+- **M4 · PR4** (T9–T10): Intento detail (`/intentos/[id]/`) + edge states. Depende de T8 (done).
+- **M5 · gate** (T11): validación dual puerto — bloquea M6.
+- Estimar diff M3/PR3 ≤ 400 líneas (dentro de presupuesto D3; ~330 estimadas).

@@ -1,0 +1,35 @@
+---
+// Mission route — mission detail + checklist + embedded intentos (T8, F-DA-11, S5/S6).
+// Static shell + hydrated <MissionDetail /> island (breadcrumb parents resolve
+// from /api/missions/{id} → mission.project, F-DA-15).
+//
+// output:'static' requires getStaticPaths for dynamic routes (Astro). We
+// enumerate mission ids from the dashboard SQLite DB (same resolution as
+// dashboard_server.py) so each real mission gets a static shell in dist/. The
+// shell is empty of content — the island fetches /api/* in the browser
+// (ADR-3), so build-time enumeration never freezes data.
+import { DatabaseSync } from 'node:sqlite';
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import MissionDetail from '../../../components/missions/MissionDetail.jsx';
+
+export async function getStaticPaths() {
+  try {
+    const dbPath =
+      process.env.ULTRATIMONEL_DB_PATH || `${process.env.HOME}/.hermes/ultratimonel.db`;
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db.prepare('SELECT id FROM missions').all();
+    db.close();
+    return rows.map((r) => ({ params: { id: String(r.id) } }));
+  } catch (err) {
+    console.error('[getStaticPaths] mission enumeration failed:', err && err.message);
+    // DB unavailable at build time — no static shells (dev 3006 still works).
+    return [];
+  }
+}
+
+const { id } = Astro.params;
+---
+
+<BaseLayout title={`Misión ${id} · Ultratimonel`}>
+  <MissionDetail client:load id={id} />
+</BaseLayout>

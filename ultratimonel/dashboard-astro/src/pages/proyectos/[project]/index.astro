@@ -1,0 +1,36 @@
+---
+// Project route — missions of a project (T7, F-DA-10, S2/S3).
+// Static shell + Breadcrumbs (Dashboard → project, current) + hydrated <ProjectDetail /> island.
+//
+// output:'static' requires getStaticPaths for dynamic routes (Astro). We
+// enumerate the project slugs from the dashboard SQLite DB (same resolution as
+// dashboard_server.py) so each real project gets a static shell in dist/. The
+// shell is empty of content — the island fetches /api/* in the browser
+// (ADR-3), so build-time enumeration never freezes data.
+import { DatabaseSync } from 'node:sqlite';
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../../components/Breadcrumbs.jsx';
+import ProjectDetail from '../../../components/projects/ProjectDetail.jsx';
+
+export async function getStaticPaths() {
+  try {
+    const dbPath =
+      process.env.ULTRATIMONEL_DB_PATH || `${process.env.HOME}/.hermes/ultratimonel.db`;
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db.prepare('SELECT DISTINCT project FROM missions WHERE project IS NOT NULL').all();
+    db.close();
+    return rows.map((r) => ({ params: { project: String(r.project) } }));
+  } catch (err) {
+    console.error('[getStaticPaths] project enumeration failed:', err && err.message);
+    // DB unavailable at build time — no static shells (dev 3006 still works).
+    return [];
+  }
+}
+
+const { project } = Astro.params;
+---
+
+<BaseLayout title={`Proyecto ${project} · Ultratimonel`}>
+  <Breadcrumbs current={project} />
+  <ProjectDetail client:load project={project} />
+</BaseLayout>
