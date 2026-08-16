@@ -13,24 +13,8 @@
 import React from 'react';
 import useApi from '../../hooks/useApi';
 import Breadcrumbs from '../Breadcrumbs';
-import { NesBadge } from '../ui';
+import StatusBadge from '../StatusBadge';
 import ChecklistCard from '../ChecklistCard';
-
-// Status → label/tone mirror of the legacy dashboard STATUS_LABEL/STATUS_CLASS
-// (ultratimonel/dashboard/app.js). T9 centralizes this in StatusBadge.
-const STATUS_META = {
-  pendiente: { label: 'PENDIENTE', tone: 'warning' },
-  en_progreso: { label: 'EN PROGRESO', tone: 'success' },
-  completada: { label: 'COMPLETADA', tone: 'success' },
-  bloqueada: { label: 'BLOQUEADA', tone: 'error' },
-  running: { label: 'EJECUTANDO', tone: 'warning' },
-  success: { label: 'EXITO', tone: 'success' },
-  fail: { label: 'FALLIDO', tone: 'error' },
-};
-
-function statusMeta(status) {
-  return STATUS_META[status] || { label: status || 'SIN ESTADO', tone: 'default' };
-}
 
 export default function MissionDetail({ id }) {
   const url = `/api/missions/${encodeURIComponent(id)}`;
@@ -93,7 +77,6 @@ export default function MissionDetail({ id }) {
     );
   }
 
-  const meta = statusMeta(mission.status);
   const total = mission.checklist_total || 0;
   const done = Math.min(mission.checklist_done || 0, total || 0);
   const checklist = Array.isArray(mission.checklist) ? mission.checklist : [];
@@ -109,7 +92,7 @@ export default function MissionDetail({ id }) {
       <div className="nes-container is-rounded">
         <div className="row">
           <h2 className="nes-text is-primary">{mission.title || 'Sin título'}</h2>
-          <NesBadge text={meta.label} tone={meta.tone} />
+          <StatusBadge status={mission.status} />
         </div>
         <p className="nes-text is-disabled">
           {done}/{total} items · {checklist.length} en checklist

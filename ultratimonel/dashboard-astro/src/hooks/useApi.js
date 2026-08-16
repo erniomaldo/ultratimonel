@@ -8,6 +8,9 @@
 //   how to render the empty state (NF-DA-06).
 // - `retry` re-runs the fetch with the same URL.
 // - Requests are abortable; a new fetch cancels the previous one.
+// - A falsy `url` skips the fetch and yields `loading: false` (T10): lets views
+//   keep a single data layer for optional/conditional fetches (e.g. the intento
+//   gate-log dialog fetches only while a gate is selected).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -25,6 +28,13 @@ export function useApi(url) {
   }, []);
 
   useEffect(() => {
+    if (!url) {
+      // Conditional/optional fetch not requested (T10): idle, not loading.
+      setLoading(false);
+      setError(null);
+      return undefined;
+    }
+
     const controller = new AbortController();
     controllerRef.current = controller;
 

@@ -1,7 +1,7 @@
 # Dashboard Astro Migration — Apply Progress
 
 > **Change:** `dashboard-astro-migration` · **Updated:** 2026-08-15
-> **Branch:** `feature_148_m3-proyecto-mision` · **Mission/PR:** M3 — Proyecto + Misión (PR3, card #154) · M1/PR1 y M2/PR2 en secciones previas
+> **Branch:** `feature_148_m4-vista-intento` · **Mission/PR:** M4 — Intento + hardening (PR4, card #154) · M1/PR1, M2/PR2 y M3/PR3 en secciones previas
 > **Inputs:** [tasks.md](./tasks.md) · [design.md](./design.md) · [spec.md](./specs/dashboard-astro-migration/spec.md)
 
 ---
@@ -129,3 +129,50 @@ Rama: `feature_148_m3-proyecto-mision` (card #154). Este run cerró el ciclo SDD
 - **M4 · PR4** (T9–T10): Intento detail (`/intentos/[id]/`) + edge states. Depende de T8 (done).
 - **M5 · gate** (T11): validación dual puerto — bloquea M6.
 - Estimar diff M3/PR3 ≤ 400 líneas (dentro de presupuesto D3; ~330 estimadas).
+
+---
+
+## Ejecución 4: M4 — Intento + hardening (T9–T10) ✅
+
+Preflight: A1 (interactivo) · B3 (openspec + engram) · C2 (un solo PR) · D3=400 líneas.
+Rama: `feature_148_m4-vista-intento` (card #154). Este run cerró el ciclo SDD de M4: marcó `tasks.md` (T9 + T10) y actualizó apply-progress (merge, sin overwrite). La implementación y la verificación smoke fueron ejecutadas en el run previo de la misma rama; aquí se verificó el árbol (read-only) y se completó el cierre. Sin commits ni PR — el trabajo queda en el working tree (regla de terminación).
+
+### T9 — Intento view: gates + progress + logs ✅ VERIFICADO
+- [x] `src/pages/intentos/[id]/index.astro`: shell + `<IntentoDetail client:load id={id} />` + getStaticPaths desde la DB SQLite (`SELECT id FROM intentos` — mismo path de `dashboard_server.py`; shells estáticos, contenido vía `/api/*` en cliente, ADR-3)
+- [x] `src/components/intentos/IntentoDetail.jsx`: `useApi('/api/intentos/{id}')`; header `Intento #<id>` + `StatusBadge(intento.status)` + `passed/total` gates; contexto misión (proyecto, título con link, item de checklist, session_id); breadcrumbs resueltos desde `intento.mission` (F-DA-15): Dashboard (auto-prepend) → proyecto (link) → misión (link) → `Intento #<id>` current (S6)
+- [x] `src/components/IntentoCard.jsx`: `Table` de gates (`gate_name`, `StatusBadge` state, mandatory, duration_ms, message) + `Progress` (`gates_passed`/`gates_total`, success al completar) + botón `.nes-btn is-small` por gate → `onViewLogs(gate)` (presentacional; la isla dueña del fetch, F-DA-12)
+- [x] Gate logs on demand: clic en gate → `useApi('/api/intentos/{id}/gate/{name}/logs')` (URL null mientras el dialog está cerrado — guard de T10 en `useApi`) → `NesDialog` con timeline `from_state → to_state` (StatusBadge gate) + `reason` + `created_at` (S7); estados loading / error+retry / empty logs ("Sin registros de transiciones.")
+- [x] `src/components/StatusBadge.jsx`: centraliza `STATUS_META` (intento/misión) + `GATE_STATE_META` (PASS/WARN/BLOCK/SKIP/PENDING → `NesBadge` tones); exporta `statusMeta`/`gateMeta`; M3 refactorizado (`MissionCard`, `ChecklistCard`, `MissionDetail`) para consumirlo
+- Verificación ejecutada en el run previo (smoke headless CDP):
+  - Dialog timeline OK (log gate → from/to state + reason + fecha renderizados)
+  - S7: header + gates + progress renderizados
+  - S6: breadcrumb proyecto/misión navegable hacia `/intentos/[id]/`
+
+### T10 — Edge states + navigation polish ✅ VERIFICADO
+- [x] `useApi` con guard URL: url falsy (`null`) → sin fetch, `loading: false` (idle) — habilita el fetch condicional de los gate logs y evita peticiones en vano; 404 → `error.status === 404` (S8); HTTP errors → `error` + `retry` (S9); respuestas vacías → `null`
+- [x] Intento 404: `IntentoDetail` con `error.status === 404` → "Intento no encontrado" + link al Dashboard, sin crash (S8)
+- [x] API down: error state con botón "Reintentar" en IntentoDetail y en los gate logs (S9)
+- [x] Empty states: `gates.length === 0` → "Sin datos de gates." (IntentoCard); sin logs → "Sin registros de transiciones."; sin datos de intento → "Intento sin datos." — sin crash (NF-DA-06)
+- [x] F5/reload: todas las rutas (`/`, `/proyectos/[project]/`, `/misiones/[id]/`, `/intentos/[id]/`) son shells estáticos con islas que resuelven padres desde la API (F-DA-15); sin estado de navegación en memoria — verificado en el run previo (S8 404, S9 error/retry, empty gates, dialog timeline OK)
+- Verificación read-only de este run: árbol con los 4 archivos nuevos (IntentoDetail, IntentoCard, StatusBadge, page intentos) + `useApi` con guard URL + M3 refactorizado a `StatusBadge` (diffs confirmados)
+
+### Decisiones de implementación (ADR/Diseño)
+- **StatusBadge centralizado:** se eliminaron los `STATUS_META` duplicados de `MissionCard`/`ChecklistCard`/`MissionDetail` (el diseño lo anticipaba para T9); M3 quedó refactorizado a `StatusBadge` en esta misión.
+- **Fetch on-demand de logs:** el dialog no fetchea hasta que se elige un gate; `useApi` con URL null evita el fetch y deja `loading: false` (extensión del contrato T4 documentada en el propio hook, T10).
+- **getStaticPaths para `/intentos/[id]/`:** enumeración desde DB SQLite (misma estrategia que M3); si la DB no está disponible el build no falla (devuelve `[]`, dev 3006 sigue funcionando).
+- ADR-6 verificado en el run previo: grep `style=` en los archivos nuevos → sin coincidencias; solo clases `.nes-*` + helpers estructurales de `layout.css`.
+
+### Estado del árbol (rama `feature_148_m4-vista-intento`)
+- Untracked (M4): `src/pages/intentos/[id]/index.astro`, `src/components/intentos/IntentoDetail.jsx`, `src/components/IntentoCard.jsx`, `src/components/StatusBadge.jsx`
+- Modificado: `src/components/MissionCard.jsx`, `src/components/ChecklistCard.jsx`, `src/components/missions/MissionDetail.jsx` (refactor a StatusBadge), `src/hooks/useApi.js` (guard URL falsy), `openspec/changes/dashboard-astro-migration/tasks.md`, `openspec/changes/dashboard-astro-migration/apply-progress.md`
+- Sin commits ni PR — working tree listo para revisión de PR4
+
+### Limpieza
+- Sin dev servers ni procesos lanzados en este run de cierre; el run previo dejó el árbol limpio de temporales (`.tmp-*` eliminados)
+
+---
+
+## Siguiente fase (tras M4)
+- **M5 · gate** (T11): validación dual puerto (dev 3006 + build 3007, legacy 3005 intacto, pytest green) — bloquea M6. Sin PR.
+- **M6 · PR5** (T12): corte final (Python sirve `dist/` en 3005, `/api` intacto, legacy deprecado, README).
+- Estimar diff M4/PR4 ≤ 400 líneas (dentro de presupuesto D3; ~310 estimadas).

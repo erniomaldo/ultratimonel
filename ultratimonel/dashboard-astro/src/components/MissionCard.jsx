@@ -9,27 +9,10 @@
 
 import React from 'react';
 import { Container, Icon, List, Progress } from 'nes-react';
-import { NesBadge } from './ui';
-
-// Status → label/tone mirror of the legacy dashboard STATUS_LABEL/STATUS_CLASS
-// (ultratimonel/dashboard/app.js). T9 centralizes this in StatusBadge.
-const STATUS_META = {
-  pendiente: { label: 'PENDIENTE', tone: 'warning' },
-  en_progreso: { label: 'EN PROGRESO', tone: 'success' },
-  completada: { label: 'COMPLETADA', tone: 'success' },
-  bloqueada: { label: 'BLOQUEADA', tone: 'error' },
-  running: { label: 'EJECUTANDO', tone: 'warning' },
-  success: { label: 'EXITO', tone: 'success' },
-  fail: { label: 'FALLIDO', tone: 'error' },
-};
-
-function statusMeta(status) {
-  return STATUS_META[status] || { label: status || 'SIN ESTADO', tone: 'default' };
-}
+import StatusBadge from './StatusBadge';
 
 export default function MissionCard({ mission }) {
   const href = `/misiones/${mission.id}/`;
-  const meta = statusMeta(mission.status);
   const total = mission.checklist_total || 0;
   const done = Math.min(mission.checklist_done || 0, total || 0);
   const date = (mission.last_sync || mission.created_at || '').split('T')[0] || '—';
@@ -44,7 +27,7 @@ export default function MissionCard({ mission }) {
       rounded
     >
       <div className="row">
-        <NesBadge text={meta.label} tone={meta.tone} />
+        <StatusBadge status={mission.status} />
       </div>
       {mission.description ? (
         <p className="nes-text">{mission.description}</p>

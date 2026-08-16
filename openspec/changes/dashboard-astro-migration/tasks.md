@@ -282,9 +282,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 6. `StatusBadge.jsx`: maps intento/gate states to `NesBadge` variants
 
 **Done when:**
-- [ ] `/intentos/{id}/` renders header, gates, progress (S7)
-- [ ] Gate logs load on demand and render the transition timeline (S7)
-- [ ] Full breadcrumb chain navigable (S6)
+- [x] `/intentos/{id}/` renders header, gates, progress (S7)
+- [x] Gate logs load on demand and render the transition timeline (S7)
+- [x] Full breadcrumb chain navigable (S6)
 
 ---
 
@@ -303,9 +303,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Direct-load each route in dev and after build; breadcrumbs must render from API-resolved data (no reliance on prior navigation)
 
 **Done when:**
-- [ ] All four edge states render without crashing on every view
-- [ ] F5/reload keeps the same view on all four routes
-- [ ] No in-memory navigation state required (F-DA-15)
+- [x] All four edge states render without crashing on every view
+- [x] F5/reload keeps the same view on all four routes
+- [x] No in-memory navigation state required (F-DA-15)
 
 ---
 

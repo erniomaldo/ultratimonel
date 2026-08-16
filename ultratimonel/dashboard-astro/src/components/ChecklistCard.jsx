@@ -10,23 +10,7 @@
 
 import React from 'react';
 import { Checkbox, Icon, List } from 'nes-react';
-import { NesBadge } from './ui';
-
-// Status → label/tone mirror of the legacy dashboard STATUS_LABEL/STATUS_CLASS
-// (ultratimonel/dashboard/app.js). T9 centralizes this in StatusBadge.
-const STATUS_META = {
-  pendiente: { label: 'PENDIENTE', tone: 'warning' },
-  en_progreso: { label: 'EN PROGRESO', tone: 'success' },
-  completada: { label: 'COMPLETADA', tone: 'success' },
-  bloqueada: { label: 'BLOQUEADA', tone: 'error' },
-  running: { label: 'EJECUTANDO', tone: 'warning' },
-  success: { label: 'EXITO', tone: 'success' },
-  fail: { label: 'FALLIDO', tone: 'error' },
-};
-
-function statusMeta(status) {
-  return STATUS_META[status] || { label: status || 'SIN ESTADO', tone: 'default' };
-}
+import StatusBadge from './StatusBadge';
 
 export default function ChecklistCard({ item }) {
   const intentos = Array.isArray(item.intentos) ? item.intentos : [];
@@ -43,7 +27,6 @@ export default function ChecklistCard({ item }) {
       ) : (
         <List>
           {intentos.map((intento) => {
-            const meta = statusMeta(intento.status);
             const href = `/intentos/${intento.id}/`;
             return (
               <li key={intento.id} className="row">
@@ -51,7 +34,7 @@ export default function ChecklistCard({ item }) {
                 <a className="nes-text is-primary" href={href}>
                   Intento #{intento.id}
                 </a>
-                <NesBadge text={meta.label} tone={meta.tone} />
+                <StatusBadge status={intento.status} />
                 <span className="nes-text is-disabled">
                   {intento.gates_passed || 0}/{intento.gates_total || 0} gates
                 </span>
