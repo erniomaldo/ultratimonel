@@ -71,7 +71,7 @@ cerrar el turno con verificación de gates.
 ┌──────────────┐   MCP stdio    ┌──────────────────┐    SQLite WAL    ┌──────────────┐
 │  Hermes      │ ──────────────→│  Ultratimonel    │ ──────────────→│              │
 │  Agent       │                │  MCP Server      │                 │ ultratimonel │
-│  + plugin    │ ←──────────────│  (18 tools)      │ ←──────────────│ .db (1 file) │
+│  + plugin    │ ←──────────────│  (20 tools)      │ ←──────────────│ .db (1 file) │
 │  preflight   │                │                  │                 │              │
 └──────────────┘                └─────────┬────────┘                 └──────────────┘
                                           │
@@ -105,7 +105,7 @@ begin_turn()  →  trabajo del turno  →  end_turn()  →  reporte al usuario
 | 📋 **Misiones** | Sincronizadas con Nextcloud Deck: mission + checklist items + intentos trazados |
 | 📊 **Dashboard web** | NES.css v2.3.0, light/dark theme, misiones con progreso, detalle de intentos |
 | 🔌 **Plugin v2.0** | `pre_llm_call` ejecuta gates, `pre_tool_call` bouncer, `post_tool_call` guard — **fuente de verdad en el repo** |
-| 🧩 **18 tools MCP** | 16 activas + 2 legacy (~~DEPRECATED~~) — ver [Tools](#️-tools-mcp-api) |
+| 🧩 **20 tools MCP** | 17 activas + 3 legacy (~~DEPRECATED~~) — ver [Tools](#️-tools-mcp-api) |
 | 💾 **SQLite WAL** | 9 tablas, migraciones incrementales, zero infraestructura |
 
 ---
@@ -281,14 +281,13 @@ agente (sigue existiendo como tool, usada por el plugin en `pre_llm_call`).
 <a id="tools"></a>
 ## 🛠️ Tools (MCP API)
 
-Ultratimonel expone **18 tools MCP**: 16 activas + 2 legacy (~~DEPRECATED~~,
+Ultratimonel expone **20 tools MCP**: 17 activas + 3 legacy (~~DEPRECATED~~,
 mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP.
 
 ### 🧠 Núcleo (Gates)
 
 | Tool | Descripción |
 |------|-------------|
-| `assert_gates(message, session_id, sender)` | Ejecuta los 4 gates y retorna resultados estructurados (la usa el plugin en `pre_llm_call`) |
 | `check_gate(name, session_id)` | Lee el estado de un gate desde SQLite (diagnóstico) |
 | `complete_gate(name, session_id, reason)` | Marca manualmente un gate como PASS — solo desde BLOCK/WARN (remediación) |
 
@@ -307,6 +306,8 @@ mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP
 | `sync_tasks(project)` | Sincroniza cards de Deck → tabla missions para un proyecto |
 | `sync_all()` | Sincroniza todos los proyectos mapeados |
 | `mission_list(project)` | Lista misiones (Deck tasks) de un proyecto |
+| `mission_get(mission_id)` | Recupera una misión por ID |
+| `checklist_item_get(checklist_item_id)` | Recupera un checklist item por ID |
 
 ### 🗺️ Project Maps
 
@@ -334,6 +335,7 @@ mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP
 
 | Tool | Firma | Descripción |
 |------|-------|-------------|
+| `assert_gates(message, session_id, sender)` | ~~DEPRECATED~~ — usa `begin_turn()` en su lugar (ejecuta los 4 gates internamente; la usa el plugin en `pre_llm_call`) |
 | `record_intento(session_id, project, mission_id, checklist_item_id)` | ~~DEPRECATED~~ — usa `begin_turn()` en su lugar |
 | `complete_intento(intento_id, status, gates_passed, session_id, project)` | ~~DEPRECATED~~ — usa `end_turn()` en su lugar |
 
@@ -425,7 +427,7 @@ ultratimonel/
 ├── .spec -> ~/.spec                 # Symlink a spec externa
 ├── ultratimonel/
 │   ├── __init__.py                  # Package metadata
-│   ├── server.py                    # FastMCP — 18 tool handlers (16 activas + 2 legacy)
+│   ├── server.py                    # FastMCP — 20 tool handlers (17 activas + 3 legacy)
 │   ├── persistence.py               # SQLite layer (WAL, 9 tablas, migrations)
 │   ├── gate_engine.py               # State machine: PASS/SKIP/WARN/BLOCK
 │   ├── triple_match.py              # Orquestación de gates 1a→1b→1c→1e
