@@ -1,0 +1,17 @@
+---
+// Project fallback shell (Ejecución 8, hierarchical routes) — generic shell for
+// project slugs created AFTER the build, so /{proyectoName}/ keeps working for
+// ANY project in a live dashboard (output:'static' + stdlib http.server, ADR-2/ADR-5).
+//
+// getStaticPaths cannot enumerate slugs that do not exist at build time, so
+// dashboard_server.py serves this single shell for non-enumerated projects ONLY
+// when the project resolves (exists in project_maps.json or in missions.project).
+// Unknown slugs keep a real 404 (S8). The island resolves the slug from
+// window.location.pathname at runtime and fixes <title> on mount, so this one
+// file works for any project.
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import ProjectDetail from '../../components/projects/ProjectDetail.jsx';
+---
+<BaseLayout title="Proyecto · Ultratimonel">
+  <ProjectDetail client:load />
+</BaseLayout>

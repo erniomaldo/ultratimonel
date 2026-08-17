@@ -22,3 +22,8 @@ project_maps.json
 # Tooling caches
 .atl/
 .spec
+
+# Astro dashboard app (dashboard-astro-migration, ADR-1)
+ultratimonel/dashboard-astro/node_modules/
+ultratimonel/dashboard-astro/dist/
+ultratimonel/dashboard-astro/.astro/

@@ -1,0 +1,18 @@
+---
+// Mission fallback shell (Ejecución 8, hierarchical routes) — generic shell for
+// mission ids created AFTER the build, so /{proyectoName}/{misionId}/ keeps
+// working for ANY mission in a live dashboard (output:'static' + stdlib
+// http.server, ADR-2/ADR-5).
+//
+// getStaticPaths cannot enumerate ids that do not exist at build time, so
+// dashboard_server.py serves this single shell for non-enumerated missions ONLY
+// when /api/missions/{id} resolves AND the project in the URL matches the
+// mission's project. Unknown ids keep a real 404 (S8). The island resolves
+// project + mission id from window.location.pathname at runtime and fixes
+// <title> on mount, so this one file works for any mission.
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import MissionDetail from '../../components/missions/MissionDetail.jsx';
+---
+<BaseLayout title="Misión · Ultratimonel">
+  <MissionDetail client:load />
+</BaseLayout>

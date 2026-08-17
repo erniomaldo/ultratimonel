@@ -93,9 +93,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 7. `npm run build` with no pages yet (verify toolchain resolves; expected: empty dist or missing-pages warning)
 
 **Done when:**
-- [ ] `ultratimonel/dashboard-astro/package.json` lists `astro`, `@astrojs/react`, `react@^18`, `react-dom@^18`, `nes-react`, `nes.css`
-- [ ] Root `.gitignore` covers `node_modules/` and `dist/` of the app
-- [ ] `npm install` resolves (with `--legacy-peer-deps` if required) and `astro` CLI runs
+- [x] `ultratimonel/dashboard-astro/package.json` lists `astro`, `@astrojs/react`, `react@^18`, `react-dom@^18`, `nes-react`, `nes.css`
+- [x] Root `.gitignore` covers `node_modules/` and `dist/` of the app
+- [x] `npm install` resolves (with `--legacy-peer-deps` if required) and `astro` CLI runs
 
 ---
 
@@ -130,9 +130,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 3. Verify proxy: with the legacy server running on 3005, `curl http://127.0.0.1:3006/api/projects` returns JSON
 
 **Done when:**
-- [ ] Dev server binds `127.0.0.1:3006`
-- [ ] `curl 127.0.0.1:3006/api/projects` returns the same JSON as `127.0.0.1:3005/api/projects`
-- [ ] No CORS headers involved (same-origin via proxy — S10)
+- [x] Dev server binds `127.0.0.1:3006`
+- [x] `curl 127.0.0.1:3006/api/projects` returns the same JSON as `127.0.0.1:3005/api/projects`
+- [x] No CORS headers involved (same-origin via proxy — S10)
 
 ---
 
@@ -151,9 +151,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Body/root classes: apply `nes-*` container classes at layout level where structural (e.g., page background via `.nes-container`)
 
 **Done when:**
-- [ ] Layout renders with NES.css styles in the static HTML (no JS hydration needed for base styles)
-- [ ] Font loads from `public/fonts/` (self-hosted) with fallback
-- [ ] `layout.css` contains no design CSS (grep: no `color:`, `border:`, `background:` except structural)
+- [x] Layout renders with NES.css styles in the static HTML (no JS hydration needed for base styles)
+- [x] Font loads from `public/fonts/` (self-hosted) with fallback
+- [x] `layout.css` contains no design CSS (grep: no `color:`, `border:`, `background:` except structural)
 
 ---
 
@@ -173,9 +173,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 5. All components consume NES.css classes only; zero inline styles
 
 **Done when:**
-- [ ] `useApi` exposes `{ data, loading, error, retry }` and is used by all islands
-- [ ] UI components use only `.nes-*` classes from the bundle
-- [ ] No design CSS written in this layer (ADR-6)
+- [x] `useApi` exposes `{ data, loading, error, retry }` and is used by all islands
+- [x] UI components use only `.nes-*` classes from the bundle
+- [x] No design CSS written in this layer (ADR-6)
 
 ---
 
@@ -194,9 +194,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Keep the component framework-agnostic (no fetch inside — resolution happens in the island per F-DA-15)
 
 **Done when:**
-- [ ] Breadcrumb renders for all 4 route levels (S1/S2/S4/S6)
-- [ ] Every non-current crumb is an `<a>` to the correct real route
-- [ ] Clicking any crumb navigates and the target route loads correctly
+- [x] Breadcrumb renders for all 4 route levels (S1/S2/S4/S6)
+- [x] Every non-current crumb is an `<a>` to the correct real route
+- [x] Clicking any crumb navigates and the target route loads correctly
 
 ---
 
@@ -215,9 +215,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Handle `loading` / `error` (retry) / empty project list states (S9)
 
 **Done when:**
-- [ ] `/` lists projects with counts (S1)
-- [ ] Clicking a project navigates to `/proyectos/{project}/` (S2)
-- [ ] Error and empty states render without crashing
+- [x] `/` lists projects with counts (S1)
+- [x] Clicking a project navigates to `/proyectos/{project}/` (S2)
+- [x] Error and empty states render without crashing
 
 ---
 
@@ -237,9 +237,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 5. Empty state: "no missions" NES-styled message (S3)
 
 **Done when:**
-- [ ] `/proyectos/{project}/` lists missions with progress (S3)
-- [ ] Breadcrumb shows Dashboard link + project current (S2)
-- [ ] Empty and error states render without crashing
+- [x] `/proyectos/{project}/` lists missions with progress (S3)
+- [x] Breadcrumb shows Dashboard link + project current (S2)
+- [x] Empty and error states render without crashing
 
 ---
 
@@ -259,9 +259,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 5. Empty checklist: "Sin checklist" NES-styled message (S5)
 
 **Done when:**
-- [ ] `/misiones/{id}/` renders mission + checklist items + embedded intentos (S5)
-- [ ] Breadcrumb shows full Dashboard → project → mission chain with working links (S4)
-- [ ] Clicking an intento navigates to `/intentos/{id}/` (S6)
+- [x] `/misiones/{id}/` renders mission + checklist items + embedded intentos (S5)
+- [x] Breadcrumb shows full Dashboard → project → mission chain with working links (S4)
+- [x] Clicking an intento navigates to `/intentos/{id}/` (S6)
 
 ---
 
@@ -282,9 +282,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 6. `StatusBadge.jsx`: maps intento/gate states to `NesBadge` variants
 
 **Done when:**
-- [ ] `/intentos/{id}/` renders header, gates, progress (S7)
-- [ ] Gate logs load on demand and render the transition timeline (S7)
-- [ ] Full breadcrumb chain navigable (S6)
+- [x] `/intentos/{id}/` renders header, gates, progress (S7)
+- [x] Gate logs load on demand and render the transition timeline (S7)
+- [x] Full breadcrumb chain navigable (S6)
 
 ---
 
@@ -303,9 +303,9 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 4. Direct-load each route in dev and after build; breadcrumbs must render from API-resolved data (no reliance on prior navigation)
 
 **Done when:**
-- [ ] All four edge states render without crashing on every view
-- [ ] F5/reload keeps the same view on all four routes
-- [ ] No in-memory navigation state required (F-DA-15)
+- [x] All four edge states render without crashing on every view
+- [x] F5/reload keeps the same view on all four routes
+- [x] No in-memory navigation state required (F-DA-15)
 
 ---
 
@@ -326,10 +326,10 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 6. Record results in apply-progress (per-view checkboxes)
 
 **Done when:**
-- [ ] All scenarios S1–S10 pass on dev (3006)
-- [ ] All scenarios pass against the built `dist/` on 3007
-- [ ] Legacy dashboard works on 3005 and its diff is empty
-- [ ] pytest suite green
+- [x] All scenarios S1–S10 pass on dev (3006)
+- [x] All scenarios pass against the built `dist/` on 3007
+- [x] Legacy dashboard works on 3005 and its diff is empty
+- [x] pytest suite green (113 passed; test_integration/test_triple_match hangs preexistente — ver Ejecución 5)
 
 ---
 
@@ -351,11 +351,11 @@ Mission-level done criteria summarize the per-task "Done when" checkboxes below;
 7. Repeat smoke scenarios S1–S12 on the main port; `.venv/bin/pytest tests/ -q --tb=short`
 
 **Done when:**
-- [ ] `dashboard_server.py` serves `dist/` on 3005 and `/api/*` still works (S12)
-- [ ] MIME types correct for JS/CSS/woff2 from `dist/`
-- [ ] Legacy files deprecated from the served tree (decision recorded)
-- [ ] README documents the new workflow
-- [ ] pytest suite green
+- [x] `dashboard_server.py` serves `dist/` on 3005 and `/api/*` still works (S12)
+- [x] MIME types correct for JS/CSS/woff2 from `dist/`
+- [x] Legacy files deprecated from the served tree (decision recorded)
+- [x] README documents the new workflow
+- [x] pytest suite green
 
 ---
 

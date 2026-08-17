@@ -109,6 +109,19 @@ export default defineConfig({
 
 ---
 
+### NOTA DE ARQUITECTURA (post-implementación, Ejecuciones 7–9, card #154) — no es un ADR nuevo
+
+Decisión real de implementación que NO quedó registrada como ADR en su momento y se documenta aquí como nota de arquitectura. Con `output: 'static'` (ADR-2/ADR-5), `getStaticPaths` no puede enumerar ids creados después del build; para que el corte (3005 sirve `dist/`) no quede obsoleto frente a entidades nuevas, se adoptó este mecanismo en `dashboard_server.py`:
+
+1. **Shells estáticos enumerados** en build-time (getStaticPaths + DB SQLite, `node:sqlite`) — un shell por entidad real conocida.
+2. **Shells fallback genéricos por nivel** (`dist/fallback/{proyecto,mision,item,intento}/index.html`), emitidos SIEMPRE en el build aunque la DB esté vacía; la isla sin props resuelve los segmentos del pathname en runtime (`window.location.pathname`) y fija `<title>` en mount.
+3. **Resolución runtime en el server**: para rutas jerárquicas sin shell enumerado, el guard consulta la DB con el mismo check de consistencia que el API (proyecto existe; misión existe Y su `project` coincide; ítem existe Y su `mission_id`+`project` coinciden; intento existe Y su `mission_id`+`checklist_item_id`+`project` coinciden). Si la entidad existe → sirve el fallback con HTTP 200; si NO existe → 404 real (S8 intacto).
+4. **Redirects 301 con Location resuelta por DB**: `/proyectos/{project}` → `/{project}/` (mapeo directo); `/misiones/{id}` → `/{project}/{id}/`; `/intentos/{id}` → `/{project}/{mission}/{checklist_item}/{id}/`. Si la entidad no se resuelve → 404 (`LEGACY_UNRESOLVED`), no redirect.
+
+**Consecuencias:** el build nunca queda obsoleto frente a entidades creadas después del corte; las URLs viejas siguen funcionando sin estado en el cliente; el 404 real queda reservado exclusivamente para entidades inexistentes (NF-DA-06). El costo es una consulta SQLite extra por request solo en rutas sin shell enumerado (las enumeradas no tocan DB).
+
+---
+
 ### ADR-6: Estilos — dependencia `nes.css` directa + política de CSS mínimo de layout
 
 **Contexto:** nes-react (v1.0.2, MIT, 7 años) compila los estilos de NES.css DENTRO de su bundle JS (`dist/index.es.js` importa `../nes.css/scss/nes.scss` + `custom.scss`): las clases llegan inyectadas por JS al hidratar la isla. Eso significa: (a) el shell estático no tendría estilos NES hasta la hidratación; (b) la capa interna de badges/dropdown/dialog (F-DA-03) necesita clases `.nes-*` en CSS real; (c) depender de inyección por JS es frágil para el build estático.
@@ -167,6 +180,16 @@ ultratimonel/dashboard-astro/
 │       └── useApi.js                             # fetch /api/* + states loading/error/empty (S8/S9)
 ```
 
+> **NOTA HISTÓRICA (Ejecuciones 8–9, 2026-08-15/16, card #154):** el árbol de
+> `src/pages/` de arriba corresponde al diseño original plano
+> (`proyectos/[project]/`, `misiones/[id]/`, `intentos/[id]/`). La implementación
+> real reemplazó esas páginas por la estructura jerárquica:
+> `[proyectoName]/`, `[proyectoName]/[misionId]/`,
+> `[proyectoName]/[misionId]/[checklistItemId]/` y
+> `[proyectoName]/[misionId]/[checklistItemId]/[intentoId]/`, más los fallbacks
+> `fallback/{proyecto,mision,item,intento}.astro`. Las rutas planas ya no
+> existen en `dist/` (redirigen 301, ADR-5/nota de arquitectura abajo).
+
 ### 2.2 Mapeo de primitivas nes-react → vistas
 
 | Vista | Primitivas nes-react principales | Capa interna |
@@ -179,7 +202,34 @@ ultratimonel/dashboard-astro/
 
 No existen `Panel` ni `TextField` (verificado en `dist/index.d.ts`): panel con título = `Container` con estilo `with-title`; campos = `TextInput`/`TextArea`.
 
+> **NOTA (E9, 2026-08-16, card #154):** el nivel ítem (vista "Ítem", página
+> propia desde E8) reutiliza `IntentoCard`, `StatusBadge` y `Progress` para
+> listar los intentos del ítem; el detalle del intento (vista "Intento") ahora
+> vive en su propia ruta (E9) y conserva el mapeo de la tabla. El mapeo de
+> primitivas no cambió con la jerarquía.
+
 ### 2.3 Breadcrumbs (F-DA-08, F-DA-15)
+
+> **NOTA (Ejecución 8, 2026-08-15, card #154):** el usuario aprobó explícitamente
+> rutas **jerárquicas** que reemplazan el esquema plano F-DA-15 de esta sección
+> (`/proyectos/[project]/`, `/misiones/[id]/`, `/intentos/[id]/`). La estructura
+> vigente desde esa fecha es:
+> `/`, `/{proyectoName}/`, `/{proyectoName}/{misionId}/`,
+> `/{proyectoName}/{misionId}/{checklistItemId}/`. Las rutas planas redirigen
+> 301 a su equivalente jerárquico (server Python). Los breadcrumbs se derivan
+> del path (el path ES la jerarquía) y el nivel actual se renderiza como
+> `<a>` clickeable que refresca. Las tablas/diagramas de las secciones 2.3 y 3.x
+> quedan como registro histórico del diseño original; la implementación actual
+> sigue la estructura jerárquica.
+>
+> **NOTA (Ejecución 9, 2026-08-16, card #154):** la estructura vigente agregó
+> el 4º nivel `/{proyectoName}/{misionId}/{checklistItemId}/{intentoId}/` — el
+> detalle del intento es PÁGINA con URL propia (antes slot dentro de un
+> `NesDialog` en la vista de ítem). La cadena completa de breadcrumbs derivada
+> del path es: `Dashboard › {proyectoName} › Misión #{misionId} › Ítem
+> #{checklistItemId} › Intento #{intentoId}`. El server Python reconoce los 4
+> niveles en el guard de fallback (check jerárquico de consistencia) y los
+> redirects legacy de `/intentos/{id}` resuelven a 4 segmentos.
 
 | Ruta | Crumbs | Resolución del parent |
 |------|--------|-----------------------|
