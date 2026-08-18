@@ -103,7 +103,7 @@ begin_turn()  →  trabajo del turno  →  end_turn()  →  reporte al usuario
 | 🔁 **Flujo consolidado** | `begin_turn()` autocontenido — ejecuta los gates internamente y crea el intento |
 | 🛑 **endTurn Bouncer** | Valida gates mandatory PASS/SKIP al cerrar; `end_turn()` **nunca bloquea** (completa con `fail` + `gates_detail`) |
 | 📋 **Misiones** | Sincronizadas con Nextcloud Deck: mission + checklist items + intentos trazados |
-| 📊 **Dashboard web** | NES.css v2.3.0, light/dark theme, misiones con progreso, detalle de intentos |
+| 📊 **Dashboard web** | Astro + NES.css: proyectos, misiones, intentos y gates con breadcrumbs |
 | 🔌 **Plugin v2.0** | `pre_llm_call` ejecuta gates, `pre_tool_call` bouncer, `post_tool_call` guard — **fuente de verdad en el repo** |
 | 🧩 **20 tools MCP** | 17 activas + 3 legacy (~~DEPRECATED~~) — ver [Tools](#️-tools-mcp-api) |
 | 💾 **SQLite WAL** | 9 tablas, migraciones incrementales, zero infraestructura |
@@ -411,6 +411,7 @@ map_sync()
 | `ULTRATIMONEL_DB_PATH` | `~/.hermes/ultratimonel.db` | Ruta a SQLite |
 | `ULTRATIMONEL_PROJECT_MAPS` | `~/.hermes/ultratimonel/project_maps.json` | Config de proyectos |
 | `ULTRATIMONEL_DASHBOARD_PORT` | `3005` | Puerto del dashboard |
+| `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` | legacy `ultratimonel/dashboard/` (puerto principal 3005: `dashboard-astro/dist/`) | Root estático del dashboard — override para staging/validación |
 
 ---
 
@@ -439,10 +440,11 @@ ultratimonel/
 │   ├── plugin_preflight.py          # Plugin v2.0.0 (pre/post_tool_call guards)
 │   ├── ultratimonel_client.py       # Cliente MCP stdio del plugin
 │   ├── plugin.yaml                  # Declaración del plugin
+│   ├── dashboard-astro/             # Dashboard nuevo (Astro, build → dist/) — ADR-1
 │   └── dashboard/
 │       ├── __init__.py
-│       ├── index.html               # Dashboard web (NES.css v2.3.0)
-│       └── app.js                   # Lógica JS del dashboard
+│       ├── index.html               # Dashboard legacy (~~DEPRECATED~~, fuera del árbol servido)
+│       └── app.js                   # Lógica JS legacy (~~DEPRECATED~~, fuera del árbol servido)
 ├── scripts/
 │   └── deploy_soul.sh               # Inyección de reglas SOUL.md
 ├── skills/
@@ -497,14 +499,34 @@ migraciones incrementales vía `schema_version`.
 ## 📊 Dashboard
 
 El dashboard web corre en un servidor **http.server** (stdlib, no FastAPI),
-puerto por defecto **3005** (configurable via `ULTRATIMONEL_DASHBOARD_PORT`).
+puerto principal **3005** (configurable via `ULTRATIMONEL_DASHBOARD_PORT`).
+El puerto principal sirve el build de Astro (`ultratimonel/dashboard-astro/dist/`)
+con los handlers `/api/*` intactos en el mismo origen (S12).
 
-Interfaz NES.css v2.3.0 con:
+### Puertos
 
-- Lista de proyectos con estado de gates
-- Tablero de misiones con progreso
-- Detalle de intentos por checklist item
-- Light/dark theme
+| Puerto | Rol | Cómo se levanta |
+|--------|-----|-----------------|
+| **3005** | **Producción** — sirve `dist/` (build Astro) + `/api` same-origin | `python ultratimonel/dashboard_server.py` (o `server(action="start")`) |
+| **3006** | Dev — Astro dev server, proxy `/api` → 3005 | `cd ultratimonel/dashboard-astro && npm run dev` |
+| **3007** | Validación del build — mismo handler Python sobre `dist/` | `ULTRATIMONEL_DASHBOARD_STATIC_ROOT=…/dist python ultratimonel/dashboard_server.py 3007` |
+
+### Comandos (frontend Astro)
+
+```bash
+cd ultratimonel/dashboard-astro
+npm run dev      # dev server en 127.0.0.1:3006 (proxy /api → 3005)
+npm run build    # genera dist/ (lo que sirve el puerto principal 3005)
+```
+
+### Root estático y deprecación legacy
+
+- El root estático se resuelve por puerto: **3005 → `dashboard-astro/dist/`**;
+  cualquier otro puerto sirve `ultratimonel/dashboard/` salvo override.
+- `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` sobreescribe el root (staging/validación).
+- Los archivos legacy `ultratimonel/dashboard/index.html` y `app.js` están
+  **DEPRECATED** — fuera del árbol servido en el puerto principal. Se conservan
+  en el repo como referencia y para rollback trivial (restaurar el root legacy).
 
 ```python
 server(action="start")   # Inicia el dashboard

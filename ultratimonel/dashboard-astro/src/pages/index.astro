@@ -1,0 +1,12 @@
+---
+// Index route — project list (T6, F-DA-09, S1/S2).
+// Static shell + Breadcrumbs (Dashboard, current) + hydrated <ProjectsIndex /> island.
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Breadcrumbs from '../components/Breadcrumbs.jsx';
+import ProjectsIndex from '../components/projects/ProjectsIndex.jsx';
+---
+
+<BaseLayout title="Ultratimonel Dashboard">
+  <Breadcrumbs current="Dashboard" />
+  <ProjectsIndex client:load />
+</BaseLayout>

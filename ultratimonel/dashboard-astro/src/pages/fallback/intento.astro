@@ -1,0 +1,20 @@
+---
+// Intento fallback shell (Ejecución 9, hierarchical routes) — generic shell for
+// intentos created AFTER the build, so
+// /{proyectoName}/{misionId}/{checklistItemId}/{intentoId}/ keeps working for
+// ANY intento in a live dashboard (output:'static' + stdlib http.server,
+// ADR-2/ADR-5).
+//
+// getStaticPaths cannot enumerate ids that do not exist at build time, so
+// dashboard_server.py serves this single shell for non-enumerated intentos ONLY
+// when the intento exists AND its mission + checklist item + project match the
+// URL segments (same consistency check the API performs). Unknown ids keep a
+// real 404 (S8). The island resolves all four path segments from
+// window.location.pathname at runtime and fixes <title> on mount, so this one
+// file works for any intento.
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import IntentoDetail from '../../components/intentos/IntentoDetail.jsx';
+---
+<BaseLayout title="Intento · Ultratimonel">
+  <IntentoDetail client:load />
+</BaseLayout>

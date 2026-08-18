@@ -1,0 +1,37 @@
+---
+// Project route — missions of a project at the TOP level: /{proyectoName}/ (Ejecución 8,
+// hierarchical routes approved 2026-08-15, card #154). REEMPLAZA /proyectos/[project]/.
+//
+// Static shell + hydrated <ProjectDetail /> island. The path IS the hierarchy:
+// Dashboard › {proyectoName} (breadcrumb rendered by the island so fallbacks work).
+//
+// output:'static' requires getStaticPaths for dynamic routes (Astro). We
+// enumerate the project slugs from the dashboard SQLite DB (same resolution as
+// dashboard_server.py) so each real project gets a static shell in dist/. The
+// shell is empty of content — the island fetches /api/* in the browser
+// (ADR-3), so build-time enumeration never freezes data.
+import { DatabaseSync } from 'node:sqlite';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import ProjectDetail from '../../components/projects/ProjectDetail.jsx';
+
+export async function getStaticPaths() {
+  try {
+    const dbPath =
+      process.env.ULTRATIMONEL_DB_PATH || `${process.env.HOME}/.hermes/ultratimonel.db`;
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db.prepare('SELECT DISTINCT project FROM missions WHERE project IS NOT NULL').all();
+    db.close();
+    return rows.map((r) => ({ params: { proyectoName: String(r.project) } }));
+  } catch (err) {
+    console.error('[getStaticPaths] project enumeration failed:', err && err.message);
+    // DB unavailable at build time — no static shells (dev 3006 still works).
+    return [];
+  }
+}
+
+const { proyectoName } = Astro.params;
+---
+
+<BaseLayout title={`${proyectoName} · Ultratimonel`}>
+  <ProjectDetail client:load project={proyectoName} />
+</BaseLayout>

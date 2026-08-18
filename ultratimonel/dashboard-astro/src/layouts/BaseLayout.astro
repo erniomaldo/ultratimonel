@@ -1,0 +1,50 @@
+---
+// BaseLayout — global shell for the Ultratimonel dashboard (T3, F-DA-13, NF-DA-05, ADR-6).
+// NES.css is imported globally so the static shell already has styles and every
+// internal UI component can use `.nes-*` classes without re-importing (ADR-6).
+import 'nes.css/css/nes.min.css';
+import '../styles/layout.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const {
+  title = 'Ultratimonel Dashboard',
+  description = 'Ultratimonel mission viewer',
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content={description} />
+    <title>{title}</title>
+    <!-- Press Start 2P self-hosted with system monospace fallback (F-DA-13, R9) -->
+    <style>
+      @font-face {
+        font-family: 'Press Start 2P';
+        font-style: normal;
+        font-weight: 400;
+        font-display: swap;
+        src: url('/fonts/press-start-2p-latin.woff2') format('woff2');
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell nes-container is-rounded">
+      <header class="app-header">
+        <h1 class="app-title">Ultratimonel</h1>
+      </header>
+      <main class="app-main">
+        <slot />
+      </main>
+      <footer class="app-footer nes-text is-disabled">
+        Ultratimonel · NES.css dashboard
+      </footer>
+    </div>
+  </body>
+</html>

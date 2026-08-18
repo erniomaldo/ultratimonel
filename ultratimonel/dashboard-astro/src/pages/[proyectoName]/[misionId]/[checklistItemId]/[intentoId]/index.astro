@@ -1,0 +1,61 @@
+---
+// Intento route — intento detail at the FOURTH level:
+// /{proyectoName}/{misionId}/{checklistItemId}/{intentoId}/ (Ejecución 9,
+// hierarchical routes card #154). El nivel faltante de la propuesta original:
+// el detalle del intento es una PÁGINA con URL propia (antes vivía como slot
+// dentro de un NesDialog en la vista de ítem).
+//
+// Static shell + hydrated <IntentoDetail /> island. The path IS the hierarchy:
+// Dashboard › {proyectoName} › Misión #{misionId} › Ítem #{checklistItemId} ›
+// Intento #{intentoId}.
+//
+// output:'static' requires getStaticPaths for dynamic routes (Astro). We
+// enumerate intentos per mission per project from the dashboard SQLite DB
+// (same resolution as dashboard_server.py) so each real intento gets a static
+// shell in dist/. The shell is empty of content — the island fetches /api/* in
+// the browser (ADR-3), so build-time enumeration never freezes data.
+import { DatabaseSync } from 'node:sqlite';
+import BaseLayout from '../../../../../layouts/BaseLayout.astro';
+import IntentoDetail from '../../../../../components/intentos/IntentoDetail.jsx';
+
+export async function getStaticPaths() {
+  try {
+    const dbPath =
+      process.env.ULTRATIMONEL_DB_PATH || `${process.env.HOME}/.hermes/ultratimonel.db`;
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db
+      .prepare(
+        `SELECT i.id AS intento_id, i.mission_id, i.checklist_item_id, m.project
+         FROM intentos i
+         JOIN missions m ON m.id = i.mission_id
+         WHERE m.project IS NOT NULL AND i.checklist_item_id IS NOT NULL`
+      )
+      .all();
+    db.close();
+    return rows.map((r) => ({
+      params: {
+        proyectoName: String(r.project),
+        misionId: String(r.mission_id),
+        checklistItemId: String(r.checklist_item_id),
+        intentoId: String(r.intento_id),
+      },
+    }));
+  } catch (err) {
+    console.error('[getStaticPaths] intento enumeration failed:', err && err.message);
+    // DB unavailable at build time — no static shells (dev 3006 still works).
+    return [];
+  }
+}
+
+const { proyectoName, misionId, checklistItemId, intentoId } = Astro.params;
+---
+
+<BaseLayout title={`Intento ${intentoId} · Ultratimonel`}>
+  <IntentoDetail
+    client:load
+    project={proyectoName}
+    missionId={misionId}
+    itemId={checklistItemId}
+    id={intentoId}
+  />
+</BaseLayout>

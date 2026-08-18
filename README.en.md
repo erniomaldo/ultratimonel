@@ -105,7 +105,7 @@ begin_turn()  →  turn work  →  end_turn()  →  report to the user
 | 🔁 **Consolidated flow** | `begin_turn()` is self-contained — runs gates internally and creates the intento |
 | 🛑 **endTurn Bouncer** | Validates mandatory gates PASS/SKIP on close; `end_turn()` **never blocks** (completes with `fail` + `gates_detail`) |
 | 📋 **Missions** | Synced with Nextcloud Deck: mission + checklist items + traced intentos |
-| 📊 **Web dashboard** | NES.css v2.3.0, light/dark theme, missions with progress, intento details |
+| 📊 **Web dashboard** | Astro + NES.css: projects, missions, intentos and gates with breadcrumbs |
 | 🔌 **Plugin v2.0** | `pre_llm_call` runs gates, `pre_tool_call` bouncer, `post_tool_call` guard — **source of truth lives in this repo** |
 | 🧩 **20 MCP tools** | 17 active + 3 legacy (~~DEPRECATED~~) — see [Tools](#️-tools-mcp-api) |
 | 💾 **SQLite WAL** | 9 tables, incremental migrations, zero infrastructure |
@@ -414,6 +414,7 @@ map_sync()
 | `ULTRATIMONEL_DB_PATH` | `~/.hermes/ultratimonel.db` | SQLite path |
 | `ULTRATIMONEL_PROJECT_MAPS` | `~/.hermes/ultratimonel/project_maps.json` | Project config |
 | `ULTRATIMONEL_DASHBOARD_PORT` | `3005` | Dashboard port |
+| `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` | legacy `ultratimonel/dashboard/` (main port 3005: `dashboard-astro/dist/`) | Dashboard static root — override for staging/validation |
 
 ---
 
@@ -442,10 +443,11 @@ ultratimonel/
 │   ├── plugin_preflight.py          # Plugin v2.0.0 (pre/post_tool_call guards)
 │   ├── ultratimonel_client.py       # Plugin's MCP stdio client
 │   ├── plugin.yaml                  # Plugin declaration
+│   ├── dashboard-astro/             # New dashboard (Astro, build → dist/) — ADR-1
 │   └── dashboard/
 │       ├── __init__.py
-│       ├── index.html               # Web dashboard (NES.css v2.3.0)
-│       └── app.js                   # Dashboard JS logic
+│       ├── index.html               # Legacy dashboard (~~DEPRECATED~~, out of the served tree)
+│       └── app.js                   # Legacy JS logic (~~DEPRECATED~~, out of the served tree)
 ├── scripts/
 │   └── deploy_soul.sh               # SOUL.md rules injection
 ├── skills/
@@ -500,14 +502,34 @@ incremental migrations via `schema_version`.
 ## 📊 Dashboard
 
 The web dashboard runs on an **http.server** (stdlib, not FastAPI) server,
-default port **3005** (configurable via `ULTRATIMONEL_DASHBOARD_PORT`).
+main port **3005** (configurable via `ULTRATIMONEL_DASHBOARD_PORT`).
+The main port serves the Astro build (`ultratimonel/dashboard-astro/dist/`)
+with the `/api/*` handlers intact on the same origin (S12).
 
-NES.css v2.3.0 interface with:
+### Ports
 
-- Project list with gate status
-- Mission board with progress
-- Intento details per checklist item
-- Light/dark theme
+| Port | Role | How to start |
+|------|------|--------------|
+| **3005** | **Production** — serves `dist/` (Astro build) + `/api` same-origin | `python ultratimonel/dashboard_server.py` (or `server(action="start")`) |
+| **3006** | Dev — Astro dev server, `/api` proxy → 3005 | `cd ultratimonel/dashboard-astro && npm run dev` |
+| **3007** | Build validation — same Python handler over `dist/` | `ULTRATIMONEL_DASHBOARD_STATIC_ROOT=…/dist python ultratimonel/dashboard_server.py 3007` |
+
+### Commands (Astro frontend)
+
+```bash
+cd ultratimonel/dashboard-astro
+npm run dev      # dev server on 127.0.0.1:3006 (proxy /api → 3005)
+npm run build    # generates dist/ (served by the main port 3005)
+```
+
+### Static root and legacy deprecation
+
+- The static root is resolved per port: **3005 → `dashboard-astro/dist/`**;
+  any other port serves `ultratimonel/dashboard/` unless overridden.
+- `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` overrides the root (staging/validation).
+- The legacy files `ultratimonel/dashboard/index.html` and `app.js` are
+  **DEPRECATED** — out of the served tree on the main port. They stay in the
+  repo as reference and for trivial rollback (restore the legacy root).
 
 ```python
 server(action="start")   # Starts the dashboard
