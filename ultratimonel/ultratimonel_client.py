@@ -123,7 +123,13 @@ def _call_mcp_tool(tool_name: str, arguments: dict) -> dict | None:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**ULTRATIMONEL_ENV},
+            # FIX (2026-08-20, card #164): merge os.environ with the
+            # ULTRATIMONEL_* overrides instead of replacing the process env.
+            # Previously the server was spawned with ONLY the ULTRATIMONEL_*
+            # vars (no PATH/HOME) → its gates 1a/1b could not spawn
+            # `npx -y @agentmemory/mcp` / `agentcheckpoint` → WARN "unavailable"
+            # every pre_llm_call → plugin bouncer blocked begin_turn post-gracia.
+            env={**os.environ, **ULTRATIMONEL_ENV},
             text=True,
             bufsize=1,
         )

@@ -37,6 +37,8 @@ TOOLS_REQUIRING_VERIFIED_GATES = {
     "mcp__ultratimonel__complete_intento",
     # Registrar intento también requiere gates
     "mcp__ultratimonel__record_intento",
+    # begin_turn requiere gates verificados para enforzar el ciclo obligatorio
+    "mcp__ultratimonel__begin_turn",
     # Tools que modifican datos (write operations)
     "mcp__nextcloud__deck_update_card",
     "mcp__nextcloud__nc_webdav_write_file",
@@ -81,7 +83,7 @@ def _gates_count_passed(gates: list[dict]) -> int:
     return sum(1 for g in gates if g.get("state") in ("PASS", "SKIP"))
 
 
-def _gates_bouncer(ctx: Any, tool_name: str, args: dict, **kwargs) -> dict | None:
+def _gates_bouncer(ctx=None, tool_name: str = "", args: dict | None = None, **kwargs) -> dict | None:
     """
     PRE_TOOL_CALL HOOK — Bouncer estilo Nikhil Verma.
 
@@ -172,7 +174,7 @@ def _gates_bouncer(ctx: Any, tool_name: str, args: dict, **kwargs) -> dict | Non
     return None
 
 
-def _post_turn_guard(ctx: Any, tool_name: str, args: dict, result: dict, **kwargs) -> dict | None:
+def _post_turn_guard(ctx=None, tool_name: str = "", args: dict | None = None, result: dict | None = None, **kwargs) -> dict | None:
     """
     POST_TOOL_CALL HOOK — Bloqueo inescapable después de end_turn.
 
