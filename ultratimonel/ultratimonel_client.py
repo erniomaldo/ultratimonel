@@ -267,3 +267,25 @@ def gates_summary(gates_result: dict | None) -> str:
 
     except Exception as e:
         return f"[ultratimonel] Error parsing gates result: {e}"
+
+
+# ── Turn Count Persistence Wrappers (v4) ─────────────────────────────────────
+
+from .persistence import Persistence
+
+# Create instance with default DB path (same as server.py uses)
+_db_path = os.environ.get(
+    "ULTRATIMONEL_DB_PATH",
+    os.path.expanduser("~/.hermes/ultratimonel.db"),
+)
+persistence = Persistence(_db_path)
+
+
+def get_turn_count(session_id: str) -> int:
+    """Get persisted turn count for a session. Returns 0 if not found."""
+    return persistence.get_turn_count(session_id)
+
+
+def set_turn_count(session_id: str, count: int) -> bool:
+    """Persist turn count for a session. Returns success status."""
+    return persistence.set_turn_count(session_id, count)

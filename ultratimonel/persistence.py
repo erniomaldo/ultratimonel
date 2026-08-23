@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 3
-SCHEMA_DESCRIPTION = "v3: gates_detail JSON column on intentos for turn completeness"
+SCHEMA_VERSION = 4
+SCHEMA_DESCRIPTION = "v4: session_turns table for persistent turn counting"
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -152,7 +152,37 @@ DDL_V2 = [
     "CREATE INDEX IF NOT EXISTS idx_intentos_checklist ON intentos(checklist_item_id)",
     "CREATE INDEX IF NOT EXISTS idx_intentos_mission ON intentos(mission_id)",
     "CREATE INDEX IF NOT EXISTS idx_intentos_session ON intentos(session_id)",
+    # Table 10: session_turns — persistent turn counting per session (v4)
+    """CREATE TABLE IF NOT EXISTS session_turns (
+        session_id TEXT PRIMARY KEY,
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
 ]
+
+
+DDL_SESSION_TURNS = [
+    """CREATE TABLE IF NOT EXISTS session_turns (
+        session_id TEXT PRIMARY KEY,
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+]
+
+
+# ── Migration Functions ─────────────────────────────────────────────────────
+
+def _migrate_v3_to_v4(conn) -> None:
+    """Migrate from v3 schema to v4 (add session_turns table)."""
+    # Create the session_turns table
+    conn.execute(DDL_SESSION_TURNS[0])
+    
+    # Update schema version
+    conn.execute(
+        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
+    )
+    logger.info("Migrated DB v3→v4: added session_turns table")
 
 
 def _is_v1_style_missions_table(conn) -> bool:
@@ -352,7 +382,7 @@ class Persistence:
                 current_ver = cur.fetchone()[0]
 
                 if current_ver == 0:
-                    # Fresh DB — apply v2 DDL then add v3 columns
+                    # Fresh DB — apply v2 DDL then add v3+v4 columns
                     for stmt in DDL_V2:
                         try:
                             conn.execute(stmt)
@@ -366,11 +396,13 @@ class Persistence:
                         )
                     except sqlite3.OperationalError:
                         pass
+                    # Add v4 session_turns table for fresh install
+                    conn.execute(DDL_SESSION_TURNS[0])
                     conn.execute(
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
-                    logger.info("Fresh DB initialized at schema v3: %s", self._db_path)
+                    logger.info("Fresh DB initialized at schema v4: %s", self._db_path)
                 elif current_ver == 1:
                     # Migration v1 → v2
                     _migrate_v1_to_v2(conn)
@@ -393,6 +425,10 @@ class Persistence:
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
                     logger.info("Migrated DB v2→v3: %s", self._db_path)
+                elif current_ver == 3:
+                    # Migration v3 → v4: add session_turns table
+                    _migrate_v3_to_v4(conn)
+                    logger.info("Migrated DB v3→v4: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
                     # Already current — ensure all tables exist
                     for stmt in DDL_V2:
@@ -401,6 +437,8 @@ class Persistence:
                         except sqlite3.OperationalError as exc:
                             if "already exists" not in str(exc):
                                 raise
+                    # Ensure v4 session_turns table exists (idempotent)
+                    conn.execute(DDL_SESSION_TURNS[0])
                     # Ensure v3 column exists (idempotent)
                     try:
                         conn.execute("ALTER TABLE intentos ADD COLUMN gates_detail TEXT")
@@ -956,3 +994,33 @@ class Persistence:
     ) -> None:
         """Legacy: old code calling upsert_mission now writes to actions."""
         self.upsert_action(session_id, project, gates_passed, gates_total)
+
+    # ── session_turns (persistent turn counting per session) ────────────────
+
+    def get_turn_count(self, session_id: str) -> int:
+        """Get persisted turn count for a session. Returns 0 if not found."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT turn_count FROM session_turns WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                return row["turn_count"] if row else 0
+
+    def set_turn_count(self, session_id: str, count: int) -> bool:
+        """Persist turn count for a session. Returns success status."""
+        with self._lock:
+            with self._conn() as conn:
+                try:
+                    conn.execute(
+                        """INSERT INTO session_turns (session_id, turn_count)
+                           VALUES (?, ?)
+                           ON CONFLICT(session_id) DO UPDATE SET
+                               turn_count = excluded.turn_count,
+                               updated_at = datetime('now')""",
+                        (session_id, count),
+                    )
+                    return True
+                except Exception as e:
+                    logger.error("Failed to persist turn count: %s", e)
+                    return False

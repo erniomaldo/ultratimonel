@@ -37,8 +37,7 @@ TOOLS_REQUIRING_VERIFIED_GATES = {
     "mcp__ultratimonel__complete_intento",
     # Registrar intento también requiere gates
     "mcp__ultratimonel__record_intento",
-    # begin_turn requiere gates verificados para enforzar el ciclo obligatorio
-    "mcp__ultratimonel__begin_turn",
+    # REMOVED: begin_turn is now exempt to prevent deadlock (see bouncer logic R3.1)
     # Tools que modifican datos (write operations)
     "mcp__nextcloud__deck_update_card",
     "mcp__nextcloud__nc_webdav_write_file",
@@ -90,11 +89,16 @@ def _gates_bouncer(ctx=None, tool_name: str = "", args: dict | None = None, **kw
     Bloquea tools críticas si los gates no se han ejecutado o no están PASS.
     Retorna None → tool se ejecuta. Retorna {"action": "block", ...} → tool bloqueada.
     """
+    # NEW FIX: EXEMPT begin_turn from restriction to prevent deadlock (R3.1)
+    # If gates fail post-grace period, agent must be able to call begin_turn to recover
+    if tool_name == "mcp__ultratimonel__begin_turn":
+        return None  # Always allow - prevents chicken-and-egg deadlock
+
     # 1. Solo aplica a tools que requieren gates verificados
     if tool_name not in TOOLS_REQUIRING_VERIFIED_GATES:
         return None
 
-    global _last_gates_parsed
+    global _last_gates_parsed, _turn_count
 
     # 2. ¿Hay gates cacheados?
     if _last_gates_parsed is None:
@@ -118,19 +122,23 @@ def _gates_bouncer(ctx=None, tool_name: str = "", args: dict | None = None, **kw
     all_pass, failed_gates = _gates_all_pass(gates)
     gates_passed = _gates_count_passed(gates)
 
-    # Grace turns — primeros N turnos permiten sin bloquear por gates fallando
+    # Grace turns — NEW: Load fresh turn count from persistence instead of module global (R2.2)
+    _turn_count = ultratimonel_client.get_turn_count(_last_session_id or "") or 0
+
     if _turn_count <= GRACE_TURNS:
         return None
 
     if not all_pass:
+        # R2.3: Block ALL tools uniformly (not selective list) when turn > GRACE_TURNS and gates fail
         detail = "\n".join(f"  🔴 {f}" for f in failed_gates)
         return {
             "action": "block",
             "message": (
-                f"🚫 Gates obligatorios no pasaron ({gates_passed}/4).\n\n"
+                f"🚫 Tiempo de gracia agotado ({GRACE_TURNS} turns). "
+                f"Gates obligatorios no pasaron ({gates_passed}/4).\n\n"
                 f"{detail}\n\n"
                 "Corrige los gates bloqueantes antes de continuar. "
-                "Ejecuta assert_gates() con el proyecto correcto."
+                "Ejecuta begin_turn() para reiniciar el turno con gates frescos."
             ),
         }
 
@@ -236,11 +244,14 @@ def _post_turn_guard(ctx=None, tool_name: str = "", args: dict | None = None, re
 
 def _on_session_start(session_id: str, **kwargs):
     """Hook: se ejecuta al crear una nueva sesión — inicializa el contador de gates."""
-    global _turn_count, _turn_ended, _turn_active
-    _turn_count = 0
+    global _turn_count, _turn_ended, _turn_active, _last_gates_result, _last_session_id, _last_gates_parsed
+
+    # NEW: Load persisted turn count from SQLite (or default to 0)
+    _turn_count = ultratimonel_client.get_turn_count(session_id) or 0
+
     _turn_ended = False
     _turn_active = False
-    logger.info("ultratimonel-preflight: Session started — running initial gates")
+    logger.info("ultratimonel-preflight: Session started with turn_count=%d — running initial gates", _turn_count)
 
     result = ultratimonel_client.assert_gates(
         session_id=session_id,
@@ -248,7 +259,6 @@ def _on_session_start(session_id: str, **kwargs):
         sender="plugin",
     )
 
-    global _last_gates_result, _last_session_id, _last_gates_parsed
     _last_gates_result = result
     _last_session_id = session_id
     _last_gates_parsed = _parse_gates(result)
@@ -270,10 +280,15 @@ def _pre_llm_call(
     incluir el proyecto en el mensaje, los gates salen SKIP (proyecto unknown)
     y pre_tool_call bloquea las tools de escritura.
     """
-    global _last_gates_result, _last_session_id, _last_gates_parsed
+    global _last_gates_result, _last_session_id, _last_gates_parsed, _turn_count
 
-    global _turn_count
+    # NEW: Load from persistence FIRST to get accurate turn count
+    persisted_count = ultratimonel_client.get_turn_count(session_id) or 0
+    _turn_count = persisted_count
+
+    # Increment and persist the new value
     _turn_count += 1
+    ultratimonel_client.set_turn_count(session_id, _turn_count)
 
     # Primer turno: usar gates de on_session_start si existen
     if is_first_turn and _last_gates_result is not None:

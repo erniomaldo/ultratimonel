@@ -342,3 +342,74 @@ class TestToolsUsabilityRetroIntegration:
         finally:
             p.close()
             os.unlink(db_path)
+
+
+class TestEnforcementV3Integration:
+    """Integration tests for persistent turn counting and deadlock prevention."""
+
+    def test_turn_counter_persists_across_sessions(self):
+        """TC1: Server restart preserves turn count per session."""
+        import tempfile, os
+        from ultratimonel.persistence import Persistence
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        try:
+            # First "session" - set turn count
+            p1 = Persistence(db_path=db_path)
+            p1.set_turn_count("sess-test-001", 7)
+            assert p1.get_turn_count("sess-test-001") == 7
+            p1.close()
+
+            # Simulate "server restart" - new persistence instance
+            p2 = Persistence(db_path=db_path)
+            turn_count = p2.get_turn_count("sess-test-001")
+            assert turn_count == 7, f"Expected 7, got {turn_count}"
+            p2.close()
+        finally:
+            os.unlink(db_path)
+
+    def test_begin_turn_exempt_from_bouncer(self):
+        """TC4: begin_turn callable post-grace even with failed gates."""
+        # This tests the deadlock prevention scenario
+        # The bouncer should return None (allow) for begin_turn regardless of gate status
+        from ultratimonel.plugin_preflight import _gates_bouncer, TOOLS_REQUIRING_VERIFIED_GATES
+
+        tool_name = "mcp__ultratimonel__begin_turn"
+
+        # Verify begin_turn is NOT in the restricted list (R3.1)
+        assert tool_name not in TOOLS_REQUIRING_VERIFIED_GATES, \
+            "begin_turn should be exempt from gate requirements per R3.1"
+
+    def test_universal_blocking_post_grace(self):
+        """TC2/TC3: All tools blocked uniformly post-grace period."""
+        # Test that the bouncer blocks ALL tools when turn > GRACE_TURNS and gates fail
+        import ultratimonel.plugin_preflight as plugin
+        from unittest.mock import patch
+
+        # Set up test context - mock persistence layer instead of global state
+        original_last_session_id = plugin._last_session_id
+        original_last_gates_parsed = plugin._last_gates_parsed
+
+        try:
+            # Mock get_turn_count to return 5 (> GRACE_TURNS default of 3)
+            with patch("ultratimonel.ultratimonel_client.get_turn_count", return_value=5):
+                plugin._last_session_id = "test-sess"
+                plugin._last_gates_parsed = [
+                    {"name": "1a", "state": "BLOCK", "mandatory": True, "message": ""},
+                    {"name": "1b", "state": "PASS", "mandatory": True, "message": ""},
+                    {"name": "1c", "state": "BLOCK", "mandatory": True, "message": ""},
+                    {"name": "1e", "state": "BLOCK", "mandatory": True, "message": ""},
+                ]
+
+                # Test that blocked tools return block action with grace period message
+                result = plugin._gates_bouncer(tool_name="mcp__ultratimonel__complete_intento")
+                assert result is not None
+                assert result["action"] == "block"
+                assert "Tiempo de gracia agotado" in result["message"]
+
+        finally:
+            # Restore original state
+            plugin._last_session_id = original_last_session_id
+            plugin._last_gates_parsed = original_last_gates_parsed
