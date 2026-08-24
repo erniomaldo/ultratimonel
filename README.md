@@ -411,7 +411,12 @@ map_sync()
 | `ULTRATIMONEL_DB_PATH` | `~/.hermes/ultratimonel.db` | Ruta a SQLite |
 | `ULTRATIMONEL_PROJECT_MAPS` | `~/.hermes/ultratimonel/project_maps.json` | Config de proyectos |
 | `ULTRATIMONEL_DASHBOARD_PORT` | `3005` | Puerto del dashboard |
+| `ULTRATIMONEL_MCP_CMD` | Auto-detectado (Hermes config → `sys.executable`) | Comando para ejecutar el MCP server ultratimonel (verifica `.env.example`) |
+| `ULTRATIMONEL_MCP_ARGS` | Vacío | Argumentos para el MCP server (ruta a `main.py`, ver `.env.example`) |
 | `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` | legacy `ultratimonel/dashboard/` (puerto principal 3005: `dashboard-astro/dist/`) | Root estático del dashboard — override para staging/validación |
+
+> [!NOTE]
+> Las variables `ULTRATIMONEL_MCP_CMD` y `ULTRATIMONEL_MCP_ARGS` son usadas por el cliente MCP (`ultratimonel_client.py`) para resolver dinámicamente los paths al lanzar el servidor. Si no están definidas, se buscan en la config de Hermes (`~/.hermes/config.yaml`). Ver `.env.example` como referencia.
 
 ---
 
@@ -470,6 +475,9 @@ ultratimonel/
     └── test_integration.py
 ```
 
+> [!NOTE]
+> El archivo `ultratimonel/combat_ws_server.py` está en el paquete principal (`ultratimonel/`) como **WIP del usuario**. Proporciona un servidor WebSocket para combat state broadcasting (⚔️) y no forma parte del flujo MCP principal.
+
 ---
 
 <a id="base-de-datos"></a>
@@ -492,6 +500,22 @@ SQLite con **WAL journal mode**. Ruta por defecto: `~/.hermes/ultratimonel.db`
 
 **Parámetros:** WAL journal mode · NORMAL synchronous · 5s busy timeout ·
 migraciones incrementales vía `schema_version`.
+
+---
+
+<a id="changes"></a>
+## 🔄 Cambios activos (OpenSpec)
+
+Los cambios propuestos y en desarrollo se documentan en `openspec/changes/`:
+
+| Change | Estado | Ubicación | PR |
+|--------|--------|-----------|-----|
+| **plugin-preflight-ctx-env-fix** | Activo | `openspec/changes/plugin-preflight-ctx-env-fix/` | PR #20 (card #136, specs retroactivas) |
+| **enforcement-v3** | En rama | Rama: `feature_164_enforcement-v3` | PR #19 abierto |
+| **dashboard-ux-v2** | Activo | `openspec/changes/dashboard-ux-v2/` | - |
+
+> [!NOTE]
+> El change **enforcement-v3** está implementado en la rama `feature_164_enforcement-v3`, NO en `main`. Busca allí para ver el código completo con: tabla `session_turns`, contador de turns persistente por sesión, fail-all post-gracia, y begin_turn exento del bouncer.
 
 ---
 

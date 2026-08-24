@@ -414,7 +414,12 @@ map_sync()
 | `ULTRATIMONEL_DB_PATH` | `~/.hermes/ultratimonel.db` | SQLite path |
 | `ULTRATIMONEL_PROJECT_MAPS` | `~/.hermes/ultratimonel/project_maps.json` | Project config |
 | `ULTRATIMONEL_DASHBOARD_PORT` | `3005` | Dashboard port |
+| `ULTRATIMONEL_MCP_CMD` | Auto-detected (Hermes config → `sys.executable`) | Command to run the ultratimonel MCP server (see `.env.example`) |
+| `ULTRATIMONEL_MCP_ARGS` | Empty | Arguments for the MCP server (`main.py` path, see `.env.example`) |
 | `ULTRATIMONEL_DASHBOARD_STATIC_ROOT` | legacy `ultratimonel/dashboard/` (main port 3005: `dashboard-astro/dist/`) | Dashboard static root — override for staging/validation |
+
+> [!NOTE]
+> The variables `ULTRATIMONEL_MCP_CMD` and `ULTRATIMONEL_MCP_ARGS` are used by the MCP client (`ultratimonel_client.py`) to dynamically resolve paths when spawning the server. If not defined, they're looked up in Hermes config (`~/.hermes/config.yaml`). See `.env.example` as reference.
 
 ---
 
@@ -473,6 +478,9 @@ ultratimonel/
     └── test_integration.py
 ```
 
+> [!NOTE]
+> The file `ultratimonel/combat_ws_server.py` is in the main package (`ultratimonel/`) as **work-in-progress by the user**. It provides a WebSocket server for combat state broadcasting (⚔️) and does not participate in the main MCP flow.
+
 ---
 
 <a id="database"></a>
@@ -495,6 +503,22 @@ SQLite with **WAL journal mode**. Default path: `~/.hermes/ultratimonel.db`
 
 **Parameters:** WAL journal mode · NORMAL synchronous · 5s busy timeout ·
 incremental migrations via `schema_version`.
+
+---
+
+<a id="changes"></a>
+## 🔄 Active Changes (OpenSpec)
+
+Proposed and in-development changes are documented in `openspec/changes/`:
+
+| Change | Status | Location | PR |
+|--------|--------|----------|-----|
+| **plugin-preflight-ctx-env-fix** | Active | `openspec/changes/plugin-preflight-ctx-env-fix/` | PR #20 (card #136, retroactive specs) |
+| **enforcement-v3** | On branch | Branch: `feature_164_enforcement-v3` | PR #19 open |
+| **dashboard-ux-v2** | Active | `openspec/changes/dashboard-ux-v2/` | - |
+
+> [!NOTE]
+> The change **enforcement-v3** is implemented on branch `feature_164_enforcement-v3`, NOT in main. Look there for the full code with: schema v4 with `session_turns` table, persistent turn counter per session, fail-all post-grace period, and begin_turn exempt from bouncer.
 
 ---
 
