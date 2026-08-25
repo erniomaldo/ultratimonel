@@ -2,15 +2,15 @@
 
 ## Intent
 
-Document retroactive fixes applied in commit 484e42f to establish audit trail. Three critical changes were made: (1) plugin hook signatures corrected with `ctx=None` default causing TypeError and breaking all gate enforcement, (2) MCP client spawning without PATH/HOME environment preventing gates 1a/1b from executing external tools successfully, and (3) `mcp__ultratimonel__begin_turn` added to TOOLS_REQUIRING_VERIFIED_GATES to enforce mandatory tool contracts for the turn cycle.
+Document retroactive fixes applied in commit 484e42f to establish audit trail. Three critical changes were made: (1) plugin hook signatures corrected with `ctx=None` default causing TypeError and breaking all gate enforcement, (2) MCP client spawning without PATH/HOME environment preventing gates 1a/1b from executing external tools successfully, and (3) `mcp__ultratimonel__begin_turn` initially added to TOOLS_REQUIRING_VERIFIED_GATES in commit 484e42f but was SUPERSEDED by PR #19 (commit 2e6c5e5, enforcement-v3 branch): begin_turn is now EXEMPT from the bouncer to prevent deadlock.
 
 ## Scope
 
 ### In Scope
-- Document the three fixes applied in commit 484e42f: (1) hook signatures with `ctx=None`, (2) MCP client environment merge, (3) `mcp__ultratimonel__begin_turn` addition to TOOLS_REQUIRING_VERIFIED_GATES
+- Document the three fixes applied in commit 484e42f: (1) hook signatures with `ctx=None`, (2) MCP client environment merge, (3) `mcp__ultratimonel__begin_turn` initially added to TOOLS_REQUIRING_VERIFIED_GATES but superseded by PR #19 making it EXEMPT from the bouncer
 - Record technical details of plugin_preflight.py hook signature corrections
 - Record ultratimonel_client.py MCP spawn environment merge fix
-- Document the critical tool contract change for begin_turn enforcement
+- Document begin_turn exemption logic in _gates_bouncer to prevent deadlock (R3.1)
 
 ### Out of Scope
 - Modifying WIP dashboard*/combat_ws_server directories
@@ -38,8 +38,10 @@ Document retroactively as audit trail of production fixes. No forward implementa
 
 | Area | Impact | Description |
 |------|--------|-------------|
-| `ultratimonel/plugin_preflight.py` | Fixed | Hook functions `_gates_bouncer()` and `_post_turn_guard()` corrected with `ctx=None` default parameter AND `mcp__ultratimonel__begin_turn` added to TOOLS_REQUIRING_VERIFIED_GATES (lines 40-42) |
+| `ultratimonel/plugin_preflight.py` | Fixed | Hook functions `_gates_bouncer()` and `_post_turn_guard()` corrected with `ctx=None` default parameter AND `mcp__ultratimonel__begin_turn` EXEMPT from bouncer (removed from TOOLS_REQUIRING_VERIFIED_GATES, see lines 92-94 in current code) |
 | `ultratimonel/ultratimonel_client.py:132` | Fixed | MCP server spawn now merges `os.environ` + `ULTRATIMONEL_ENV` instead of replacing system environment |
+
+**Nota:** El cambio de begin_turn a TOOLS_REQUIRING_VERIFIED_GATES en commit 484e42f fue SUPERSEIDO por PR #19 (commit 2e6c5e5, rama enforcement-v3). La versión actual del código tiene begin_turn como EXEMPTO del bouncer para prevenir deadlock. Ver lógica R3.1 en plugin_preflight.py:92-94.
 
 ## Risks
 

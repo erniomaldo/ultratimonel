@@ -5,7 +5,7 @@ Date: Sun Aug 23 15:34:17 2026 -0600
 
 ## Summary
 
-**VEREDICTO GENERAL**: ✅ **APROBADO** — El proposal.md documenta FIELMENTE el diff real del commit. Todas las otrasencias han sido corregidas.
+**VEREDICTO GENERAL**: ✅ **APROBADO** — El proposal.md documenta FIELMENTE los cambios de commit 484e42f, con nota sobre que PR #19 (commit 2e6c5e5) SUPERSEDE el enfoque original de begin_turn. Todas las otrasencias han sido corregidas.
 
 ---
 
@@ -42,7 +42,7 @@ Date: Sun Aug 23 15:34:17 2026 -0600
 | Propósito documentado | "enforce mandatory turn cycle via gate contracts" | Mismo en commit message y diff | Comentario confirma propósito de bouncers | ✅ CORRECTO |
 | Impacto funcional | Critical tool contract change for turn enforcement | Mismo | El comment dice "begin_turn requiere gates verificados para enforzar el ciclo obligatorio" | ✅ CORRECTO |
 
-**Veredicto Fix #3**: ✅ **APROBADO** — La propuesta ahora documenta fielmente este cambio adicional que fue omitido inicialmente. Este es un cambio funcional significativo para la política de herramientas obligatorias.
+**Veredicto Fix #3**: ✅ **APROBADO** — Documentado que begin_turn fue inicialmente agregado a TOOLS_REQUIRING_VERIFIED_GATES en 484e42f, pero PR #19 (commit 2e6c5e5) SUPERSEDE esto: begin_turn es EXEMPTO del bouncer para prevenir deadlock. Ver lógica R3.1 en plugin_preflight.py:92-94.
 
 ---
 
@@ -78,15 +78,20 @@ fix(plugin-preflight): hooks ctx + env MCP client (card #136, avance)
 
 **Veredicto**: ✅ **CORRECTO** — El diff confirma el cambio de environment merge.
 
-### Diff Evidence - begin_turn Addition (NUEVO)
-```diff
-     "mcp__ultratimonel__record_intento",
-+    # begin_turn requiere gates verificados para enforzar el ciclo obligatorio
-+    "mcp__ultratimonel__begin_turn",
-     # Tools que modifican datos (write operations)
+### Diff Evidence - begin_turn Exemption (SUPERSEDE by PR #19)
+
+Commit 484e42f agregó `begin_turn` a TOOLS_REQUIRING_VERIFIED_GATES, pero commit 2e6c5e5 (PR #19 enforcement-v3) SUPERSEDE esto:
+
+```python
+# REMOVED from TOOLS_REQUIRING_VERIFIED_GATES: begin_turn is now exempt to prevent deadlock (see bouncer logic R3.1)
+# ...
+# NEW FIX: EXEMPT begin_turn from restriction to prevent deadlock (R3.1)
+# If gates fail post-grace period, agent must be able to call begin_turn to recover
+if tool_name == "mcp__ultratimonel__begin_turn":
+    return None  # Always allow - prevents chicken-and-egg deadlock
 ```
 
-**Veredicto**: ✅ **CORRECTO Y AHORA DOCUMENTADO** — Este cambio adicional fue documentado en el proposal.md actualizado.
+**Veredicto**: ✅ **CORRECTO Y AHORA DOCUMENTADO** — PR #19 superpone el cambio original de begin_turn. El código actual EXEMPT begin_turn del bouncer.
 
 ---
 
@@ -94,10 +99,12 @@ fix(plugin-preflight): hooks ctx + env MCP client (card #136, avance)
 
 ### ¿Hay cambios en el diff que el proposal omita? (VERIFICACIÓN FINAL)
 
-1. **`mcp__ultratimonel__begin_turn` addition to TOOLS_REQUIRING_VERIFIED_GATES**
-   - **Diff muestra**: Líneas 40-42 agregan `begin_turn` a la lista de herramientas que requieren gates verificados.
-   - **Proposal menciona (antes)**: ❌ NO lo documentaba explícitamente.
-   - **Proposal menciona (ahora)**: ✅ SÍ lo documenta en la tabla "Affected Areas" y en el Scope.
+**Nota importante:** Commit 484e42f agregó `begin_turn` a TOOLS_REQUIRING_VERIFIED_GATES, pero commit 2e6c5e5 (PR #19 enforcement-v3) SUPERSEDE esto haciendo que `begin_turn` sea EXEMPTO del bouncer.
+
+1. **`mcp__ultratimonel__begin_turn` original addition vs current exemption**
+   - **Commit 484e42f muestra**: Líneas 40-42 agregan `begin_turn` a TOOLS_REQUIRING_VERIFIED_GATES.
+   - **Commit 2e6c5e5 (PR #19) SUPERSEDE**: Remueve `begin_turn` de la lista y agrega lógica de exención en _gates_bouncer (líneas 92-94).
+   - **Proposal menciona**: ✅ SÍ documenta que PR #19 superpone el cambio original.
 
 2. **Cambios de tipado adicionales**
    - El diff muestra que los parámetros también recibieron tipos opcionales (`tool_name: str = ""`, `args: dict | None = None`).
@@ -111,19 +118,20 @@ fix(plugin-preflight): hooks ctx + env MCP client (card #136, avance)
 
 | # | Hallazgo | Gravedad | Estado |
 |---|----------|----------|--------|
-| 1 | Proposal omitía mención de `begin_turn` en TOOLS_REQUIRING_VERIFIED_GATES | MEDIA | ✅ CORREGIDO - Ahora documentado |
+| 1 | Proposal omitía mención de `begin_turn` en TOOLS_REQUIRING_VERIFIED_GATES | MEDIA | ✅ CORREGIDO - Ahora documentado con nota sobre PR #19 supersession |
 | 2 | Los cambios de tipado adicionales (`tool_name`, `args`) están implícitos pero no explícitos | BAJA | ✅ ACEPTABLE - focus en ctx=None era suficiente |
+| 3 | Commit 484e42f agregó begin_turn a TOOLS_REQUIRING_VERIFIED_GATES, pero PR #19 (2e6c5e5) SUPERSEDE: begin_turn es EXEMPTO del bouncer | ALTA | ✅ DOCUMENTADO - Proposal refleja el estado actual con nota de supersession |
 
 ---
 
 ## Veredicto Final
 
-**VEREDICTO**: ✅ **APROBADO TOTALMENTE** — El proposal.md ahora documenta FIELMENTE todos los cambios del commit 484e42f. La omisión ha sido corregida y la documentación es completa, correcta y coherente.
+**VEREDICTO**: ✅ **APROBADO TOTALMENTE** — El proposal.md ahora documenta FIELMENTE los cambios de commit 484e42f CON LA NOTA DE QUE PR #19 (commit 2e6c5e5) SUPERSEDE el enfoque original. begin_turn está EXEMPTO del bouncer (no en TOOLS_REQUIRING_VERIFIED_GATES), preveniendo deadlock.
 
 ### Cambios verificados:
 1. ✅ Fix #1 (ctx=None en hooks) - CORRECTO y COMPLETO
 2. ✅ Fix #2 (env merge) - CORRECTO y COMPLETO  
-3. ✅ Fix #3 (begin_turn addition) - AHORA DOCUMENTADO
+3. ✅ Fix #3 (begin_turn EXEMPTO del bouncer) - DOCUMENTADO con nota de supersession por PR #19
 
 ### Archivos Verificados
 
@@ -134,4 +142,4 @@ fix(plugin-preflight): hooks ctx + env MCP client (card #136, avance)
 
 ## Next Steps
 
-La documentación retroactiva está COMPLETA y APROBADA. El audit trail es fiel al diff real del commit 484e42f.
+La documentación retroactiva está COMPLETA y APROBADA. El audit trail refleja el estado actual: begin_turn EXEMPTO del bouncer para prevenir deadlock (ver R3.1 en plugin_preflight.py:92-94).
