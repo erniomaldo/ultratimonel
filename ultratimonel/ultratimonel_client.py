@@ -123,7 +123,13 @@ def _call_mcp_tool(tool_name: str, arguments: dict) -> dict | None:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**ULTRATIMONEL_ENV},
+            # FIX (2026-08-20, card #164): merge os.environ with the
+            # ULTRATIMONEL_* overrides instead of replacing the process env.
+            # Previously the server was spawned with ONLY the ULTRATIMONEL_*
+            # vars (no PATH/HOME) → its gates 1a/1b could not spawn
+            # `npx -y @agentmemory/mcp` / `agentcheckpoint` → WARN "unavailable"
+            # every pre_llm_call → plugin bouncer blocked begin_turn post-gracia.
+            env={**os.environ, **ULTRATIMONEL_ENV},
             text=True,
             bufsize=1,
         )
@@ -261,3 +267,25 @@ def gates_summary(gates_result: dict | None) -> str:
 
     except Exception as e:
         return f"[ultratimonel] Error parsing gates result: {e}"
+
+
+# ── Turn Count Persistence Wrappers (v4) ─────────────────────────────────────
+
+from .persistence import Persistence
+
+# Create instance with default DB path (same as server.py uses)
+_db_path = os.environ.get(
+    "ULTRATIMONEL_DB_PATH",
+    os.path.expanduser("~/.hermes/ultratimonel.db"),
+)
+persistence = Persistence(_db_path)
+
+
+def get_turn_count(session_id: str) -> int:
+    """Get persisted turn count for a session. Returns 0 if not found."""
+    return persistence.get_turn_count(session_id)
+
+
+def set_turn_count(session_id: str, count: int) -> bool:
+    """Persist turn count for a session. Returns success status."""
+    return persistence.set_turn_count(session_id, count)

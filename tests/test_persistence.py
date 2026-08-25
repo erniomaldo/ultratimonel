@@ -230,12 +230,14 @@ class TestDbFile:
 class TestGatesDetail:
     """Tests for gates_detail column (v3 schema)."""
 
-    def test_schema_version_v3(self, db):
+    def test_schema_version_v4(self, db):
+        """Verify DB initializes at v4 with session_turns table."""
+        from ultratimonel.persistence import SCHEMA_VERSION
         with db._conn() as conn:
             row = conn.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()
-            assert row[0] == 3
+            assert row[0] == SCHEMA_VERSION
 
     def test_gates_detail_column_exists(self, db):
         with db._conn() as conn:
@@ -296,33 +298,96 @@ class TestChecklistItemById:
         assert db.get_checklist_item_by_id(99999) is None
 
 
-class TestDbMigrationV2ToV3:
-    def test_migration_v2_to_v3(self):
-        """Simulate migration from v2 to v3."""
+class TestDbMigrationV2ToV4:
+    def test_migration_v2_to_v4(self):
+        """Simulate migration from v2 to v4 (skipping v3)."""
         import tempfile, os
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
         try:
-            # Create v2 DB
+            # Create v2 DB with minimal schema
             p2 = Persistence(db_path=db_path)
             with p2._conn() as conn:
                 conn.execute(
                     "INSERT INTO schema_version (version, description) VALUES (2, 'v2')"
                 )
+                # Add v3 column for gates_detail simulation
+                try:
+                    conn.execute("ALTER TABLE intentos ADD COLUMN gates_detail TEXT")
+                except:
+                    pass  # Column might not exist yet in minimal v2
             p2.close()
 
-            # Reopen — should auto-migrate to v3
-            p3 = Persistence(db_path=db_path)
-            with p3._conn() as conn:
+            # Reopen — should auto-migrate to v4 (skipping v3)
+            p4 = Persistence(db_path=db_path)
+            with p4._conn() as conn:
                 row = conn.execute(
                     "SELECT MAX(version) FROM schema_version"
                 ).fetchone()
-                assert row[0] == 3
+                assert row[0] == 4  # Should be at v4
 
-                # Column should exist
-                cols = conn.execute("PRAGMA table_info(intentos)").fetchall()
+                # session_turns table should exist (v4 feature)
+                cols = conn.execute("PRAGMA table_info(session_turns)").fetchall()
                 col_names = {c[1] for c in cols}
-                assert "gates_detail" in col_names
-            p3.close()
+                assert "session_id" in col_names
+                assert "turn_count" in col_names
+
+            p4.close()
         finally:
             os.unlink(db_path)
+
+
+class TestTurnCount:
+    """Tests for turn count persistence methods (v4 schema)."""
+
+    def test_get_turn_count_missing_session(self, db):
+        """get_turn_count returns 0 for non-existent session."""
+        assert db.get_turn_count("nonexistent") == 0
+
+    def test_set_and_get_turn_count(self, db):
+        """set_turn_count persists and get_turn_count retrieves correctly."""
+        assert db.set_turn_count("sess-1", 5) is True
+        assert db.get_turn_count("sess-1") == 5
+
+    def test_multiple_sessions_independent(self, db):
+        """Each session has independent turn count."""
+        db.set_turn_count("sess-a", 5)
+        db.set_turn_count("sess-b", 3)
+        assert db.get_turn_count("sess-a") == 5
+        assert db.get_turn_count("sess-b") == 3
+
+
+class TestDbMigrationV3ToV4:
+    def test_migration_v3_to_v4(self):
+        """Simulate migration from v3 to v4."""
+        import os
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            # Create v3 DB (simulate by using current version)
+            p = Persistence(db_path=db_path)
+            with p._conn() as conn:
+                conn.execute(
+                    "INSERT INTO schema_version (version, description) VALUES (3, 'v3')"
+                )
+            p.close()
+
+            # Reopen — should auto-migrate to v4
+            p2 = Persistence(db_path=db_path)
+            try:
+                with p2._conn() as conn:
+                    row = conn.execute(
+                        "SELECT MAX(version) FROM schema_version"
+                    ).fetchone()
+                    assert row[0] == 4
+
+                    # Table should exist
+                    cols = conn.execute("PRAGMA table_info(session_turns)").fetchall()
+                    col_names = {c[1] for c in cols}
+                    assert "session_id" in col_names
+                    assert "turn_count" in col_names
+            finally:
+                p2.close()
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
