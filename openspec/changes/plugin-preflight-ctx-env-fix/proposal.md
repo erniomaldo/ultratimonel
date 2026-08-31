@@ -38,7 +38,7 @@ Document retroactively as audit trail of production fixes. No forward implementa
 
 | Area | Impact | Description |
 |------|--------|-------------|
-| `ultratimonel/plugin_preflight.py` | Fixed | Hook functions `_gates_bouncer()` and `_post_turn_guard()` corrected with `ctx=None` default parameter AND `mcp__ultratimonel__begin_turn` EXEMPT from bouncer (removed from TOOLS_REQUIRING_VERIFIED_GATES, see lines 92-94 in current code) |
+| `ultratimonel/plugin_preflight.py` | Fixed | Hook functions `_gates_bouncer()` and `_post_turn_guard()` corrected with `ctx=None` default parameter. **NOTA:** `mcp__ultratimonel__begin_turn` fue inicialmente agregado a TOOLS_REQUIRING_VERIFIED_GATES en commit 484e42f, pero PR #19 (commit 2e6c5e5) lo SUPERSEDIÓ: begin_turn es ahora EXEMPTO del bouncer para prevenir deadlock. **Este PR NO propone re-agregar begin_turn a TOOLS_REQUIRING_VERIFIED_GATES.** |
 | `ultratimonel/ultratimonel_client.py:132` | Fixed | MCP server spawn now merges `os.environ` + `ULTRATIMONEL_ENV` instead of replacing system environment |
 
 **Nota:** El cambio de begin_turn a TOOLS_REQUIRING_VERIFIED_GATES en commit 484e42f fue SUPERSEIDO por PR #19 (commit 2e6c5e5, rama enforcement-v3). La versión actual del código tiene begin_turn como EXEMPTO del bouncer para prevenir deadlock. Ver lógica R3.1 en plugin_preflight.py:92-94.

@@ -5,7 +5,7 @@ Date: Sun Aug 23 15:34:17 2026 -0600
 
 ## Summary
 
-**VEREDICTO GENERAL**: ✅ **APROBADO** — El proposal.md documenta FIELMENTE los cambios de commit 484e42f, con nota sobre que PR #19 (commit 2e6c5e5) SUPERSEDE el enfoque original de begin_turn. Todas las otrasencias han sido corregidas.
+**VEREDICTO GENERAL**: ✅ **APROBADO** — El proposal.md documenta FIELMENTE los cambios de commit 484e42f. El fix #3 (begin_turn en TOOLS_REQUIRING_VERIFIED_GATES) se documenta como histórico: fue parte de 484e42f pero PR #19 (commit 2e6c5e5) lo SUPERSEDIÓ haciendo begin_turn EXEMPTO del bouncer. Este PR NO propone re-agregar begin_turn a TOOLS_REQUIRING_VERIFIED_GATES.
 
 ---
 
@@ -33,16 +33,16 @@ Date: Sun Aug 23 15:34:17 2026 -0600
 
 **Veredicto Fix #2**: ✅ **APROBADO** — La propuesta documenta fielmente el cambio de merge de entorno. La ubicación exacta (`line:132`) es correcta.
 
-### Fix #3: begin_turn addition to TOOLS_REQUIRING_VERIFIED_GATES (CORREGIDO)
+### Fix #3: begin_turn en TOOLS_REQUIRING_VERIFIED_GATES (HISTÓRICO — SUPERSEDE)
 
-| Aspecto | Propuesta (proposal.md actualizado) | Diff Real (commit 484e42f) | Código Actual en commit | Estado |
-|---------|-------------------------------------|---------------------------|------------------------|--------|
-| Archivo afectado | `ultratimonel/plugin_preflight.py` | Sí | Sí | ✅ |
+| Aspecto | Propuesta (proposal.md actualizado) | Diff Real (commit 484e42f) | Código Actual en main | Estado |
+|---------|-------------------------------------|---------------------------|----------------------|--------|
+| Archivo afectado | `ultratimonel/plugin_preflight.py` | Sí | N/A (superseded) | ✅ |
 | Línea exacta del cambio | "begin_turn added to TOOLS_REQUIRING_VERIFIED_GATES" | `+    # begin_turn requiere gates verificados para enforzar el ciclo obligatorio`<br>`+    "mcp__ultratimonel__begin_turn",` | Líneas 40-42 del commit | ✅ CONCORDE |
 | Propósito documentado | "enforce mandatory turn cycle via gate contracts" | Mismo en commit message y diff | Comentario confirma propósito de bouncers | ✅ CORRECTO |
 | Impacto funcional | Critical tool contract change for turn enforcement | Mismo | El comment dice "begin_turn requiere gates verificados para enforzar el ciclo obligatorio" | ✅ CORRECTO |
 
-**Veredicto Fix #3**: ✅ **APROBADO** — Documentado que begin_turn fue inicialmente agregado a TOOLS_REQUIRING_VERIFIED_GATES en 484e42f, pero PR #19 (commit 2e6c5e5) SUPERSEDE esto: begin_turn es EXEMPTO del bouncer para prevenir deadlock. Ver lógica R3.1 en plugin_preflight.py:92-94.
+**Veredicto Fix #3**: ✅ **APROBADO** — Documentado que begin_turn fue inicialmente agregado a TOOLS_REQUIRING_VERIFIED_GATES en 484e42f. PR #19 (commit 2e6c5e5) SUPERSEDE esto: begin_turn es EXEMPTO del bouncer para prevenir deadlock. **Este PR NO propone re-agregar begin_turn a TOOLS_REQUIRING_VERIFIED_GATES** — el fix #3 se documenta como histórico, no como cambio a aplicar.
 
 ---
 
@@ -91,7 +91,7 @@ if tool_name == "mcp__ultratimonel__begin_turn":
     return None  # Always allow - prevents chicken-and-egg deadlock
 ```
 
-**Veredicto**: ✅ **CORRECTO Y AHORA DOCUMENTADO** — PR #19 superpone el cambio original de begin_turn. El código actual EXEMPT begin_turn del bouncer.
+**Veredicto**: ✅ **CORRECTO Y DOCUMENTADO** — PR #19 superpone el cambio original de begin_turn. El código actual de main EXEMPT begin_turn del bouncer. Este PR documenta el fix #3 como histórico sin proponer re-agregarlo.
 
 ---
 
@@ -99,12 +99,13 @@ if tool_name == "mcp__ultratimonel__begin_turn":
 
 ### ¿Hay cambios en el diff que el proposal omita? (VERIFICACIÓN FINAL)
 
-**Nota importante:** Commit 484e42f agregó `begin_turn` a TOOLS_REQUIRING_VERIFIED_GATES, pero commit 2e6c5e5 (PR #19 enforcement-v3) SUPERSEDE esto haciendo que `begin_turn` sea EXEMPTO del bouncer.
+**Nota importante:** Commit 484e42f agregó `begin_turn` a TOOLS_REQUIRING_VERIFIED_GATES, pero commit 2e6c5e5 (PR #19 enforcement-v3) SUPERSEDE esto haciendo que `begin_turn` sea EXEMPTO del bouncer. Este PR NO propone re-agregar begin_turn a TOOLS_REQUIRING_VERIFIED_GATES.
 
 1. **`mcp__ultratimonel__begin_turn` original addition vs current exemption**
    - **Commit 484e42f muestra**: Líneas 40-42 agregan `begin_turn` a TOOLS_REQUIRING_VERIFIED_GATES.
-   - **Commit 2e6c5e5 (PR #19) SUPERSEDE**: Remueve `begin_turn` de la lista y agrega lógica de exención en _gates_bouncer (líneas 92-94).
+   - **Commit 2e6c5e5 (PR #19) SUPERSEDE**: Remueve `begin_turn` de la lista y agrega lógica de exención en _gates_bouncer.
    - **Proposal menciona**: ✅ SÍ documenta que PR #19 superpone el cambio original.
+   - **Código propuesto**: ✅ NO incluye begin_turn en TOOLS_REQUIRING_VERIFIED_GATES (no revertir #19).
 
 2. **Cambios de tipado adicionales**
    - El diff muestra que los parámetros también recibieron tipos opcionales (`tool_name: str = ""`, `args: dict | None = None`).
@@ -120,7 +121,7 @@ if tool_name == "mcp__ultratimonel__begin_turn":
 |---|----------|----------|--------|
 | 1 | Proposal omitía mención de `begin_turn` en TOOLS_REQUIRING_VERIFIED_GATES | MEDIA | ✅ CORREGIDO - Ahora documentado con nota sobre PR #19 supersession |
 | 2 | Los cambios de tipado adicionales (`tool_name`, `args`) están implícitos pero no explícitos | BAJA | ✅ ACEPTABLE - focus en ctx=None era suficiente |
-| 3 | Commit 484e42f agregó begin_turn a TOOLS_REQUIRING_VERIFIED_GATES, pero PR #19 (2e6c5e5) SUPERSEDE: begin_turn es EXEMPTO del bouncer | ALTA | ✅ DOCUMENTADO - Proposal refleja el estado actual con nota de supersession |
+| 3 | Commit 484e42f agregó begin_turn a TOOLS_REQUIRING_VERIFIED_GATES, pero PR #19 (2e6c5e5) SUPERSEDE: begin_turn es EXEMPTO del bouncer | ALTA | ✅ DOCUMENTADO - Proposal refleja el estado actual con nota de supersession. Código propuesto NO incluye begin_turn en TOOLS_REQUIRING_VERIFIED_GATES. |
 
 ---
 
