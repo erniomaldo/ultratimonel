@@ -1373,3 +1373,50 @@ class TestBeginTurnProjectFix:
             assert list_call[1]["project"] == "voy-rojo"
         else:
             assert list_call[0][1] == "voy-rojo"
+
+
+class TestCardUpdateDescription:
+    """Regression tests for card_update_description (card #186).
+
+    The tool must update only the description, preserve the current title,
+    and never raise KeyError on the tool-name lookup.
+    """
+
+    def test_deck_update_card_is_mapped(self):
+        """TOOL_NAMES must define deck_update_card for the nextcloud server."""
+        from ultratimonel.mcp_client import TOOL_NAMES
+
+        assert TOOL_NAMES["nextcloud"]["deck_update_card"] == "deck_update_card"
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_preserves_title_and_sends_description(self, mock_call_mcp):
+        """No KeyError; update payload keeps the fetched title and new description."""
+        from ultratimonel.server import card_update_description
+
+        current_card = {"id": 99, "title": "Titulo original", "description": "vieja"}
+        calls = []
+
+        def side_effect(tool_name, tool_fn, params, **kwargs):
+            calls.append((tool_name, tool_fn, params))
+            if tool_fn == "deck_get_card":
+                return (current_card, None)
+            if tool_fn == "deck_update_card":
+                return ({"id": 99}, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = side_effect
+
+        result = json.loads(
+            card_update_description(
+                99, "nueva descripcion", board_id=1, stack_id=2
+            )
+        )
+
+        assert result["status"] == "ok"
+        assert result["title_preserved"] == "Titulo original"
+
+        update_calls = [c for c in calls if c[1] == "deck_update_card"]
+        assert len(update_calls) == 1
+        payload = update_calls[0][2]
+        assert payload["title"] == "Titulo original"
+        assert payload["description"] == "nueva descripcion"

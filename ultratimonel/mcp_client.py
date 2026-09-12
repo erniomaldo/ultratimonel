@@ -101,6 +101,7 @@ TOOL_NAMES: dict[str, dict[str, str]] = {
         "deck_get_boards": "deck_get_boards",
         "deck_get_stacks": "deck_get_stacks",
         "deck_get_card": "deck_get_card",
+        "deck_update_card": "deck_update_card",
         "collectives_get_pages": "collectives_get_pages",
         "collectives_get_page": "collectives_get_page",
     },
