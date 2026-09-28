@@ -145,6 +145,88 @@ class TestSyncTasksMarkdownFallback:
         assert result["synced"] == 1
         assert result["total_errors"] == 0
 
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_single_parser_matches_extract_quests(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """FIX 1(b): sync_tasks and deck_bridge.extract_quests count the SAME quests."""
+        from ultratimonel.server import sync_tasks
+        from ultratimonel import deck_bridge
+
+        shared = (
+            "Intro\n"
+            "- [ ] one\n"
+            "* [x] two\n"
+            "- [X] three\n"
+            "prose\n"
+            "- [ ] four\n"
+        )
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+        card = self._make_card(200, "Shared payload card")
+        card_detail = self._make_card_detail(shared)
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 7
+        mock_persistence.upsert_checklist_item.return_value = None
+
+        result = json.loads(sync_tasks("testproj"))
+
+        assert result["synced"] == 1
+        authoritative = deck_bridge.extract_quests(shared)
+        mission_kwargs = mock_persistence.upsert_mission.call_args_list[0][1]
+        assert mission_kwargs["checklist_total"] == len(authoritative) == 4
+        assert mission_kwargs["checklist_done"] == sum(
+            1 for q in authoritative if q["done"]
+        ) == 2
+        assert mock_persistence.upsert_checklist_item.call_count == 4
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_genuine_checkbox_replica_extraction_unchanged(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """FIX 1(c): genuine ``- [ ]``/``- [x]``/``* [ ]`` semantics are preserved."""
+        from ultratimonel.server import sync_tasks
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+        card = self._make_card(201, "Genuine card")
+        card_detail = self._make_card_detail(
+            "Tarea\n- [ ] open\n- [x] done\n* [ ] star\n"
+        )
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 11
+        mock_persistence.upsert_checklist_item.return_value = None
+
+        json.loads(sync_tasks("testproj"))
+
+        items = [
+            call[1] for call in mock_persistence.upsert_checklist_item.call_args_list
+        ]
+        assert items == [
+            {"mission_id": 11, "item_index": 0, "text": "open", "done": 0},
+            {"mission_id": 11, "item_index": 1, "text": "done", "done": 1},
+            {"mission_id": 11, "item_index": 2, "text": "star", "done": 0},
+        ]
+
 
 class TestCompleteGate:
     """complete_gate output schema and no-op behavior."""
@@ -2502,3 +2584,266 @@ class TestCompactReadAndNoVerbose:
         assert result == {"id": 456, "text": "Review backlog", "done": False}
 
 
+# ── WU5: sync_task + sync_all deprecation (§2.7, §3.1) ──────────────────────
+
+
+def _tool_map():
+    """Return the registered MCP tools keyed by name (synchronous helper)."""
+    import asyncio
+
+    from ultratimonel.server import app
+
+    return {t.name: t for t in asyncio.run(app.list_tools())}
+
+
+class TestSyncToolSurface:
+    """deck-sync/mission-gate: sync_task + sync_tasks registered; sync_all marked."""
+
+    def test_sync_task_and_sync_tasks_registered(self):
+        tools = _tool_map()
+        assert "sync_task" in tools
+        assert "sync_tasks" in tools
+
+    def test_sync_all_deprecated_but_registered(self):
+        tools = _tool_map()
+        assert "sync_all" in tools
+        assert "~~DEPRECATED~~" in (tools["sync_all"].description or "")
+
+    def test_deprecation_points_to_sync_task(self):
+        tools = _tool_map()
+        # The explicit single-mission recovery path is available alongside.
+        assert "sync_task" in tools
+        assert "sync_task" in (tools["sync_all"].description or "")
+
+
+class TestSyncTask:
+    """D7: sync_task refreshes exactly one mission and backfills deck_stack_id."""
+
+    _CARD_DESC = "Prose line\n\n- [ ] one\n- [x] two"
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_unknown_mission_not_found_no_deck(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import sync_task
+
+        mock_persist.get_mission.return_value = None
+
+        result = json.loads(sync_task(9999))
+
+        assert "error" in result
+        assert "9999" in result["error"]
+        mock_call.assert_not_called()
+        mock_maps.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_refreshes_single_mission_and_backfills_stack(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import sync_task
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        responses = {
+            "deck_get_stacks": (
+                [{"id": 111, "title": "Backlog", "cards": [{"id": 189}]}],
+                None,
+            ),
+            "deck_get_card": (
+                {"title": "New title", "description": self._CARD_DESC},
+                None,
+            ),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_mission_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 5
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_mission_side_effect
+
+        result = json.loads(sync_task(5))
+
+        assert result == {
+            "mission_id": 5,
+            "deck_task_id": 189,
+            "status": "pendiente",
+            "quests_synced": 2,
+        }
+        # Exactly one mission is refreshed.
+        assert mock_persist.upsert_mission.call_count == 1
+        assert mock_persist.get_mission.call_count == 1
+        upsert_kwargs = mock_persist.upsert_mission.call_args.kwargs
+        assert upsert_kwargs["title"] == "New title"
+        assert upsert_kwargs["checklist_total"] == 2
+        assert upsert_kwargs["checklist_done"] == 1
+        # deck_stack_id is backfilled so later writes skip deck_get_stacks.
+        mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 111)
+        # Both quests refreshed, done flags preserved from the card.
+        assert mock_persist.upsert_checklist_item.call_count == 2
+        done_flags = [
+            c.kwargs["done"]
+            for c in mock_persist.upsert_checklist_item.call_args_list
+        ]
+        assert done_flags == [0, 1]
+        # Deck read happens before the replica refresh (Deck-first).
+        assert events.index(("deck", "deck_get_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_cached_stack_skips_stack_lookup(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "en_progreso",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        responses = {
+            "deck_get_card": ({"title": "Old", "description": "- [ ] only"}, None),
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: responses.get(
+            tool_name, (None, "unavailable")
+        )
+
+        result = json.loads(sync_task(5))
+
+        assert result["quests_synced"] == 1
+        called_tools = [c.args[1] for c in mock_call.call_args_list]
+        assert "deck_get_stacks" not in called_tools
+        mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 111)
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_card_not_found_leaves_stack_null_no_backfill(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """W-g: a card missing from every stack is an error, never a guess."""
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: {
+            "deck_get_stacks": (
+                [{"id": 111, "title": "Backlog", "cards": [{"id": 999}]}],
+                None,
+            ),
+        }.get(tool_name, (None, "unavailable"))
+
+        result = json.loads(sync_task(5))
+
+        assert "error" in result
+        # No guess persisted: deck_stack_id stays NULL and no replica row moves.
+        mock_persist.set_mission_deck_stack_id.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_removed_deck_quests_delete_stale_replica_rows(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """W3: replica rows beyond the parsed Deck quest set are deleted."""
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 3,
+            "checklist_done": 0,
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: {
+            "deck_get_card": ({"title": "Old", "description": "- [ ] only"}, None),
+        }.get(tool_name, (None, "unavailable"))
+
+        result = json.loads(sync_task(5))
+
+        assert result["quests_synced"] == 1
+        # The two replica rows no longer present in Deck are dropped.
+        mock_persist.delete_checklist_items_beyond.assert_called_once_with(5, 1)
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_status_derived_from_card_stack(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """W3: mission status is refreshed from the card's Deck stack."""
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: {
+            "deck_get_stacks": (
+                [{"id": 222, "title": "Done", "cards": [{"id": 189}]}],
+                None,
+            ),
+            "deck_get_card": ({"title": "Old", "description": "- [x] done"}, None),
+        }.get(tool_name, (None, "unavailable"))
+
+        result = json.loads(sync_task(5))
+
+        assert result["status"] == "completada"
+        assert mock_persist.upsert_mission.call_args.kwargs["status"] == "completada"
+        mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 222)

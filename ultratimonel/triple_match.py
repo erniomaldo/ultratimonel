@@ -16,7 +16,15 @@ import os
 import time
 from typing import Any, Optional
 
-from .gate_engine import GateConfig, GateResult, PASS, SKIP, WARN, BLOCK
+from .gate_engine import (
+    GateConfig,
+    GateResult,
+    GATE_CONFIG_MAP,
+    PASS,
+    SKIP,
+    WARN,
+    BLOCK,
+)
 from .mcp_client import call_mcp_tool, TOOL_NAMES
 from .context_extractor import reload_project_maps, is_known_project, get_project_maps
 
@@ -390,6 +398,12 @@ def run_triple_match(context: dict) -> list[GateResult]:
             )
 
         result.duration_ms = round((time.monotonic() - start) * 1000, 1)
+        # Stamp the authoritative classification (design D8) so every consumer
+        # — begin_turn, assert_gates, aggregate — sees 1a/1b as best-effort.
+        cfg = GATE_CONFIG_MAP.get(gate_name)
+        if cfg is not None:
+            result.mandatory = cfg.mandatory
+            result.best_effort = cfg.best_effort
         results.append(result)
 
     return results

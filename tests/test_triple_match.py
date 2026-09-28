@@ -6,7 +6,15 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ultratimonel.gate_engine import PASS, SKIP, WARN, BLOCK
+from ultratimonel.gate_engine import (
+    PASS,
+    SKIP,
+    WARN,
+    BLOCK,
+    GateResult,
+    GATE_CONFIG_MAP,
+    aggregate,
+)
 from ultratimonel.triple_match import (
     run_triple_match,
     build_context_envelope,
@@ -15,6 +23,7 @@ from ultratimonel.triple_match import (
     _call_checkpoint,
     _call_deck,
 )
+from ultratimonel.mcp_client import TOOL_NAMES
 
 from unittest.mock import patch, ANY
 
@@ -342,3 +351,114 @@ class TestLabelParsing:
             cards_data = result.result_data.get("deck_cards", [])
             assert len(cards_data) == 1
             assert cards_data[0]["labels"] == []
+
+
+class TestBestEffortClassification:
+    """D8 / triple-match delta: 1a/1b are best-effort and non-blocking while
+    1c/1e keep their classification and behavior unchanged."""
+
+    def _mock_side_effect(self):
+        def side_effect(server_name, tool_name, params=None, **kwargs):
+            if tool_name == TOOL_NAMES["agentmemory"]["smart_search"]:
+                return (None, "unavailable")
+            if tool_name in (
+                TOOL_NAMES["checkpoint"]["get_state"],
+                TOOL_NAMES["checkpoint"]["set_state"],
+            ):
+                return (None, "unavailable")
+            if tool_name == TOOL_NAMES["nextcloud"]["collectives_get_pages"]:
+                return ([{"id": 1, "title": "decisions"}], None)
+            if tool_name == TOOL_NAMES["nextcloud"]["deck_get_stacks"]:
+                return (
+                    [
+                        {
+                            "id": 111,
+                            "title": "To Do",
+                            "cards": [
+                                {
+                                    "id": 1,
+                                    "title": "Task",
+                                    "description": "",
+                                    "duedate": None,
+                                    "labels": [],
+                                }
+                            ],
+                        }
+                    ],
+                    None,
+                )
+            return (None, "unknown tool")
+
+        return side_effect
+
+    @patch("ultratimonel.triple_match.get_project_maps")
+    @patch("ultratimonel.triple_match.call_mcp_tool")
+    def test_run_stamps_best_effort_and_later_gates_still_run(
+        self, mock_call, mock_maps
+    ):
+        mock_maps.return_value = {
+            "testproj": {"collective_id": 5, "deck_board_id": 21}
+        }
+        mock_call.side_effect = self._mock_side_effect()
+
+        context = {
+            "sender": "user",
+            "topic": "t",
+            "project": "testproj",
+            "session_id": "sess-be",
+        }
+        results = run_triple_match(context)
+
+        by_name = {r.name: r for r in results}
+        assert [r.name for r in results] == ["1a", "1b", "1c", "1e"]
+
+        # 1a/1b unavailable -> WARN, but stamped best-effort/non-mandatory.
+        assert by_name["1a"].state == WARN
+        assert by_name["1a"].best_effort is True
+        assert by_name["1a"].mandatory is False
+        assert by_name["1b"].state == WARN
+        assert by_name["1b"].best_effort is True
+
+        # Later gates still executed (failure isolation preserved).
+        assert by_name["1c"].state == PASS
+        assert by_name["1e"].state == PASS
+
+        # Overall stays PASS despite the two best-effort WARNs.
+        overall, _ = aggregate(results)
+        assert overall == PASS
+
+    def test_best_effort_warns_yield_overall_pass(self):
+        results = [
+            GateResult(name="1a", state=WARN, mandatory=False, best_effort=True),
+            GateResult(name="1b", state=WARN, mandatory=False, best_effort=True),
+            GateResult(name="1c", state=PASS, mandatory=False, best_effort=False),
+            GateResult(name="1e", state=PASS, mandatory=True, best_effort=False),
+        ]
+        overall, _ = aggregate(results)
+        assert overall == PASS
+
+    def test_1c_warn_still_yields_overall_warn(self):
+        """Non-best-effort behavior unchanged: a 1c WARN is not swallowed."""
+        results = [
+            GateResult(name="1a", state=PASS, mandatory=False, best_effort=True),
+            GateResult(name="1c", state=WARN, mandatory=False, best_effort=False),
+            GateResult(name="1e", state=PASS, mandatory=True, best_effort=False),
+        ]
+        overall, _ = aggregate(results)
+        assert overall == WARN
+
+    def test_1c_1e_config_unchanged(self):
+        assert GATE_CONFIG_MAP["1c"].mandatory is False
+        assert GATE_CONFIG_MAP["1c"].best_effort is False
+        assert GATE_CONFIG_MAP["1e"].mandatory is True
+        assert GATE_CONFIG_MAP["1e"].best_effort is False
+
+    @patch(
+        "ultratimonel.triple_match.call_mcp_tool",
+        return_value=(None, "unavailable"),
+    )
+    def test_agentmemory_and_checkpoint_still_return_warn(self, mock_call):
+        """1a/1b keep returning WARN on failure (only their impact changed)."""
+        context = {"sender": "u", "topic": "t", "project": "p"}
+        assert _call_agentmemory(context).state == WARN
+        assert _call_checkpoint(context).state == WARN

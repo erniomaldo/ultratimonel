@@ -850,8 +850,9 @@ def map_sync() -> str:
 def sync_tasks(project: str) -> str:
     """Sync Deck cards from Nextcloud → missions table for a project.
 
-    Fetches all stacks/cards from the project's mapped Deck board,
-    extracts checklists, and upserts into the missions + checklist_items tables.
+    Fetches all stacks/cards from the project's mapped Deck board, extracts
+    quests (markdown checkbox lines in the card description; ``done`` = ``[x]``),
+    and upserts into the missions + checklist_items tables.
 
     Args:
         project: Project slug (e.g. "voy-rojo").
@@ -954,25 +955,20 @@ def sync_tasks(project: str) -> str:
 
                 # No checklist items from Deck API? Parse description for markdown checkboxes
                 if checklist_total == 0 and description:
-                    lines = description.strip().split("\n")
-                    for line in lines:
-                        line = line.strip()
-                        # Match - [ ] or - [x] style checkboxes
-                        if line.startswith("- [") or line.startswith("* ["):
-                            done = 1 if ("[x]" in line or "[X]" in line) else 0
-                            text = (
-                                line.split("]", 1)[1].strip() if "]" in line else line
-                            )
-                            checklist_items_data.append(
-                                {
-                                    "index": checklist_total,
-                                    "text": text,
-                                    "done": done,
-                                }
-                            )
-                            checklist_total += 1
-                            if done:
-                                checklist_done += 1
+                    # Single authoritative quest parser (deck_bridge.extract_quests):
+                    # same done/text/index semantics as the legacy inline parser.
+                    for quest in deck_bridge.extract_quests(description):
+                        done = 1 if quest["done"] else 0
+                        checklist_items_data.append(
+                            {
+                                "index": checklist_total,
+                                "text": quest["text"],
+                                "done": done,
+                            }
+                        )
+                        checklist_total += 1
+                        if done:
+                            checklist_done += 1
 
                 # Map stack title → mission status
                 status_map = {
@@ -1031,11 +1027,199 @@ def sync_tasks(project: str) -> str:
     )
 
 
+def _resolve_stack_for_card(
+    board_id: int,
+    mission: dict,
+) -> tuple[int | None, str | None, str | None]:
+    """Resolve the Deck stack that actually holds a mission's card (D7).
+
+    Prefers the replicated ``deck_stack_id`` (design D9). When it is missing —
+    which is the case for every mission until its first ``sync_task`` — this
+    locates the card among the board's stacks (the same shape ``sync_tasks``
+    consumes) so the correct stack is discovered and can be backfilled.
+
+    W-g: the card MUST be located among the board's stacks. When it is not,
+    this returns an error instead of guessing the pending/first stack, so a
+    wrong ``deck_stack_id`` can never be backfilled. Returns
+    ``(stack_id, stack_title, err)``; ``stack_title`` is ``None`` when the
+    cached stack id was used (its title is not known without a lookup).
+    """
+    cached = mission.get("deck_stack_id")
+    if cached:
+        return int(cached), None, None
+
+    from .mcp_client import call_mcp_tool, TOOL_NAMES
+
+    data, err = call_mcp_tool(
+        "nextcloud",
+        TOOL_NAMES["nextcloud"]["deck_get_stacks"],
+        {"board_id": board_id, "include_cards": True},
+        timeout=15.0,
+    )
+    if data is None:
+        return None, None, err or "unavailable"
+
+    stacks = (
+        data
+        if isinstance(data, list)
+        else data.get("stacks", data.get("result", []))
+    )
+
+    card_id = mission.get("deck_task_id")
+    for stack in stacks:
+        for card in (stack.get("cards") or []):
+            if card.get("id") == card_id:
+                return int(stack["id"]), stack.get("title"), None
+
+    return None, None, "card not found in any board stack"
+
+
+# Deck stack title → mission status (same vocabulary as sync_tasks). Deck is the
+# source of truth, so sync_task derives the replica status from the card's
+# current stack instead of echoing the stale local value (W-b/W3).
+_STACK_STATUS_MAP = {
+    "backlog": "pendiente",
+    "pendiente": "pendiente",
+    "to do": "pendiente",
+    "en progreso": "en_progreso",
+    "in progress": "en_progreso",
+    "doing": "en_progreso",
+    "done": "completada",
+    "hecho": "completada",
+    "completada": "completada",
+    "completado": "completada",
+}
+
+
+def _status_from_stack_title(stack_title: str | None, fallback: str) -> str:
+    """Map a Deck stack title to the mission status vocabulary.
+
+    Falls back to the supplied value when the title is unknown or unrecognized
+    (e.g. the stack id came from the replica cache).
+    """
+    if not stack_title:
+        return fallback
+    return _STACK_STATUS_MAP.get(str(stack_title).strip().lower(), fallback)
+
+
+@app.tool()
+def sync_task(mission_id: int) -> str:
+    """Recover exactly ONE mission (and its quests) from Deck (design D7).
+
+    ``sync_task`` is the explicit single-mission recovery path. It resolves the
+    mission's ``deck_task_id`` and stack internally, reads the authoritative
+    card, and refreshes only that mission's replica fields and quests. It never
+    syncs any other mission. On a successful read it backfills
+    ``missions.deck_stack_id`` so later writes skip the ``deck_get_stacks``
+    lookup (design D9).
+
+    Args:
+        mission_id: Local mission id.
+
+    Returns:
+        JSON {mission_id, deck_task_id, status, quests_synced}.
+        An unknown ``mission_id`` fails with a not-found error and modifies no
+        replica rows.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False, default=str)
+
+    stack_id, stack_title, err = _resolve_stack_for_card(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    card, err = deck_bridge.read_card(
+        board_id, stack_id, mission["deck_task_id"]
+    )
+    if card is None:
+        return json.dumps(
+            {"error": f"Cannot read Deck card: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    title = card.get("title") or mission.get("title", "")
+    description = card.get("description", "") or ""
+    quests = deck_bridge.extract_quests(description)
+    checklist_total = len(quests)
+    checklist_done = sum(1 for q in quests if q["done"])
+
+    # Derive the status from the card's Deck stack (source of truth) instead of
+    # echoing the stale replica value. When the stack id was cached its title is
+    # unknown, so the replica value is the only available fallback.
+    status = _status_from_stack_title(
+        stack_title, mission.get("status", "pendiente")
+    )
+
+    # Refresh ONLY this mission's replica fields (Deck already is the truth).
+    persistence.upsert_mission(
+        deck_task_id=mission["deck_task_id"],
+        project=mission.get("project", ""),
+        title=title,
+        description=description,
+        status=status,
+        checklist_total=checklist_total,
+        checklist_done=checklist_done,
+    )
+
+    # Backfill deck_stack_id (D9) ONLY now that the card was located, so future
+    # writes skip the stack lookup. A guessed stack is never persisted (W-g).
+    try:
+        persistence.set_mission_deck_stack_id(mission_id, stack_id)
+    except Exception as exc:
+        logger.warning("sync_task: deck_stack_id backfill failed: %s", exc)
+
+    # Reconcile the replica with Deck: drop rows whose quest was removed there
+    # (item_index >= len(parsed_quests)), then upsert the surviving set (W3).
+    try:
+        persistence.delete_checklist_items_beyond(mission_id, len(quests))
+    except Exception as exc:
+        logger.warning("sync_task: stale quest reconciliation failed: %s", exc)
+
+    # Refresh this mission's quests (upsert by item_index, like sync_tasks).
+    quests_synced = 0
+    for idx, quest in enumerate(quests):
+        persistence.upsert_checklist_item(
+            mission_id=mission_id,
+            item_index=idx,
+            text=quest["text"],
+            done=1 if quest["done"] else 0,
+        )
+        quests_synced += 1
+
+    return json.dumps(
+        {
+            "mission_id": mission_id,
+            "deck_task_id": mission["deck_task_id"],
+            "status": status,
+            "quests_synced": quests_synced,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 @app.tool()
 def sync_all() -> str:
-    """Sync Deck cards → missions for ALL mapped projects.
+    """~~DEPRECATED~~ Sync Deck cards → missions for ALL mapped projects.
 
-    Iterates all projects with deck_board_id and runs sync_tasks on each.
+    DEPRECATED — use ``sync_task(mission_id)`` for explicit single-mission
+    recovery. ``sync_all`` is kept registered and invocable for compatibility
+    (same marker pattern as ``assert_gates``); it MUST NOT be removed. It still
+    iterates all projects with a deck_board_id and runs ``sync_tasks`` on each.
 
     Returns:
         JSON with per-project sync results.
