@@ -1320,6 +1320,224 @@ def checklist_item_get(checklist_item_id: int) -> str:
     return json.dumps(compact.compact_quest(item), ensure_ascii=False, default=str)
 
 
+@app.tool()
+def begin_turn(
+    session_id: str,
+    project: str,
+    mission_id: int = 0,
+    quest_id: int = 0,
+    message: str = "",
+    sender: str = "user",
+    checklist_item_id: int = 0,
+) -> str:
+    """Begin a new turn: execute gates fresh and create an intento.
+
+    This is the first call of the consolidated 2-call turn workflow:
+      begin_turn → trabajo → end_turn
+
+    begin_turn EJECUTA INTERNAMENTE los 4 gates (1a/1b/1c/1e) de forma fresca,
+    persistiendo los resultados en gate_state y capturándolos en el intento.
+    Esto elimina la necesidad de llamar assert_gates manualmente antes del turno.
+
+    Before ANY side effect (orphan cleanup AND gate execution), begin_turn
+    resolves and validates the target quest (design D5). A quest that is already
+    ``done`` or unknown fails hard with a ``code`` and mutates nothing.
+
+    If an orphaned turn exists (active in memory but not matching this request),
+    it is auto-completed as "fail" so the new turn can proceed — this prevents
+    IRRECOVERABLE state where a crashed/blocked previous turn blocks all future turns.
+
+    Args:
+        session_id:         Active Hermes session identifier.
+        project:            Project slug (e.g. "voy-rojo").
+        mission_id:         Numeric mission ID (same as record_intento).
+        quest_id:           Numeric quest (checklist item) ID. Canonical 4th
+                            positional parameter, positionally compatible with
+                            the legacy ``checklist_item_id``.
+        message:            The user's raw message / query (used for context extraction).
+        sender:             Optional sender name (default: "user").
+        checklist_item_id:  Backward-compatible trailing alias for ``quest_id``.
+
+    Returns:
+        JSON string with intento_id, mission_id, quest_id, status, and real
+        fresh gate counts. On a done/unknown quest:
+        ``{"error", "code": "quest_done"|"missing_quest", "quest_id"}``.
+    """
+    # 0. Guard (D5): resolve/validate the target quest BEFORE any mutation.
+    #    This MUST precede the orphan cleanup and the gate execution so a done
+    #    or missing quest leaves the system with zero side effects. The guard
+    #    is REQUIRED: omitting the ids never silently bypasses it (W-a).
+    resolved_quest_id = quest_id or checklist_item_id
+    if not resolved_quest_id:
+        return json.dumps(
+            {
+                "error": "A nonzero quest_id (or legacy checklist_item_id) is required",
+                "code": "missing_quest",
+                "quest_id": 0,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not mission_id:
+        return json.dumps(
+            {
+                "error": "A nonzero mission_id is required",
+                "code": "missing_mission",
+                "mission_id": 0,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    target_quest = persistence.get_checklist_item_by_id(resolved_quest_id)
+    if target_quest is None:
+        return json.dumps(
+            {
+                "error": f"Quest {resolved_quest_id} not found",
+                "code": "missing_quest",
+                "quest_id": resolved_quest_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if isinstance(target_quest, dict) and target_quest.get("done"):
+        return json.dumps(
+            {
+                "error": f"Quest {resolved_quest_id} is already done",
+                "code": "quest_done",
+                "quest_id": resolved_quest_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # 1. Check for orphaned/active turn — auto-cleanup if needed
+    active = _get_active_intento()
+    if active is not None:
+        if active["intento_id"] != _resolve_requesting_intento(session_id, project):
+            # Orphaned turn: complete it as fail so we can proceed
+            logger.warning(
+                "Orphaned turno detected (intento #%d). Auto-completing as fail.",
+                active["intento_id"],
+            )
+            try:
+                persistence.complete_intento(
+                    intento_id=active["intento_id"],
+                    status="fail",
+                    gates_passed=0,
+                )
+            except Exception as exc:
+                logger.error("Failed to auto-complete orphaned intento #%d: %s", active["intento_id"], exc)
+            _clear_active_intento()
+
+    # 2. Ejecutar los 4 gates de forma fresca
+    context = extract_context(message, session_id, sender=sender)
+
+    # El project explícito manda sobre el extraído del topic. Se resuelve
+    # ANTES de ejecutar los gates para que 1c/1e corran contra el project
+    # correcto (no contra "unknown" cuando el message no lo menciona).
+    resolved_project = project if project else context["project"]
+    context["project"] = resolved_project
+
+    try:
+        persistence.upsert_session(
+            session_id=session_id,
+            sender=context["sender"],
+            topic=context["topic"],
+            project=context["project"],
+        )
+    except Exception as exc:
+        logger.warning("Session persistence failed (degraded): %s", exc)
+
+    try:
+        gate_results = run_triple_match(context)
+    except Exception as exc:
+        logger.warning("Gate execution failed (degraded): %s", exc)
+        gate_results = []
+
+    # 3. Agregar info de mandatory/best_effort a cada resultado (D8)
+    for r in gate_results:
+        cfg = GATE_CONFIG_MAP.get(r.name)
+        if cfg:
+            r.mandatory = cfg.mandatory
+            r.best_effort = cfg.best_effort
+
+    overall, gate_dicts = aggregate(gate_results)
+    context_envelope = build_context_envelope(gate_results)
+
+    # 4. Persistir cada gate state fresco
+    try:
+        for r in gate_results:
+            persistence.upsert_gate_state(
+                session_id=session_id,
+                project=resolved_project,
+                gate_name=r.name,
+                state=r.state,
+                mandatory=r.mandatory,
+                duration_ms=int(r.duration_ms),
+                message=r.message,
+                result_data=r.result_data,
+            )
+
+        # Solo persistir misión si es un proyecto conocido
+        if is_known_project(resolved_project):
+            gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
+            persistence.upsert_action(
+                session_id=session_id,
+                project=resolved_project,
+                gates_passed=gates_passed,
+                gates_total=len(DEFAULT_GATES),
+            )
+        else:
+            logger.info(
+                "Skipping mission persistence: project '%s' is not a known project",
+                resolved_project,
+            )
+    except Exception as exc:
+        logger.warning("Gate state persistence failed (degraded): %s", exc)
+
+    # 5. Crear intento con los gates frescos.
+    #    Persist the RESOLVED quest id (quest_id or its legacy alias) — never
+    #    the raw trailing alias, which is 0 when the caller uses quest_id.
+    #    Otherwise end_turn's _complete_quest_for_intento short-circuits and
+    #    the false→true quest transition never happens.
+    intento_id = persistence.create_intento(
+        session_id=session_id,
+        project=resolved_project,
+        mission_id=mission_id,
+        checklist_item_id=resolved_quest_id,
+    )
+
+    # 6. Persistir snapshot de gates en el intento
+    if gate_results:
+        try:
+            persistence.capture_gates_for_intento(intento_id, gate_dicts)
+        except Exception as exc:
+            logger.warning("Failed to capture gates for intento #%d: %s", intento_id, exc)
+
+    # 7. Registrar como turno activo
+    _set_active_intento(intento_id, session_id, resolved_project)
+
+    gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
+    return json.dumps(
+        {
+            "status": "started",
+            "intento_id": intento_id,
+            "mission_id": mission_id,
+            "quest_id": resolved_quest_id or None,
+            "gates_captured": len(gate_results),
+            "gates_passed_so_far": gates_passed,
+            "overall": overall,
+            "context": {
+                "sender": context["sender"],
+                "topic": context["topic"],
+                "project": resolved_project,
+            },
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
 # ── Mission / quest write tools (Deck-first, replica refresh) ──────────────
 #
 # Every write goes to Nextcloud Deck (the source of truth) through the internal
@@ -1728,225 +1946,6 @@ def quest_update(
     )
     return json.dumps(
         {"quest_id": quest_id, "title": new_text, "done": False},
-        ensure_ascii=False,
-        default=str,
-    )
-
-
-@app.tool()
-def begin_turn(
-    session_id: str,
-    project: str,
-    mission_id: int = 0,
-    quest_id: int = 0,
-    message: str = "",
-    sender: str = "user",
-    checklist_item_id: int = 0,
-) -> str:
-    """Begin a new turn: execute gates fresh and create an intento.
-
-    This is the first call of the consolidated 2-call turn workflow:
-      begin_turn → trabajo → end_turn
-
-    begin_turn EJECUTA INTERNAMENTE los 4 gates (1a/1b/1c/1e) de forma fresca,
-    persistiendo los resultados en gate_state y capturándolos en el intento.
-    Esto elimina la necesidad de llamar assert_gates manualmente antes del turno.
-
-    Before ANY side effect (orphan cleanup AND gate execution), begin_turn
-    resolves and validates the target quest (design D5). A quest that is already
-    ``done`` or unknown fails hard with a ``code`` and mutates nothing.
-
-    If an orphaned turn exists (active in memory but not matching this request),
-    it is auto-completed as "fail" so the new turn can proceed — this prevents
-    IRRECOVERABLE state where a crashed/blocked previous turn blocks all future turns.
-
-    Args:
-        session_id:         Active Hermes session identifier.
-        project:            Project slug (e.g. "voy-rojo").
-        mission_id:         Numeric mission ID (same as record_intento).
-        quest_id:           Numeric quest (checklist item) ID. Canonical 4th
-                            positional parameter, positionally compatible with
-                            the legacy ``checklist_item_id``.
-        message:            The user's raw message / query (used for context extraction).
-        sender:             Optional sender name (default: "user").
-        checklist_item_id:  Backward-compatible trailing alias for ``quest_id``.
-
-    Returns:
-        JSON string with intento_id, mission_id, quest_id, status, and real
-        fresh gate counts. On a done/unknown quest:
-        ``{"error", "code": "quest_done"|"missing_quest", "quest_id"}``.
-    """
-    # 0. Guard (D5): resolve/validate the target quest BEFORE any mutation.
-    #    This MUST precede the orphan cleanup and the gate execution so a done
-    #    or missing quest leaves the system with zero side effects. The guard
-    #    is REQUIRED: omitting the ids never silently bypasses it (W-a).
-    resolved_quest_id = quest_id or checklist_item_id
-    if not resolved_quest_id:
-        return json.dumps(
-            {
-                "error": "A nonzero quest_id (or legacy checklist_item_id) is required",
-                "code": "missing_quest",
-                "quest_id": 0,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-    if not mission_id:
-        return json.dumps(
-            {
-                "error": "A nonzero mission_id is required",
-                "code": "missing_mission",
-                "mission_id": 0,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-
-    target_quest = persistence.get_checklist_item_by_id(resolved_quest_id)
-    if target_quest is None:
-        return json.dumps(
-            {
-                "error": f"Quest {resolved_quest_id} not found",
-                "code": "missing_quest",
-                "quest_id": resolved_quest_id,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-    if isinstance(target_quest, dict) and target_quest.get("done"):
-        return json.dumps(
-            {
-                "error": f"Quest {resolved_quest_id} is already done",
-                "code": "quest_done",
-                "quest_id": resolved_quest_id,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-
-    # 1. Check for orphaned/active turn — auto-cleanup if needed
-    active = _get_active_intento()
-    if active is not None:
-        if active["intento_id"] != _resolve_requesting_intento(session_id, project):
-            # Orphaned turn: complete it as fail so we can proceed
-            logger.warning(
-                "Orphaned turno detected (intento #%d). Auto-completing as fail.",
-                active["intento_id"],
-            )
-            try:
-                persistence.complete_intento(
-                    intento_id=active["intento_id"],
-                    status="fail",
-                    gates_passed=0,
-                )
-            except Exception as exc:
-                logger.error("Failed to auto-complete orphaned intento #%d: %s", active["intento_id"], exc)
-            _clear_active_intento()
-
-    # 2. Ejecutar los 4 gates de forma fresca
-    context = extract_context(message, session_id, sender=sender)
-
-    # El project explícito manda sobre el extraído del topic. Se resuelve
-    # ANTES de ejecutar los gates para que 1c/1e corran contra el project
-    # correcto (no contra "unknown" cuando el message no lo menciona).
-    resolved_project = project if project else context["project"]
-    context["project"] = resolved_project
-
-    try:
-        persistence.upsert_session(
-            session_id=session_id,
-            sender=context["sender"],
-            topic=context["topic"],
-            project=context["project"],
-        )
-    except Exception as exc:
-        logger.warning("Session persistence failed (degraded): %s", exc)
-
-    try:
-        gate_results = run_triple_match(context)
-    except Exception as exc:
-        logger.warning("Gate execution failed (degraded): %s", exc)
-        gate_results = []
-
-    # 3. Agregar info de mandatory/best_effort a cada resultado (D8)
-    for r in gate_results:
-        cfg = GATE_CONFIG_MAP.get(r.name)
-        if cfg:
-            r.mandatory = cfg.mandatory
-            r.best_effort = cfg.best_effort
-
-    overall, gate_dicts = aggregate(gate_results)
-    context_envelope = build_context_envelope(gate_results)
-
-    # 4. Persistir cada gate state fresco
-    try:
-        for r in gate_results:
-            persistence.upsert_gate_state(
-                session_id=session_id,
-                project=resolved_project,
-                gate_name=r.name,
-                state=r.state,
-                mandatory=r.mandatory,
-                duration_ms=int(r.duration_ms),
-                message=r.message,
-                result_data=r.result_data,
-            )
-
-        # Solo persistir misión si es un proyecto conocido
-        if is_known_project(resolved_project):
-            gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
-            persistence.upsert_action(
-                session_id=session_id,
-                project=resolved_project,
-                gates_passed=gates_passed,
-                gates_total=len(DEFAULT_GATES),
-            )
-        else:
-            logger.info(
-                "Skipping mission persistence: project '%s' is not a known project",
-                resolved_project,
-            )
-    except Exception as exc:
-        logger.warning("Gate state persistence failed (degraded): %s", exc)
-
-    # 5. Crear intento con los gates frescos.
-    #    Persist the RESOLVED quest id (quest_id or its legacy alias) — never
-    #    the raw trailing alias, which is 0 when the caller uses quest_id.
-    #    Otherwise end_turn's _complete_quest_for_intento short-circuits and
-    #    the false→true quest transition never happens.
-    intento_id = persistence.create_intento(
-        session_id=session_id,
-        project=resolved_project,
-        mission_id=mission_id,
-        checklist_item_id=resolved_quest_id,
-    )
-
-    # 6. Persistir snapshot de gates en el intento
-    if gate_results:
-        try:
-            persistence.capture_gates_for_intento(intento_id, gate_dicts)
-        except Exception as exc:
-            logger.warning("Failed to capture gates for intento #%d: %s", intento_id, exc)
-
-    # 7. Registrar como turno activo
-    _set_active_intento(intento_id, session_id, resolved_project)
-
-    gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
-    return json.dumps(
-        {
-            "status": "started",
-            "intento_id": intento_id,
-            "mission_id": mission_id,
-            "quest_id": resolved_quest_id or None,
-            "gates_captured": len(gate_results),
-            "gates_passed_so_far": gates_passed,
-            "overall": overall,
-            "context": {
-                "sender": context["sender"],
-                "topic": context["topic"],
-                "project": resolved_project,
-            },
-        },
         ensure_ascii=False,
         default=str,
     )
