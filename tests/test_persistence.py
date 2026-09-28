@@ -42,6 +42,15 @@ class TestSchema:
             assert "checkpoints" in names
             assert "missions" in names
 
+    def test_fresh_missions_has_deck_stack_id(self, db):
+        """Fresh-DB DDL includes the v5 deck_stack_id column (WU1, D9)."""
+        with db._conn() as conn:
+            cols = {
+                c[1]
+                for c in conn.execute("PRAGMA table_info(missions)").fetchall()
+            }
+            assert "deck_stack_id" in cols
+
 
 class TestSessions:
     def test_upsert_session(self, db):
@@ -231,7 +240,7 @@ class TestGatesDetail:
     """Tests for gates_detail column (v3 schema)."""
 
     def test_schema_version_v4(self, db):
-        """Verify DB initializes at v4 with session_turns table."""
+        """Verify DB initializes at the current schema version."""
         from ultratimonel.persistence import SCHEMA_VERSION
         with db._conn() as conn:
             row = conn.execute(
@@ -300,7 +309,7 @@ class TestChecklistItemById:
 
 class TestDbMigrationV2ToV4:
     def test_migration_v2_to_v4(self):
-        """Simulate migration from v2 to v4 (skipping v3)."""
+        """Simulate migration from v2 up to the current schema version."""
         import tempfile, os
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -318,13 +327,13 @@ class TestDbMigrationV2ToV4:
                     pass  # Column might not exist yet in minimal v2
             p2.close()
 
-            # Reopen — should auto-migrate to v4 (skipping v3)
+            # Reopen — should auto-migrate to the current version
             p4 = Persistence(db_path=db_path)
             with p4._conn() as conn:
                 row = conn.execute(
                     "SELECT MAX(version) FROM schema_version"
                 ).fetchone()
-                assert row[0] == 4  # Should be at v4
+                assert row[0] == SCHEMA_VERSION
 
                 # session_turns table should exist (v4 feature)
                 cols = conn.execute("PRAGMA table_info(session_turns)").fetchall()
@@ -359,7 +368,7 @@ class TestTurnCount:
 
 class TestDbMigrationV3ToV4:
     def test_migration_v3_to_v4(self):
-        """Simulate migration from v3 to v4."""
+        """Simulate migration from v3 up to the current schema version."""
         import os
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -372,14 +381,14 @@ class TestDbMigrationV3ToV4:
                 )
             p.close()
 
-            # Reopen — should auto-migrate to v4
+            # Reopen — should auto-migrate to the current version
             p2 = Persistence(db_path=db_path)
             try:
                 with p2._conn() as conn:
                     row = conn.execute(
                         "SELECT MAX(version) FROM schema_version"
                     ).fetchone()
-                    assert row[0] == 4
+                    assert row[0] == SCHEMA_VERSION
 
                     # Table should exist
                     cols = conn.execute("PRAGMA table_info(session_turns)").fetchall()
@@ -391,3 +400,119 @@ class TestDbMigrationV3ToV4:
         finally:
             if os.path.exists(db_path):
                 os.unlink(db_path)
+
+
+class TestDbMigrationV4ToV5:
+    """WU1: the v4→v5 migration is additive and lossless (D9, NF-GP-05)."""
+
+    def test_migration_v4_to_v5_adds_deck_stack_id_without_data_loss(self):
+        import sqlite3
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            # Build a genuine v4 database with only the tables the migration
+            # touches, populated before the upgrade.
+            raw = sqlite3.connect(db_path)
+            raw.executescript(
+                """
+                CREATE TABLE schema_version (
+                    version     INTEGER PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE missions (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    deck_task_id    INTEGER UNIQUE,
+                    project         TEXT NOT NULL,
+                    title           TEXT NOT NULL,
+                    description     TEXT DEFAULT '',
+                    status          TEXT NOT NULL DEFAULT 'pendiente',
+                    checklist_total INTEGER NOT NULL DEFAULT 0,
+                    checklist_done  INTEGER NOT NULL DEFAULT 0,
+                    last_sync       TEXT,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO schema_version (version, description)
+                VALUES (4, 'v4: session_turns table for persistent turn counting');
+                INSERT INTO missions (deck_task_id, project, title, status)
+                VALUES (42, 'ultratimonel', 'Existing mission', 'en_progreso');
+                """
+            )
+            raw.commit()
+            raw.close()
+
+            # Reopen: Persistence must run the v4→v5 migration.
+            p = Persistence(db_path=db_path)
+            try:
+                with p._conn() as conn:
+                    version = conn.execute(
+                        "SELECT MAX(version) FROM schema_version"
+                    ).fetchone()[0]
+                    assert version == SCHEMA_VERSION
+
+                    cols = {
+                        c[1]
+                        for c in conn.execute(
+                            "PRAGMA table_info(missions)"
+                        ).fetchall()
+                    }
+                    assert "deck_stack_id" in cols
+
+                # The pre-existing row survives untouched; the new column is NULL.
+                mission = p.get_mission(1)
+                assert mission is not None
+                assert mission["deck_task_id"] == 42
+                assert mission["project"] == "ultratimonel"
+                assert mission["title"] == "Existing mission"
+                assert mission["status"] == "en_progreso"
+                assert mission["deck_stack_id"] is None
+            finally:
+                p.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                if os.path.exists(db_path + suffix):
+                    os.unlink(db_path + suffix)
+
+
+class TestQuestHelpers:
+    """WU1 helpers: set_quest_done + get_mission_by_deck_task."""
+
+    def test_set_quest_done_updates_flag(self, db):
+        mid = db.upsert_mission(deck_task_id=7, project="p", title="T")
+        qid = db.upsert_checklist_item(mid, item_index=0, text="Q", done=0)
+        assert db.set_quest_done(qid, True) is True
+        assert db.get_checklist_item_by_id(qid)["done"] == 1
+        assert db.set_quest_done(qid, False) is True
+        assert db.get_checklist_item_by_id(qid)["done"] == 0
+
+    def test_set_quest_done_missing_returns_false(self, db):
+        assert db.set_quest_done(99999, True) is False
+
+    def test_get_mission_by_deck_task(self, db):
+        mid = db.upsert_mission(deck_task_id=55, project="p", title="T")
+        mission = db.get_mission_by_deck_task(55)
+        assert mission is not None
+        assert mission["id"] == mid
+        assert mission["deck_task_id"] == 55
+
+    def test_get_mission_by_deck_task_missing(self, db):
+        assert db.get_mission_by_deck_task(12345) is None
+
+    def test_delete_checklist_items_beyond_keeps_prefix(self, db):
+        """W3: only rows with item_index >= keep_count are removed."""
+        mid = db.upsert_mission(deck_task_id=77, project="p", title="T")
+        for idx in range(3):
+            db.upsert_checklist_item(mid, item_index=idx, text=f"Q{idx}", done=0)
+
+        deleted = db.delete_checklist_items_beyond(mid, 1)
+
+        assert deleted == 2
+        remaining = db.list_checklist_items(mid)
+        assert [(q["item_index"], q["text"]) for q in remaining] == [(0, "Q0")]
+
+    def test_delete_checklist_items_beyond_no_rows(self, db):
+        mid = db.upsert_mission(deck_task_id=78, project="p", title="T")
+        db.upsert_checklist_item(mid, item_index=0, text="Q0", done=0)
+        assert db.delete_checklist_items_beyond(mid, 5) == 0
+        assert len(db.list_checklist_items(mid)) == 1

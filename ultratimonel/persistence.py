@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 4
-SCHEMA_DESCRIPTION = "v4: session_turns table for persistent turn counting"
+SCHEMA_VERSION = 5
+SCHEMA_DESCRIPTION = "v5: missions.deck_stack_id for deterministic Deck stack writes"
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -113,6 +113,7 @@ DDL_V2 = [
     """CREATE TABLE IF NOT EXISTS missions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         deck_task_id    INTEGER UNIQUE,
+        deck_stack_id   INTEGER,
         project         TEXT NOT NULL,
         title           TEXT NOT NULL,
         description     TEXT DEFAULT '',
@@ -176,13 +177,32 @@ def _migrate_v3_to_v4(conn) -> None:
     """Migrate from v3 schema to v4 (add session_turns table)."""
     # Create the session_turns table
     conn.execute(DDL_SESSION_TURNS[0])
-    
-    # Update schema version
+
+    # Record the target version explicitly so the migration chain stays
+    # correct when SCHEMA_VERSION is bumped again (v4→v5 and beyond).
+    conn.execute(
+        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+        (4, "v4: session_turns table for persistent turn counting"),
+    )
+    logger.info("Migrated DB v3→v4: added session_turns table")
+
+
+def _migrate_v4_to_v5(conn) -> None:
+    """Migrate from v4 schema to v5 (add missions.deck_stack_id).
+
+    Additive only (NF-GP-05): a nullable column, no data rewrite, no
+    destructive DDL. Older server code fails safe by ignoring the unknown
+    version (SCHEMA_AHEAD contract in the gate-persistence spec).
+    """
+    try:
+        conn.execute("ALTER TABLE missions ADD COLUMN deck_stack_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists (idempotent)
     conn.execute(
         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
     )
-    logger.info("Migrated DB v3→v4: added session_turns table")
+    logger.info("Migrated DB v4→v5: added missions.deck_stack_id")
 
 
 def _is_v1_style_missions_table(conn) -> bool:
@@ -241,6 +261,7 @@ def _migrate_v1_to_v2(conn) -> None:
     conn.execute("""CREATE TABLE IF NOT EXISTS missions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         deck_task_id    INTEGER UNIQUE,
+        deck_stack_id   INTEGER,
         project         TEXT NOT NULL,
         title           TEXT NOT NULL,
         description     TEXT DEFAULT '',
@@ -382,7 +403,7 @@ class Persistence:
                 current_ver = cur.fetchone()[0]
 
                 if current_ver == 0:
-                    # Fresh DB — apply v2 DDL then add v3+v4 columns
+                    # Fresh DB — apply v2 DDL then add v3/v4/v5 additions
                     for stmt in DDL_V2:
                         try:
                             conn.execute(stmt)
@@ -402,7 +423,7 @@ class Persistence:
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
-                    logger.info("Fresh DB initialized at schema v4: %s", self._db_path)
+                    logger.info("Fresh DB initialized at schema v5: %s", self._db_path)
                 elif current_ver == 1:
                     # Migration v1 → v2
                     _migrate_v1_to_v2(conn)
@@ -420,15 +441,27 @@ class Persistence:
                         logger.info("Migrated DB v2→v3: added gates_detail to intentos")
                     except sqlite3.OperationalError:
                         pass  # column already exists (idempotent)
+                    # Migration v4 → v5: add missions.deck_stack_id (idempotent)
+                    try:
+                        conn.execute(
+                            "ALTER TABLE missions ADD COLUMN deck_stack_id INTEGER"
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # column already exists (idempotent)
                     conn.execute(
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
                     logger.info("Migrated DB v2→v3: %s", self._db_path)
                 elif current_ver == 3:
-                    # Migration v3 → v4: add session_turns table
+                    # Migration v3 → v4 → v5: session_turns table + deck_stack_id
                     _migrate_v3_to_v4(conn)
-                    logger.info("Migrated DB v3→v4: %s", self._db_path)
+                    _migrate_v4_to_v5(conn)
+                    logger.info("Migrated DB v3→v5: %s", self._db_path)
+                elif current_ver == 4:
+                    # Migration v4 → v5: add missions.deck_stack_id
+                    _migrate_v4_to_v5(conn)
+                    logger.info("Migrated DB v4→v5: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
                     # Already current — ensure all tables exist
                     for stmt in DDL_V2:
@@ -442,6 +475,11 @@ class Persistence:
                     # Ensure v3 column exists (idempotent)
                     try:
                         conn.execute("ALTER TABLE intentos ADD COLUMN gates_detail TEXT")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists
+                    # Ensure v5 column exists (idempotent, additive)
+                    try:
+                        conn.execute("ALTER TABLE missions ADD COLUMN deck_stack_id INTEGER")
                     except sqlite3.OperationalError:
                         pass  # column already exists
                     logger.debug("DB schema up to date (v%s)", SCHEMA_VERSION)
@@ -746,6 +784,30 @@ class Persistence:
                 ).fetchone()
                 return dict(row) if row else None
 
+    def get_mission_by_deck_task(self, deck_task_id: int) -> Optional[dict]:
+        """Look up a mission by its Deck task id. Returns None if not found."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM missions WHERE deck_task_id = ?",
+                    (deck_task_id,),
+                ).fetchone()
+                return dict(row) if row else None
+
+    def set_mission_deck_stack_id(self, mission_id: int, deck_stack_id: int) -> bool:
+        """Backfill a mission's replicated Deck stack id. Returns True if found.
+
+        Replica field only; Deck remains the source of truth. Used by
+        ``sync_task`` so later writes skip the ``deck_get_stacks`` lookup (D9).
+        """
+        with self._lock:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE missions SET deck_stack_id = ? WHERE id = ?",
+                    (deck_stack_id, mission_id),
+                )
+                return cursor.rowcount > 0
+
     def list_missions(self, project: str) -> list[dict]:
         """List missions for a project."""
         with self._lock:
@@ -842,6 +904,36 @@ class Persistence:
                     (checklist_item_id,),
                 ).fetchone()
                 return dict(row) if row else None
+
+    def set_quest_done(self, quest_id: int, done: bool) -> bool:
+        """Set a quest's (checklist item) done flag. Returns True if found.
+
+        The replica flag only; Deck is updated by the caller through the
+        bridge. Returns False when no checklist item matches ``quest_id``.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE checklist_items SET done = ? WHERE id = ?",
+                    (1 if done else 0, quest_id),
+                )
+                return cursor.rowcount > 0
+
+    def delete_checklist_items_beyond(self, mission_id: int, keep_count: int) -> int:
+        """Delete replica checklist items whose ``item_index`` >= ``keep_count``.
+
+        Used by ``sync_task`` to reconcile the replica after quests were removed
+        on Deck (the source of truth): the surviving set is ``[0, keep_count)``.
+        Returns the number of rows deleted.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM checklist_items"
+                    " WHERE mission_id = ? AND item_index >= ?",
+                    (mission_id, keep_count),
+                )
+                return cursor.rowcount
 
     # ── intentos ────────────────────────────────────────────────────────
 
