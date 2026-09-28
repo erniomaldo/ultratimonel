@@ -243,3 +243,176 @@ def read_card(
     return _read_card(board_id, stack_id, card_id)
 
 
+def create_card(
+    board_id: int,
+    stack_id: int,
+    title: str,
+    description: str = "",
+) -> tuple[Optional[int], Optional[str]]:
+    """Create a Deck card in ``stack_id``. Returns ``(card_id, err)``."""
+    result, err = _deck_call(
+        "deck_create_card",
+        {
+            "board_id": board_id,
+            "stack_id": stack_id,
+            "title": title,
+            "description": description,
+        },
+    )
+    if result is None:
+        return None, err or "unavailable"
+    card_id = _extract_card_id(result)
+    if card_id is None:
+        return None, "unexpected Deck response shape"
+    return card_id, None
+
+
+def update_title(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    title: str,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Update a card's title while preserving its description byte-identically."""
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, err
+    description = card.get("description", "") or ""
+    return _write_card(board_id, stack_id, card_id, title, description)
+
+
+def update_description(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    prose: str,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Update a card's prose without touching its quests (D3).
+
+    Every checkbox line in the current description is preserved
+    byte-identically and in its original relative order. Checkbox lines in the
+    incoming ``prose`` are omitted so prose cannot introduce a quest.
+    """
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, err
+
+    title = card.get("title", "") or ""
+    current = card.get("description", "") or ""
+    original_lines = current.split("\n")
+    preserved = [
+        original_lines[q["line_no"]] for q in extract_quests(current)
+    ]
+
+    cleaned = clean_prose(prose)
+
+    if preserved:
+        quest_block = "\n".join(preserved)
+        new_description = f"{cleaned}\n\n{quest_block}" if cleaned else quest_block
+    else:
+        new_description = cleaned
+
+    return _write_card(board_id, stack_id, card_id, title, new_description)
+
+
+def append_quest(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    text: str,
+) -> tuple[Optional[int], Optional[str]]:
+    """Append ``- [ ] text`` to the card. Returns ``(position, err)``.
+
+    ``position`` is the 0-based index of the new quest among the card's
+    quests. The quest is written with ``done=false``. Multi-line ``text`` is
+    rejected (``quest_text_multiline``) so it cannot compose extra checkboxes.
+    """
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, err
+
+    clean = _single_line_quest_text(text)
+    if clean is None:
+        return None, "quest_text_multiline"
+
+    title = card.get("title", "") or ""
+    current = card.get("description", "") or ""
+    position = len(extract_quests(current))
+    new_line = f"- [ ] {clean}"
+
+    if current.strip():
+        new_description = current.rstrip("\n") + "\n" + new_line
+    else:
+        new_description = new_line
+
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return position, None
+
+
+def update_quest(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    position: int,
+    text: str,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Surgically rewrite one quest line, keeping ``done=false``.
+
+    Only the targeted quest line changes; every other line stays
+    byte-identical. Multi-line ``text`` is rejected
+    (``quest_text_multiline``) so it cannot compose extra checkboxes.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    clean = _single_line_quest_text(text)
+    if clean is None:
+        return None, "quest_text_multiline"
+
+    if position < 0 or position >= len(quests):
+        return None, "quest_position_out_of_range"
+
+    target = quests[position]
+    raw = lines[target["line_no"]]
+    bullet = "*" if raw.strip().startswith("*") else "-"
+    lines[target["line_no"]] = f"{bullet} [ ] {clean}"
+    return _write_card(board_id, stack_id, card_id, title, "\n".join(lines))
+
+
+def complete_quest(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    position: int,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Flip ``- [ ]`` to ``- [x]`` at exactly one quest position.
+
+    Only the targeted quest line changes; every other line stays
+    byte-identical.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    if position < 0 or position >= len(quests):
+        return None, "quest_position_out_of_range"
+
+    line_no = quests[position]["line_no"]
+    lines[line_no] = re.sub(r"\[ \]", "[x]", lines[line_no], count=1)
+    return _write_card(board_id, stack_id, card_id, title, "\n".join(lines))
+
+
+def _read_lines_and_quests(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+) -> tuple[Optional[str], Optional[list[str]], list[dict[str, Any]], Optional[str]]:
+    """Read a card and return ``(title, raw_lines, parsed_quests, err)``."""
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, None, [], err
+    current = card.get("description", "") or ""
+    return card.get("title", "") or "", current.split("\n"), extract_quests(current), None

@@ -107,6 +107,185 @@ class TestCleanProse:
         assert deck_bridge.clean_prose(prose) == "Antes\nDespues"
 
 
+class TestCreateCard:
+    def test_returns_card_id(self, fake_mcp):
+        fake_mcp.responses["deck_create_card"] = ({"id": 99}, None)
+        card_id, err = deck_bridge.create_card(21, 111, "New mission", "desc")
+        assert card_id == 99
+        assert err is None
+        call = fake_mcp.calls_for("deck_create_card")[0]
+        assert call["server_name"] == "nextcloud"
+        assert call["params"] == {
+            "board_id": 21,
+            "stack_id": 111,
+            "title": "New mission",
+            "description": "desc",
+        }
+
+
+class TestUpdateTitle:
+    def test_preserves_description(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "Old", "description": "- [ ] keep me"},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+        ok, err = deck_bridge.update_title(21, 111, 42, "New")
+        assert ok is True
+        assert err is None
+
+        update = fake_mcp.calls_for("deck_update_card")[0]
+        assert update["params"]["title"] == "New"
+        assert update["params"]["description"] == "- [ ] keep me"
+
+
+class TestUpdateDescription:
+    def _prime(self, fake_mcp, current_description):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "Mission", "description": current_description},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+    def test_preserves_quests_byte_identical_and_in_order(self, fake_mcp):
+        current = "Old prose\n\n- [ ] alpha\n- [x] beta\n* [ ] gamma"
+        self._prime(fake_mcp, current)
+
+        ok, err = deck_bridge.update_description(21, 111, 42, "New prose")
+        assert ok is True
+        assert err is None
+
+        params = fake_mcp.calls_for("deck_update_card")[0]["params"]
+        new_description = params["description"]
+        assert params["title"] == "Mission"
+        # byte-identical, original relative order
+        assert "- [ ] alpha\n- [x] beta\n* [ ] gamma" in new_description
+        assert "New prose" in new_description
+        assert "Old prose" not in new_description
+
+    def test_incoming_prose_cannot_introduce_a_quest(self, fake_mcp):
+        current = "- [ ] alpha"
+        self._prime(fake_mcp, current)
+
+        ok, err = deck_bridge.update_description(
+            21, 111, 42, "New prose\n- [ ] sneaky\n* [x] also sneaky"
+        )
+        assert ok is True
+        assert err is None
+
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert "- [ ] sneaky" not in new_description
+        assert "* [x] also sneaky" not in new_description
+        assert deck_bridge.extract_quests(new_description) == [
+            {"line_no": 2, "done": False, "text": "alpha"}
+        ]
+
+    def test_no_quests_writes_clean_prose(self, fake_mcp):
+        self._prime(fake_mcp, "just prose")
+        ok, err = deck_bridge.update_description(21, 111, 42, "Only prose")
+        assert ok is True
+        assert err is None
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert new_description == "Only prose"
+
+
+class TestAppendQuest:
+    def test_returns_position_and_appends_line(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "M", "description": "- [ ] one\n- [x] two"},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+        position, err = deck_bridge.append_quest(21, 111, 42, "three")
+        assert position == 2
+        assert err is None
+
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert new_description == "- [ ] one\n- [x] two\n- [ ] three"
+
+    def test_appends_to_empty_description(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "M", "description": ""},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+        position, err = deck_bridge.append_quest(21, 111, 42, "first")
+        assert position == 0
+        assert err is None
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert new_description == "- [ ] first"
+
+
+class TestUpdateQuest:
+    def test_surgical_edit_keeps_done_false(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "M", "description": "- [ ] one\n- [x] two\n- [ ] three"},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+        ok, err = deck_bridge.update_quest(21, 111, 42, 1, "TWO")
+        assert ok is True
+        assert err is None
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert new_description == "- [ ] one\n- [ ] TWO\n- [ ] three"
+
+    def test_out_of_range_position_errors(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "M", "description": "- [ ] one"},
+            None,
+        )
+        ok, err = deck_bridge.update_quest(21, 111, 42, 5, "nope")
+        assert ok is None
+        assert err == "quest_position_out_of_range"
+        assert fake_mcp.calls_for("deck_update_card") == []
+
+
+class TestCompleteQuest:
+    def test_flips_only_target_position(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "M", "description": "- [ ] alpha\n- [ ] beta\n- [ ] gamma"},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+        ok, err = deck_bridge.complete_quest(21, 111, 42, 1)
+        assert ok is True
+        assert err is None
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert new_description == "- [ ] alpha\n- [x] beta\n- [ ] gamma"
+
+    def test_preserves_star_bullet(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "M", "description": "* [ ] alpha\n* [ ] beta"},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 42}, None)
+
+        ok, err = deck_bridge.complete_quest(21, 111, 42, 1)
+        assert ok is True
+        assert err is None
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert new_description == "* [ ] alpha\n* [x] beta"
+
+
 class TestQuestTextSingleLine:
     """W-d: quest text can never compose an extra checkbox line."""
 
@@ -146,3 +325,34 @@ class TestQuestTextSingleLine:
         assert fake_mcp.calls_for("deck_update_card") == []
 
 
+class TestBridgeUnavailable:
+    """A dead bridge must fail loudly and never touch local persistence."""
+
+    def test_read_failure_returns_error(self, fake_mcp):
+        card, err = deck_bridge.create_card(21, 111, "t")
+        assert card is None
+        assert err == "unavailable"
+
+    def test_update_description_failure_returns_error(self, fake_mcp):
+        ok, err = deck_bridge.update_description(21, 111, 42, "prose")
+        assert ok is None
+        assert err == "unavailable"
+        assert fake_mcp.calls_for("deck_update_card") == []
+
+    def test_all_operations_fail_without_local_write(self, fake_mcp, monkeypatch):
+        calls = [
+            lambda: deck_bridge.create_card(21, 111, "t"),
+            lambda: deck_bridge.update_title(21, 111, 42, "t"),
+            lambda: deck_bridge.update_description(21, 111, 42, "prose"),
+            lambda: deck_bridge.append_quest(21, 111, 42, "q"),
+            lambda: deck_bridge.update_quest(21, 111, 42, 0, "q"),
+            lambda: deck_bridge.complete_quest(21, 111, 42, 0),
+        ]
+        for call in calls:
+            value, err = call()
+            assert value is None
+            assert err is not None
+
+    def test_bridge_does_not_reference_persistence(self):
+        """The bridge has no local-persistence dependency at all."""
+        assert not hasattr(deck_bridge, "persistence")
