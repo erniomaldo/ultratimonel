@@ -1420,3 +1420,440 @@ class TestCardUpdateDescription:
         payload = update_calls[0][2]
         assert payload["title"] == "Titulo original"
         assert payload["description"] == "nueva descripcion"
+
+
+# ── WU3: mission/quest write tools (Deck-first, replica refresh) ───────────
+
+
+class FakeDeck:
+    """Records Deck calls and serves canned responses keyed by tool name."""
+
+    def __init__(self):
+        self.calls = []
+        self.responses = {}
+
+    def __call__(self, server_name, tool_name, params=None, timeout=8.0):
+        self.calls.append((tool_name, dict(params or {})))
+        return self.responses.get(tool_name, (None, "unavailable"))
+
+    def calls_for(self, tool_name):
+        return [c for c in self.calls if c[0] == tool_name]
+
+
+def _write_tool_names():
+    """Enumerate the registered MCP tool surface (synchronous helper)."""
+    import asyncio
+
+    from ultratimonel.server import app
+
+    tools = asyncio.run(app.list_tools())
+    return {t.name for t in tools}
+
+
+class TestWriteToolSurface:
+    """Req: the 5 deterministic write tools exist and no mark-complete tool does."""
+
+    def test_deterministic_write_tools_registered(self):
+        names = _write_tool_names()
+        expected = {
+            "mission_create",
+            "mission_update_title",
+            "mission_update_description",
+            "quest_add",
+            "quest_update",
+        }
+        assert expected <= names
+
+    def test_no_mark_complete_tool_exists(self):
+        import re
+
+        names = _write_tool_names()
+        pattern = re.compile(
+            r"(complete|mark|finish|done).*quest|quest.*(complete|mark|finish|done)",
+            re.IGNORECASE,
+        )
+        offenders = sorted(n for n in names if pattern.search(n))
+        assert offenders == []
+
+
+class TestMissionCreate:
+    """mission_create writes Deck first, then refreshes the replica; no quests."""
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_deck_before_replica_and_no_quests(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_create
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+
+        responses = {
+            "deck_get_stacks": ([{"id": 111, "title": "Backlog"}], None),
+            "deck_create_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 7
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_side_effect
+
+        result = json.loads(mission_create("testproj", "Launch", "prose"))
+
+        assert result == {
+            "mission_id": 7,
+            "deck_task_id": 189,
+            "title": "Launch",
+            "status": "pendiente",
+        }
+        assert ("deck", "deck_create_card") in events
+        assert events.index(("deck", "deck_create_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_bridge_failure_makes_no_replica_write(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_create
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_call.side_effect = lambda *a, **k: (None, "unavailable")
+
+        result = json.loads(mission_create("testproj", "Launch"))
+
+        assert "error" in result
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_description_checkbox_lines_are_omitted(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """FIX: description checkbox lines never become quests (D2/D9, Req 1)."""
+        from ultratimonel.server import mission_create
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        responses = {
+            "deck_get_stacks": ([{"id": 111, "title": "Backlog"}], None),
+            "deck_create_card": ({"id": 189}, None),
+        }
+        mock_call.side_effect = (
+            lambda server_name, tool_name, params=None, timeout=8.0: responses.get(
+                tool_name, (None, "unavailable")
+            )
+        )
+        mock_persist.upsert_mission.return_value = 7
+
+        result = json.loads(
+            mission_create(
+                "testproj",
+                "Launch",
+                "Line one\n- [ ] injected quest\n- [x] done quest\nLine two",
+            )
+        )
+
+        assert "error" not in result
+        create_params = next(
+            c.args[2]
+            for c in mock_call.call_args_list
+            if c.args[1] == "deck_create_card"
+        )
+        assert "- [" not in create_params["description"]
+        assert create_params["description"] == "Line one\nLine two"
+        # The replica mirrors the sanitized Deck description.
+        assert (
+            mock_persist.upsert_mission.call_args.kwargs["description"]
+            == "Line one\nLine two"
+        )
+
+
+class TestMissionUpdateTitle:
+    """mission_update_title: not-found short-circuit and Deck-first ordering."""
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_unknown_mission_skips_deck(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import mission_update_title
+
+        mock_persist.get_mission.return_value = None
+
+        result = json.loads(mission_update_title(9999, "New"))
+
+        assert "error" in result
+        assert "9999" in result["error"]
+        mock_call.assert_not_called()
+        mock_maps.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_deck_before_replica_and_preserves_description(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_update_title
+
+        events = []
+        current_desc = "prose\n\n- [ ] alpha"
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Old",
+            "description": current_desc,
+            "status": "pendiente",
+            "checklist_total": 1,
+            "checklist_done": 0,
+        }
+        responses = {
+            "deck_get_card": (
+                {"title": "Old", "description": current_desc},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 5
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_side_effect
+
+        result = json.loads(mission_update_title(5, "New"))
+
+        assert result == {"mission_id": 5, "title": "New", "status": "pendiente"}
+        # deck_stack_id was replicated: no extra stack lookup
+        assert ("deck", "deck_get_stacks") not in events
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+        # description passed through the bridge is the live card description
+        update_params = mock_call.call_args_list[-1].args[2]
+        assert update_params["title"] == "New"
+        assert update_params["description"] == current_desc
+
+
+class TestMissionUpdateDescription:
+    """mission_update_description never touches quests (D3)."""
+
+    _ORIGINAL = "Old prose\n\n- [ ] alpha\n- [x] beta"
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_unknown_mission_skips_deck(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import mission_update_description
+
+        mock_persist.get_mission.return_value = None
+
+        result = json.loads(mission_update_description(9999, "prose"))
+
+        assert "error" in result
+        mock_call.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_preserves_quests_byte_identical_and_deck_first(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_update_description
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Mission",
+            "description": self._ORIGINAL,
+            "status": "pendiente",
+            "checklist_total": 2,
+            "checklist_done": 1,
+        }
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission", "description": self._ORIGINAL},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 5
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_side_effect
+
+        result = json.loads(
+            mission_update_description(5, "New prose\n- [ ] sneaky")
+        )
+
+        assert result == {"mission_id": 5, "status": "ok"}
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+
+        update_params = mock_call.call_args_list[-1].args[2]
+        new_desc = update_params["description"]
+        # quest lines byte-identical, original order
+        assert "- [ ] alpha\n- [x] beta" in new_desc
+        # incoming prose cannot introduce a quest
+        assert "- [ ] sneaky" not in new_desc
+        assert "Old prose" not in new_desc
+        assert "New prose" in new_desc
+        # quest rows themselves are untouched by a description edit
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+
+class TestQuestWriteTools:
+    """quest_add / quest_update are Deck-first and always set done=false."""
+
+    _MISSION = {
+        "id": 5,
+        "deck_task_id": 189,
+        "deck_stack_id": 111,
+        "project": "testproj",
+        "title": "Mission",
+        "description": "- [ ] one",
+        "status": "pendiente",
+        "checklist_total": 1,
+        "checklist_done": 0,
+    }
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_quest_add_deck_first_done_false(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import quest_add
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = dict(self._MISSION)
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission", "description": "- [ ] one"},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_checklist_item"))
+            return 77
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_checklist_item.side_effect = upsert_side_effect
+
+        result = json.loads(quest_add(5, "two"))
+
+        assert result == {
+            "quest_id": 77,
+            "mission_id": 5,
+            "title": "two",
+            "done": False,
+        }
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_checklist_item")
+        )
+        # Deck line appended with done=false
+        update_params = mock_call.call_args_list[-1].args[2]
+        assert update_params["description"] == "- [ ] one\n- [ ] two"
+        # replica row written with done=0
+        assert mock_persist.upsert_checklist_item.call_args.kwargs["done"] == 0
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_quest_update_resets_done_false(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import quest_update
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_checklist_item_by_id.return_value = {
+            "id": 77,
+            "mission_id": 5,
+            "item_index": 0,
+            "text": "old",
+            "done": 1,
+        }
+        mock_persist.get_mission.return_value = dict(self._MISSION)
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission", "description": "- [x] old"},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_checklist_item"))
+            return 77
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_checklist_item.side_effect = upsert_side_effect
+
+        result = json.loads(quest_update(77, title="new"))
+
+        assert result == {"quest_id": 77, "title": "new", "done": False}
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_checklist_item")
+        )
+        update_params = mock_call.call_args_list[-1].args[2]
+        assert update_params["description"] == "- [ ] new"
+        assert mock_persist.upsert_checklist_item.call_args.kwargs["done"] == 0
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_bridge_failure_makes_no_replica_write(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import quest_add
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = dict(self._MISSION)
+        mock_call.side_effect = lambda *a, **k: (None, "unavailable")
+
+        result = json.loads(quest_add(5, "two"))
+
+        assert "error" in result
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+

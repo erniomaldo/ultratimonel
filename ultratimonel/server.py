@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 
 from fastmcp import FastMCP
 
+from . import compact
+from . import deck_bridge
 from .context_extractor import extract_context, is_known_project
 from .gate_engine import (
     GATE_CONFIG_MAP,
@@ -1257,6 +1259,418 @@ def begin_turn(
                 "project": resolved_project,
             },
         },
+        ensure_ascii=False,
+        default=str,
+    )
+
+# ── Mission / quest write tools (Deck-first, replica refresh) ──────────────
+#
+# Every write goes to Nextcloud Deck (the source of truth) through the internal
+# ``deck_bridge`` BEFORE the local SQLite replica is touched. A bridge failure
+# returns an error and performs NO local write (design D1/D9, Req
+# "Deck Is the Source of Truth via the Internal Bridge").
+
+# Stack titles treated as the "pending" bucket when creating a mission.
+_PENDING_STACK_TITLES = {"backlog", "pendiente", "to do", "todo", "pending"}
+
+
+def _resolve_board_id(project: str) -> tuple[int | None, str | None]:
+    """Resolve a project's Deck board id from the project maps."""
+    from .context_extractor import get_project_maps
+
+    cfg = get_project_maps().get(project)
+    if not cfg:
+        return None, f"Project '{project}' not found in project_maps"
+    board_id = cfg.get("deck_board_id")
+    if board_id is None:
+        return None, f"Project '{project}' has no deck_board_id mapped"
+    return int(board_id), None
+
+
+def _fetch_stacks(board_id: int) -> tuple[list | None, str | None]:
+    """Fetch the board's stacks from Deck. Returns ``(stacks, err)``."""
+    from .mcp_client import call_mcp_tool, TOOL_NAMES
+
+    data, err = call_mcp_tool(
+        "nextcloud",
+        TOOL_NAMES["nextcloud"]["deck_get_stacks"],
+        {"board_id": board_id, "include_cards": False},
+        timeout=8.0,
+    )
+    if data is None:
+        return None, err or "unavailable"
+    stacks = (
+        data
+        if isinstance(data, list)
+        else data.get("stacks", data.get("result", []))
+    )
+    return stacks, None
+
+
+def _resolve_stack_id(
+    board_id: int,
+    mission: dict | None = None,
+) -> tuple[int | None, str | None]:
+    """Resolve a Deck stack id for a mission.
+
+    Prefers the mission's replicated ``deck_stack_id`` (design D9) and falls
+    back to a ``deck_get_stacks`` lookup when it is missing/``NULL``.
+    """
+    if mission:
+        stack_id = mission.get("deck_stack_id")
+        if stack_id:
+            return int(stack_id), None
+
+    stacks, err = _fetch_stacks(board_id)
+    if stacks is None:
+        return None, err
+    if not stacks:
+        return None, "no stacks found on board"
+
+    for stack in stacks:
+        title = str(stack.get("title", "")).strip().lower()
+        if title in _PENDING_STACK_TITLES:
+            return int(stack["id"]), None
+    return int(stacks[0]["id"]), None
+
+
+def _refresh_mission_replica(
+    mission: dict,
+    title: str,
+    description: str,
+    status: str,
+) -> int:
+    """Refresh a mission row without disturbing its quest rows (replica only)."""
+    return persistence.upsert_mission(
+        deck_task_id=mission["deck_task_id"],
+        project=mission.get("project", ""),
+        title=title,
+        description=description,
+        status=status,
+        checklist_total=mission.get("checklist_total", 0) or 0,
+        checklist_done=mission.get("checklist_done", 0) or 0,
+    )
+
+
+@app.tool()
+def mission_create(project: str, title: str, description: str = "") -> str:
+    """Create a Deck-backed mission (Deck-first), then refresh the replica.
+
+    Writes the Deck card through the internal bridge BEFORE creating the local
+    replica row. No quest is created (design D2/D9, Req 1).
+
+    Args:
+        project: Project slug (e.g. "voy-rojo").
+        title: Mission title (Deck card title).
+        description: Optional prose description.
+
+    Returns:
+        JSON {mission_id, deck_task_id, title, status}.
+    """
+    board_id, err = _resolve_board_id(project)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False, default=str)
+
+    stack_id, err = _resolve_stack_id(board_id)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # No quest is created (D2/D9, Req 1): omit checkbox lines from the prose so
+    # the description can never inject a quest into the freshly created card.
+    clean_description = deck_bridge.clean_prose(description)
+
+    card_id, err = deck_bridge.create_card(
+        board_id, stack_id, title, clean_description
+    )
+    if card_id is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    mission_id = persistence.upsert_mission(
+        deck_task_id=card_id,
+        project=project,
+        title=title,
+        description=clean_description,
+        status="pendiente",
+    )
+    if not mission_id:
+        return json.dumps(
+            {"error": "Failed to refresh local replica"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return json.dumps(
+        {
+            "mission_id": mission_id,
+            "deck_task_id": card_id,
+            "title": title,
+            "status": "pendiente",
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def mission_update_title(mission_id: int, title: str) -> str:
+    """Update a mission's title (Deck-first), then refresh the replica.
+
+    An unknown ``mission_id`` fails with a not-found error and performs NO
+    Deck call (Req 1).
+
+    Args:
+        mission_id: Local mission id.
+        title: New mission title (Deck card title).
+
+    Returns:
+        JSON {mission_id, title, status}.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False, default=str)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    ok, err = deck_bridge.update_title(
+        board_id, stack_id, mission["deck_task_id"], title
+    )
+    if not ok:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    status = mission.get("status", "pendiente")
+    _refresh_mission_replica(
+        mission, title, mission.get("description", "") or "", status
+    )
+    return json.dumps(
+        {"mission_id": mission_id, "title": title, "status": status},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def mission_update_description(mission_id: int, description: str) -> str:
+    """Update a mission's prose description without touching its quests (D3).
+
+    The bridge preserves every quest line byte-identical and in its original
+    order. An unknown ``mission_id`` fails with a not-found error and performs
+    NO Deck call (Req 1).
+
+    Args:
+        mission_id: Local mission id.
+        description: New prose description (quest lines are ignored).
+
+    Returns:
+        JSON {mission_id, status}.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False, default=str)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    ok, err = deck_bridge.update_description(
+        board_id, stack_id, mission["deck_task_id"], description
+    )
+    if not ok:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    _refresh_mission_replica(
+        mission,
+        mission.get("title", "") or "",
+        description,
+        mission.get("status", "pendiente"),
+    )
+    return json.dumps(
+        {"mission_id": mission_id, "status": "ok"},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_add(mission_id: int, title: str) -> str:
+    """Append a quest to a mission's Deck card (Deck-first), then the replica.
+
+    The quest is always written with ``done=false`` (design D2/D10). There is
+    no tool that marks a quest complete; only ``end_turn`` does that.
+
+    Args:
+        mission_id: Local mission id.
+        title: Quest text.
+
+    Returns:
+        JSON {quest_id, mission_id, title, done}.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False, default=str)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    position, err = deck_bridge.append_quest(
+        board_id, stack_id, mission["deck_task_id"], title
+    )
+    if position is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    quest_id = persistence.upsert_checklist_item(
+        mission_id=mission_id,
+        item_index=position,
+        text=title,
+        done=0,
+    )
+    if not quest_id:
+        return json.dumps(
+            {"error": "Failed to refresh local replica"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return json.dumps(
+        {
+            "quest_id": quest_id,
+            "mission_id": mission_id,
+            "title": title,
+            "done": False,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_update(
+    quest_id: int,
+    title: str | None = None,
+    position: int | None = None,
+) -> str:
+    """Surgically rewrite one quest line (Deck-first), always resetting done.
+
+    ``position`` optionally overrides which Deck checkbox line is edited
+    (defaults to the replica quest's ``item_index``). ``title`` optionally
+    replaces the quest text. The replica is refreshed with ``done=false``
+    (design D2/D10). No mark-complete path exists here.
+
+    Args:
+        quest_id: Local checklist-item (quest) id.
+        title: Optional new quest text.
+        position: Optional Deck checkbox position override.
+
+    Returns:
+        JSON {quest_id, title, done}.
+    """
+    quest = persistence.get_checklist_item_by_id(quest_id)
+    if not quest:
+        return json.dumps(
+            {"error": f"Quest {quest_id} not found"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    mission = persistence.get_mission(quest["mission_id"])
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {quest['mission_id']} not found"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False, default=str)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    deck_position = position if position is not None else quest["item_index"]
+    new_text = title if title is not None else quest["text"]
+
+    ok, err = deck_bridge.update_quest(
+        board_id, stack_id, mission["deck_task_id"], deck_position, new_text
+    )
+    if not ok:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}"},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    persistence.upsert_checklist_item(
+        mission_id=mission["id"],
+        item_index=deck_position,
+        text=new_text,
+        done=0,
+    )
+    return json.dumps(
+        {"quest_id": quest_id, "title": new_text, "done": False},
         ensure_ascii=False,
         default=str,
     )
