@@ -130,6 +130,31 @@ def _clear_active_intento() -> None:
         _active_intento = None
 
 
+def _gates_from_intento_snapshot(intento: dict | None) -> list[dict]:
+    """Return the intento's FRESH gate snapshot, or ``[]`` (fail closed).
+
+    ``begin_turn`` captures the freshly executed gates into the intento's
+    ``gates_detail`` (``capture_gates_for_intento``). The session-scoped
+    ``list_gate_states`` is latest-per-gate and can be STALE when ``begin_turn``
+    degraded before writing fresh state, so it must never decide the final
+    verdict (W-f/W-g). A missing, empty, or unparseable snapshot yields ``[]``
+    so ``end_turn`` fails closed.
+    """
+    if not isinstance(intento, dict):
+        return []
+    raw = intento.get("gates_detail")
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [g for g in raw if isinstance(g, dict)]
+
+
 def _validate_gates_for_completion(
     session_id: str, project: str
 ) -> tuple[bool, list[str]]:
@@ -1053,35 +1078,36 @@ def sync_all() -> str:
 
 
 @app.tool()
-def mission_list(project: str, include_description: bool = True) -> str:
+def mission_list(project: str, include_description: bool = False) -> str:
     """List missions (Deck tasks) for a project.
+
+    Compact by default (design D4): each mission is represented by
+    ``{id, title, status}`` only — no description and no nested
+    ``checklist_items``. Pass ``include_description=True`` to opt in to the full
+    payload (e.g. the dashboard). There is no global ``verbose`` toggle.
 
     Args:
         project: Project slug.
-        include_description: If True (default), returns full payload
-            including description and nested checklist_items (backward compatible).
-            When False, returns lightweight {id, title, status} per mission.
+        include_description: If True, returns the full payload including
+            description and nested checklist_items. Defaults to False (compact).
 
     Returns:
         JSON with missions list.
     """
     missions = persistence.list_missions(project)
 
-    if not include_description:
-        light_missions = [
-            {"id": m["id"], "title": m["title"], "status": m["status"]}
-            for m in missions
-        ]
-        payload = {
-            "project": project,
-            "missions": light_missions,
-            "total": len(light_missions),
-        }
-    else:
+    if include_description:
         payload = {
             "project": project,
             "missions": missions,
             "total": len(missions),
+        }
+    else:
+        compact_missions = [compact.compact_mission(m) for m in missions]
+        payload = {
+            "project": project,
+            "missions": compact_missions,
+            "total": len(compact_missions),
         }
 
     return json.dumps(payload, ensure_ascii=False, default=str)
@@ -1103,11 +1129,11 @@ def mission_get(mission_id: int) -> str:
 
 @app.tool()
 def checklist_item_get(checklist_item_id: int) -> str:
-    """Retrieve a single checklist item by ID."""
+    """Retrieve a single checklist item (quest) by ID, compact by default (D4)."""
     item = persistence.get_checklist_item_by_id(checklist_item_id)
     if not item:
         return json.dumps({"error": f"Checklist item {checklist_item_id} not found"})
-    return json.dumps(item, ensure_ascii=False, default=str)
+    return json.dumps(compact.compact_quest(item), ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -1115,9 +1141,10 @@ def begin_turn(
     session_id: str,
     project: str,
     mission_id: int = 0,
-    checklist_item_id: int = 0,
+    quest_id: int = 0,
     message: str = "",
     sender: str = "user",
+    checklist_item_id: int = 0,
 ) -> str:
     """Begin a new turn: execute gates fresh and create an intento.
 
@@ -1128,6 +1155,10 @@ def begin_turn(
     persistiendo los resultados en gate_state y capturándolos en el intento.
     Esto elimina la necesidad de llamar assert_gates manualmente antes del turno.
 
+    Before ANY side effect (orphan cleanup AND gate execution), begin_turn
+    resolves and validates the target quest (design D5). A quest that is already
+    ``done`` or unknown fails hard with a ``code`` and mutates nothing.
+
     If an orphaned turn exists (active in memory but not matching this request),
     it is auto-completed as "fail" so the new turn can proceed — this prevents
     IRRECOVERABLE state where a crashed/blocked previous turn blocks all future turns.
@@ -1136,13 +1167,66 @@ def begin_turn(
         session_id:         Active Hermes session identifier.
         project:            Project slug (e.g. "voy-rojo").
         mission_id:         Numeric mission ID (same as record_intento).
-        checklist_item_id:  Numeric checklist item ID (same as record_intento).
+        quest_id:           Numeric quest (checklist item) ID. Canonical 4th
+                            positional parameter, positionally compatible with
+                            the legacy ``checklist_item_id``.
         message:            The user's raw message / query (used for context extraction).
         sender:             Optional sender name (default: "user").
+        checklist_item_id:  Backward-compatible trailing alias for ``quest_id``.
 
     Returns:
-        JSON string with intento_id, status, and real fresh gate counts.
+        JSON string with intento_id, mission_id, quest_id, status, and real
+        fresh gate counts. On a done/unknown quest:
+        ``{"error", "code": "quest_done"|"missing_quest", "quest_id"}``.
     """
+    # 0. Guard (D5): resolve/validate the target quest BEFORE any mutation.
+    #    This MUST precede the orphan cleanup and the gate execution so a done
+    #    or missing quest leaves the system with zero side effects. The guard
+    #    is REQUIRED: omitting the ids never silently bypasses it (W-a).
+    resolved_quest_id = quest_id or checklist_item_id
+    if not resolved_quest_id:
+        return json.dumps(
+            {
+                "error": "A nonzero quest_id (or legacy checklist_item_id) is required",
+                "code": "missing_quest",
+                "quest_id": 0,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not mission_id:
+        return json.dumps(
+            {
+                "error": "A nonzero mission_id is required",
+                "code": "missing_mission",
+                "mission_id": 0,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    target_quest = persistence.get_checklist_item_by_id(resolved_quest_id)
+    if target_quest is None:
+        return json.dumps(
+            {
+                "error": f"Quest {resolved_quest_id} not found",
+                "code": "missing_quest",
+                "quest_id": resolved_quest_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if isinstance(target_quest, dict) and target_quest.get("done"):
+        return json.dumps(
+            {
+                "error": f"Quest {resolved_quest_id} is already done",
+                "code": "quest_done",
+                "quest_id": resolved_quest_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     # 1. Check for orphaned/active turn — auto-cleanup if needed
     active = _get_active_intento()
     if active is not None:
@@ -1187,11 +1271,12 @@ def begin_turn(
         logger.warning("Gate execution failed (degraded): %s", exc)
         gate_results = []
 
-    # 3. Agregar info de mandatory a cada resultado
+    # 3. Agregar info de mandatory/best_effort a cada resultado (D8)
     for r in gate_results:
         cfg = GATE_CONFIG_MAP.get(r.name)
         if cfg:
             r.mandatory = cfg.mandatory
+            r.best_effort = cfg.best_effort
 
     overall, gate_dicts = aggregate(gate_results)
     context_envelope = build_context_envelope(gate_results)
@@ -1227,12 +1312,16 @@ def begin_turn(
     except Exception as exc:
         logger.warning("Gate state persistence failed (degraded): %s", exc)
 
-    # 5. Crear intento con los gates frescos
+    # 5. Crear intento con los gates frescos.
+    #    Persist the RESOLVED quest id (quest_id or its legacy alias) — never
+    #    the raw trailing alias, which is 0 when the caller uses quest_id.
+    #    Otherwise end_turn's _complete_quest_for_intento short-circuits and
+    #    the false→true quest transition never happens.
     intento_id = persistence.create_intento(
         session_id=session_id,
         project=resolved_project,
         mission_id=mission_id,
-        checklist_item_id=checklist_item_id,
+        checklist_item_id=resolved_quest_id,
     )
 
     # 6. Persistir snapshot de gates en el intento
@@ -1250,6 +1339,8 @@ def begin_turn(
         {
             "status": "started",
             "intento_id": intento_id,
+            "mission_id": mission_id,
+            "quest_id": resolved_quest_id or None,
             "gates_captured": len(gate_results),
             "gates_passed_so_far": gates_passed,
             "overall": overall,
@@ -1676,12 +1767,78 @@ def quest_update(
     )
 
 
+def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
+    """Flip the intento's quest to done in Deck, then refresh the replica (D6).
+
+    Unconditional quest closure: whenever a turn closes the intento's quest
+    becomes ``done=true``, regardless of the turn's success/fail. Deck stays the
+    source of truth, so the local replica is refreshed only after
+    ``deck_bridge.complete_quest`` acknowledges the write (D1). Failures are
+    logged and never raise — closing a turn must not be blocked by a bridge or
+    resolution problem (a later ``sync_task`` can recover).
+
+    Returns ``(quest_id, done)``; ``done`` is True only when both the Deck write
+    and the replica refresh succeeded.
+    """
+    mission_id = intento.get("mission_id") or 0
+    quest_id = intento.get("checklist_item_id") or 0
+    if not (mission_id and quest_id):
+        return None, False
+
+    try:
+        mission = persistence.get_mission(mission_id)
+        quest = persistence.get_checklist_item_by_id(quest_id)
+    except Exception as exc:
+        logger.warning(
+            "Quest closure lookup failed (intento=%s): %s", intento.get("id"), exc
+        )
+        return quest_id, False
+
+    if not isinstance(mission, dict) or not isinstance(quest, dict):
+        logger.warning(
+            "Quest closure skipped: mission #%s or quest #%s not found",
+            mission_id,
+            quest_id,
+        )
+        return quest_id, False
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        logger.warning("Quest closure skipped (board): %s", err)
+        return quest_id, False
+
+    # W-g parity: resolve the stack that ACTUALLY holds the card (fail closed),
+    # never guess the pending/first stack. When the card cannot be located the
+    # turn closes with quest_done=False and NO Deck write against a guessed stack.
+    stack_id, _stack_title, err = _resolve_stack_for_card(board_id, mission)
+    if err:
+        logger.warning("Quest closure skipped (stack): %s", err)
+        return quest_id, False
+
+    ok, err = deck_bridge.complete_quest(
+        board_id, stack_id, mission["deck_task_id"], quest["item_index"]
+    )
+    if not ok:
+        logger.warning("Quest closure: Deck write failed for quest #%s: %s", quest_id, err)
+        return quest_id, False
+
+    try:
+        persistence.set_quest_done(quest_id, True)
+    except Exception as exc:
+        logger.warning(
+            "Quest closure: replica refresh failed for quest #%s: %s", quest_id, exc
+        )
+        return quest_id, False
+
+    return quest_id, True
+
+
 @app.tool()
 def end_turn(
     intento_id: int,
     status: str = "success",
 ) -> str:
-    """End the current turn: validate gates and complete the intento.
+    """End the current turn: validate gates, complete the intento, close the quest.
 
     This is the second (and final) call of the consolidated 2-call turn workflow:
       begin_turn → trabajo → end_turn
@@ -1690,9 +1847,20 @@ def end_turn(
     data (session_id, project) is resolved internally from the DB so the
     orchestrating agent never has to pass it.
 
+    end_turn is the ONLY false→true quest transition path (design D6). It flips
+    the intento's quest to ``done`` in Deck (``- [ ]`` → ``- [x]``) and refreshes
+    the replica. The transition is UNCONDITIONAL: the quest is consumed whenever
+    the turn closes, while the success/fail result lives on the intento.
+
+    ``final_status`` derives from MANDATORY gates only (design D8): a
+    non-mandatory gate that is not PASS/SKIP never forces a fail.
+
     end_turn NEVER blocks permanently. When gates do not pass, it completes
     the intento with final_status="fail" and real gate detail, then clears
     the active turn state — always leaving the system in a recoverable state.
+
+    The response is COMPACT (design D4): gates carry only
+    ``{name, state, mandatory}`` and no raw ``result_data``.
 
     Args:
         intento_id: Numeric intento ID returned by begin_turn().
@@ -1700,7 +1868,8 @@ def end_turn(
                     actual completion status derives from gate validation.
 
     Returns:
-        JSON string with completion status, gates_passed count, and gate detail.
+        JSON string with completion status, gates_passed count, compact gate
+        detail, and the closed quest_id/quest_done.
     """
     global _active_intento
 
@@ -1754,12 +1923,11 @@ def end_turn(
                 default=str,
             )
 
-    # 3. Capturar estado final de gates (always attempt, never block)
-    try:
-        final_gates = persistence.list_gate_states(session_id, project)
-    except Exception as exc:
-        logger.warning("Failed to capture final gate states: %s", exc)
-        final_gates = []
+    # 3. Final gate evidence comes from the intento's FRESH snapshot, captured in
+    #    begin_turn. The session-scoped list_gate_states is latest-per-gate and
+    #    can be STALE when begin_turn degraded, so it must not decide the verdict
+    #    (W-f/W-g). No snapshot → fail closed.
+    final_gates = _gates_from_intento_snapshot(intento)
 
     # 4. Validate gates for logging (does NOT block completion)
     try:
@@ -1776,9 +1944,25 @@ def end_turn(
             detail,
         )
 
-    # 5. Contar gates passed
+    # 5. Contar gates passed + final_status por gates MANDATORY (D8)
+    #    A non-mandatory gate that is not in {PASS, SKIP} MUST NOT force a fail.
+    #    W-f: fail closed — with no persisted mandatory-gate evidence (empty or
+    #    incomplete final_gates) the turn MUST NOT be reported as success.
     gates_passed = sum(1 for g in final_gates if g.get("state") in ("PASS", "SKIP"))
-    final_status = "success" if gates_passed >= 4 else "fail"
+    mandatory_failed = [
+        g
+        for g in final_gates
+        if g.get("mandatory") and g.get("state") not in ("PASS", "SKIP")
+    ]
+    has_mandatory_evidence = any(bool(g.get("mandatory")) for g in final_gates)
+    if final_gates and has_mandatory_evidence and not mandatory_failed:
+        final_status = "success"
+    else:
+        final_status = "fail"
+
+    # 5b. Quest closure (D6): UNCONDITIONAL '- [ ]' -> '- [x]' in Deck, then
+    #     replica refresh, independent of final_status. Never blocks the close.
+    quest_id_closed, quest_done = _complete_quest_for_intento(intento)
 
     # 6. Completar intento con detalle completo (NEVER blocks — always completes)
     try:
@@ -1810,7 +1994,9 @@ def end_turn(
             "final_status": final_status,
             "gates_passed": gates_passed,
             "gates_total": len(final_gates) if final_gates else 4,
-            "gates": final_gates,
+            "gates": compact.compact_gates(final_gates),
+            "quest_id": quest_id_closed,
+            "quest_done": quest_done,
         },
         ensure_ascii=False,
         default=str,

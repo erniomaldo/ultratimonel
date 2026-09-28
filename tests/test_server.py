@@ -427,7 +427,16 @@ class TestBeginTurn:
         assert begin_result["intento_id"] == 70
 
         mock_persistence.get_intento.return_value = {
-            "id": 70, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 70,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "SKIP", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
         end_result = json.loads(end_turn(70))
         assert end_result["final_status"] == "success"
@@ -558,7 +567,17 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 42
         mock_persistence.get_intento.return_value = {
-            "id": 42, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 42,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # New snapshot contract (W-f/W-g): final_status derives from the
+            # intento's fresh gates_detail, not stale list_gate_states.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "PASS", "mandatory": 1},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
@@ -587,7 +606,16 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 44
         mock_persistence.get_intento.return_value = {
-            "id": 44, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 44,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot: 1b BLOCK (mandatory) forces final_status=fail.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "BLOCK", "mandatory": 1},
+                {"name": "1c", "state": "PASS", "mandatory": 1},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
@@ -614,7 +642,16 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 50
         mock_persistence.get_intento.return_value = {
-            "id": 50, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 50,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot: mandatory 1b WARN forces final_status=fail.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "WARN", "mandatory": 1},
+                {"name": "1c", "state": "SKIP", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
@@ -659,14 +696,35 @@ class TestEndTurn:
 
         begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user")
 
-        # Should complete with empty gates, not crash
+        # Should complete with empty gates, not crash.
+        # W-f: fail closed — no persisted mandatory-gate evidence means fail.
         result = json.loads(end_turn(51))
         assert result["status"] == "ok"
-        assert result["final_status"] == "fail"  # 0/4 gates captured
+        assert result["final_status"] == "fail"
         assert result["gates_passed"] == 0
 
         import ultratimonel.server as srv
         assert srv._get_active_intento() is None
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_without_mandatory_evidence_fails_closed(self, mock_persistence):
+        """W-f: gates present but no mandatory evidence still fails closed."""
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(55, "sess-1", "voy-rojo")
+        mock_persistence.get_intento.return_value = {
+            "id": 55, "session_id": "sess-1", "project": "voy-rojo"
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1b", "state": "PASS", "mandatory": 0, "message": "best effort"},
+        ]
+
+        result = json.loads(end_turn(55))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "fail"
+        srv._clear_active_intento()
 
     @patch("ultratimonel.server.persistence")
     def test_end_turn_no_active_turn(self, mock_persistence):
@@ -758,16 +816,26 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 46
         mock_persistence.get_intento.return_value = {
-            "id": 46, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 46,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot: 1c WARN is non-mandatory, so mandatory gates all
+            # pass and final_status=success (D8). gates_passed is still 3/4.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "WARN", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
 
-        # End turn — all mandatory gates are PASS (1c is non-mandatory WARN), so bouncer allows
-        # But only 3/4 gates passed (1c is WARN, not PASS/SKIP)
+        # End turn — 1c is a non-mandatory WARN. WU4/D8: only MANDATORY gates
+        # determine final_status, so the turn succeeds (gates_passed still 3/4).
         result = json.loads(end_turn(46))
         assert result["status"] == "ok"
-        assert result["final_status"] == "fail"
+        assert result["final_status"] == "success"
         assert result["gates_passed"] == 3
 
     @patch("ultratimonel.server.persistence")
@@ -792,6 +860,66 @@ class TestEndTurn:
 
         end_turn(47)
         assert srv._get_active_intento() is None
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_stale_session_pass_fails_closed_without_snapshot(
+        self, mock_persistence
+    ):
+        """FIX: a STALE session-scoped PASS must not yield success (W-f/W-g)."""
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(77, "sess-1", "voy-rojo")
+        mock_persistence.get_intento.return_value = {
+            "id": 77,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 0,
+            "checklist_item_id": 0,
+            "status": "running",
+            # No gates_detail: begin_turn degraded and captured no snapshot.
+        }
+        # Previous-turn session state claims every gate PASS — it is stale.
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1},
+        ]
+
+        result = json.loads(end_turn(77))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "fail"
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_empty_snapshot_fails_closed_despite_stale_pass(
+        self, mock_persistence
+    ):
+        """FIX: an EMPTY intento snapshot also fails closed (W-f/W-g)."""
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(78, "sess-1", "voy-rojo")
+        mock_persistence.get_intento.return_value = {
+            "id": 78,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 0,
+            "checklist_item_id": 0,
+            "status": "running",
+            "gates_detail": json.dumps([]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1},
+        ]
+
+        result = json.loads(end_turn(78))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "fail"
+        srv._clear_active_intento()
 
 
 class TestCompleteIntentoBackwardCompat:
@@ -874,7 +1002,16 @@ class TestFluxConsolidated:
         ]
         mock_persistence.create_intento.return_value = 140
         mock_persistence.get_intento.return_value = {
-            "id": 140, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 140,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
+            ]),
         }
 
         # Step 1: begin_turn — executes gates FRESH, no assert_gates needed
@@ -914,7 +1051,7 @@ class TestFluxConsolidated:
         mock_extract.return_value = {
             "sender": "user", "topic": "test", "project": "voy-rojo"
         }
-        # Gates: 1a=PASS, 1b=WARN (agentmemory down), 1c=SKIP, 1e=PASS
+        # Gates: 1a=PASS, 1b=WARN (best-effort, D8), 1c=SKIP, 1e=PASS
         mock_triple.return_value = [
             GateResult(name="1a", state=PASS, message="ok"),
             GateResult(name="1b", state=WARN, message="AgentMemory timeout"),
@@ -923,13 +1060,22 @@ class TestFluxConsolidated:
         ]
         mock_persistence.list_gate_states.return_value = [
             {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-            {"gate_name": "1b", "state": "WARN", "mandatory": 1, "message": "AgentMemory timeout"},
+            {"gate_name": "1b", "state": "WARN", "mandatory": 0, "message": "AgentMemory timeout"},
             {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
             {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
         ]
         mock_persistence.create_intento.return_value = 141
         mock_persistence.get_intento.return_value = {
-            "id": 141, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 141,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1b", "state": "WARN", "mandatory": 0, "message": "timeout"},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
+            ]),
         }
 
         # begin_turn executes gates fresh — NO assert_gates call needed
@@ -937,12 +1083,13 @@ class TestFluxConsolidated:
         assert begin_result["status"] == "started"
         assert begin_result["intento_id"] == 141
         assert begin_result["gates_captured"] == 4
-        assert begin_result["overall"] == "WARN"
+        # D8: the best-effort 1b WARN does not degrade the overall status.
+        assert begin_result["overall"] == "PASS"
 
-        # end_turn completes as fail (only 3/4 PASS+SKIP)
+        # D8: 1b is best-effort, so end_turn is NOT forced to fail.
         end_result = json.loads(end_turn(141))
         assert end_result["status"] == "ok"
-        assert end_result["final_status"] == "fail"
+        assert end_result["final_status"] == "success"
         assert end_result["gates_passed"] == 3
 
         # Verify no manual assert_gates was needed (triple_match was called directly)
@@ -974,7 +1121,16 @@ class TestFluxConsolidated:
         ]
         mock_persistence.create_intento.return_value = 142
         mock_persistence.get_intento.return_value = {
-            "id": 142, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 142,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g): 1e BLOCK.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue"},
+            ]),
         }
 
         begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
@@ -1184,13 +1340,26 @@ class TestDashboardStability:
 
 class TestMissionListLightMode:
     @patch("ultratimonel.server.persistence")
-    def test_default_returns_full_payload_backward_compatible(self, mock_persistence):
-        """F-TU-07: default (no param) returns full payload — dashboard unchanged."""
+    def test_default_is_compact(self, mock_persistence):
+        """WU4/D4: default (no param) returns compact {id,title,status} only."""
         from ultratimonel.server import mission_list
         full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
         mock_persistence.list_missions.return_value = [full_mission]
 
         result = json.loads(mission_list("testproj"))
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert "description" not in result["missions"][0]
+        assert "checklist_items" not in result["missions"][0]
+        assert result["total"] == 1
+
+    @patch("ultratimonel.server.persistence")
+    def test_include_description_true_returns_full_payload(self, mock_persistence):
+        """F-TU-07: opt-in full payload still returns description + checklist_items."""
+        from ultratimonel.server import mission_list
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        mock_persistence.list_missions.return_value = [full_mission]
+
+        result = json.loads(mission_list("testproj", include_description=True))
         assert result["missions"][0]["description"] == "desc"
         assert result["missions"][0]["checklist_items"] == [{"id": 10}]
         assert result["total"] == 1
@@ -1354,7 +1523,16 @@ class TestBeginTurnProjectFix:
         from ultratimonel.server import begin_turn, end_turn
 
         mock_persistence.get_intento.return_value = {
-            "id": 70, "session_id": "sess-x", "project": "voy-rojo"
+            "id": 70,
+            "session_id": "sess-x",
+            "project": "voy-rojo",
+            # New snapshot contract: final_status derives from gates_detail.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "SKIP", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
         mock_persistence.list_gate_states.return_value = [
             {"gate_name": "1a", "state": "PASS", "mandatory": 1},
@@ -1855,5 +2033,472 @@ class TestQuestWriteTools:
 
         assert "error" in result
         mock_persist.upsert_checklist_item.assert_not_called()
+
+
+# ── WU4: turn protocol + compact output (§2.5, §2.6, §2.9) ─────────────────
+
+
+class TestBeginTurnQuestGuard:
+    """WU4/D5: begin_turn validates the quest BEFORE any mutation."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_done_quest_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        from ultratimonel.server import begin_turn
+        import ultratimonel.server as srv
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0,
+            "text": "already done", "done": 1,
+        }
+        # An orphaned active turn exists: the guard MUST run before cleanup.
+        srv._set_active_intento(99, "old-sess", "old-proj")
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+
+        assert result["code"] == "quest_done"
+        assert result["quest_id"] == 10
+        assert "error" in result
+        # Zero mutation: no orphan cleanup, no gates, no intento, no gate state.
+        mock_persistence.complete_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        mock_persistence.upsert_gate_state.assert_not_called()
+        # The orphaned turn is left untouched (the guard precedes cleanup).
+        assert srv._get_active_intento()["intento_id"] == 99
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_missing_quest_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        from ultratimonel.server import begin_turn
+
+        mock_persistence.get_checklist_item_by_id.return_value = None
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+
+        assert result["code"] == "missing_quest"
+        assert result["quest_id"] == 10
+        mock_persistence.create_intento.assert_not_called()
+        mock_triple.assert_not_called()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_open_quest_creates_intento_and_returns_ids(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_extract.return_value = {
+            "sender": "user", "topic": "t", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS),
+            GateResult(name="1b", state=PASS),
+            GateResult(name="1c", state=SKIP),
+            GateResult(name="1e", state=PASS),
+        ]
+        mock_persistence.create_intento.return_value = 200
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+
+        assert result["status"] == "started"
+        assert result["intento_id"] == 200
+        assert result["mission_id"] == 5
+        assert result["quest_id"] == 10
+        mock_persistence.create_intento.assert_called_once()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_checklist_item_id_alias_still_guards(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """The trailing checklist_item_id alias resolves the same quest guard."""
+        from ultratimonel.server import begin_turn
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "done", "done": 1,
+        }
+        result = json.loads(
+            begin_turn("sess-1", "voy-rojo", mission_id=5, checklist_item_id=10)
+        )
+        assert result["code"] == "quest_done"
+        assert result["quest_id"] == 10
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_missing_quest_id_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """W-a: omitting the quest id must not silently skip the guard."""
+        from ultratimonel.server import begin_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(99, "old-sess", "old-proj")
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", mission_id=5))
+
+        assert result["code"] == "missing_quest"
+        mock_persistence.get_checklist_item_by_id.assert_not_called()
+        mock_persistence.complete_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        # The orphaned turn is left untouched (guard precedes cleanup).
+        assert srv._get_active_intento()["intento_id"] == 99
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_missing_mission_id_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """W-a: a quest id alone is not enough; mission_id is required too."""
+        from ultratimonel.server import begin_turn
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", quest_id=10))
+
+        assert result["code"] == "missing_mission"
+        mock_persistence.get_checklist_item_by_id.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+
+    def test_quest_id_persisted_and_closed_end_to_end(
+        self, tmp_path, monkeypatch
+    ):
+        """CRITICAL: begin_turn(quest_id=...) persists it; end_turn closes it.
+
+        End-to-end against a real temp SQLite DB with the Deck bridge mocked:
+        (a) the intento stores the resolved quest id, (b) complete_quest is
+        called for the quest's item_index, (c) the replica quest becomes done.
+        """
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        srv._clear_active_intento()
+        db = Persistence(db_path=str(tmp_path / "cards-solo-e2e.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_id = db.upsert_mission(
+            deck_task_id=189,
+            project="voy-rojo",
+            title="Mission",
+            status="pendiente",
+        )
+        quest_id = db.upsert_checklist_item(
+            mission_id=mission_id, item_index=0, text="do it", done=0
+        )
+
+        monkeypatch.setattr(
+            srv,
+            "extract_context",
+            lambda message, session_id, sender="user": {
+                "sender": "user",
+                "topic": "t",
+                "project": "voy-rojo",
+            },
+        )
+        monkeypatch.setattr(
+            srv,
+            "run_triple_match",
+            lambda context: [
+                GateResult(name="1a", state=PASS),
+                GateResult(name="1b", state=PASS),
+                GateResult(name="1c", state=SKIP),
+                GateResult(name="1e", state=PASS),
+            ],
+        )
+        monkeypatch.setattr(srv, "_resolve_board_id", lambda project: (21, None))
+        monkeypatch.setattr(
+            srv,
+            "_resolve_stack_for_card",
+            lambda board_id, mission=None: (111, None, None),
+        )
+        complete_calls = []
+
+        def fake_complete(board_id, stack_id, card_id, position):
+            complete_calls.append((board_id, stack_id, card_id, position))
+            return True, None
+
+        monkeypatch.setattr(srv.deck_bridge, "complete_quest", fake_complete)
+
+        begin = json.loads(
+            srv.begin_turn("sess-1", "voy-rojo", mission_id, quest_id=quest_id)
+        )
+        assert begin["status"] == "started"
+        intento_id = begin["intento_id"]
+
+        # (a) The persisted intento holds the resolved quest id.
+        intento = db.get_intento(intento_id)
+        assert intento["checklist_item_id"] == quest_id
+
+        # (b) end_turn drives the Deck write for the matching item_index.
+        end = json.loads(srv.end_turn(intento_id))
+        assert complete_calls == [(21, 111, 189, 0)]
+        assert end["quest_id"] == quest_id
+        assert end["quest_done"] is True
+
+        # (c) The replica quest is now done.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 1
+        srv._clear_active_intento()
+
+
+class TestEndTurnQuestTransition:
+    """WU4/D6: end_turn closes the quest and returns a compact payload."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    @staticmethod
+    def _intento():
+        return {
+            "id": 42,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 5,
+            "checklist_item_id": 10,
+            "status": "running",
+        }
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server._resolve_stack_id")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_flips_quest_and_returns_compact(
+        self, mock_persistence, mock_board, mock_stack, mock_complete
+    ):
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            **self._intento(),
+            # Fresh snapshot captured by begin_turn (W-f/W-g); carries the byte
+            # blobs that must never leak into the compact payload.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok",
+                 "result_data": {"blob": "x" * 5000}},
+                {"name": "1b", "state": "PASS", "mandatory": 1, "message": "ok",
+                 "result_data": {"blob": "y" * 5000}},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "ok",
+                 "result_data": {"deck": "z" * 5000}},
+            ]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok",
+             "result_data": {"blob": "x" * 5000}},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok",
+             "result_data": {"blob": "y" * 5000}},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok",
+             "result_data": {"deck": "z" * 5000}},
+        ]
+        mock_persistence.get_mission.return_value = {
+            "id": 5, "deck_task_id": 189, "deck_stack_id": 111, "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        mock_stack.return_value = (111, None)
+        mock_complete.return_value = (True, None)
+
+        raw = end_turn(42)
+        result = json.loads(raw)
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "success"
+        assert result["quest_id"] == 10
+        assert result["quest_done"] is True
+        # Deck write first, then replica refresh.
+        mock_complete.assert_called_once_with(21, 111, 189, 0)
+        mock_persistence.set_quest_done.assert_called_once_with(10, True)
+        # Compact: raw result_data never leaks into the payload.
+        assert "result_data" not in raw
+        assert result["gates"] == [
+            {"name": "1a", "state": "PASS", "mandatory": True},
+            {"name": "1b", "state": "PASS", "mandatory": True},
+            {"name": "1c", "state": "SKIP", "mandatory": False},
+            {"name": "1e", "state": "PASS", "mandatory": True},
+        ]
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server._resolve_stack_id")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_transition_is_unconditional_on_fail(
+        self, mock_persistence, mock_board, mock_stack, mock_complete
+    ):
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            **self._intento(),
+            # Fresh snapshot captured by begin_turn (W-f/W-g): 1e BLOCK.
+            "gates_detail": json.dumps([
+                {"name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue"},
+            ]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue"},
+        ]
+        mock_persistence.get_mission.return_value = {
+            "id": 5, "deck_task_id": 189, "deck_stack_id": 111, "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 2, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        mock_stack.return_value = (111, None)
+        mock_complete.return_value = (True, None)
+
+        result = json.loads(end_turn(42))
+
+        assert result["final_status"] == "fail"
+        # The quest is consumed anyway (PM: unconditional transition).
+        assert result["quest_done"] is True
+        mock_complete.assert_called_once_with(21, 111, 189, 2)
+        mock_persistence.set_quest_done.assert_called_once_with(10, True)
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server._resolve_stack_id")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_bridge_failure_skips_replica_but_still_completes(
+        self, mock_persistence, mock_board, mock_stack, mock_complete
+    ):
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            **self._intento(),
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
+            ]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
+        ]
+        mock_persistence.get_mission.return_value = {
+            "id": 5, "deck_task_id": 189, "deck_stack_id": 111, "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        mock_stack.return_value = (111, None)
+        mock_complete.return_value = (None, "unavailable")
+
+        result = json.loads(end_turn(42))
+
+        assert result["status"] == "ok"
+        assert result["quest_done"] is False
+        # Deck-first: no replica write when the Deck write failed (D1).
+        mock_persistence.set_quest_done.assert_not_called()
+        mock_persistence.complete_intento_with_gates.assert_called_once()
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_card_not_located_never_writes_guessed_stack(
+        self, mock_persistence, mock_board, mock_call, mock_complete
+    ):
+        """FIX 1: fail closed when the card is not in any board stack (W-g).
+
+        No cached deck_stack_id and a card absent from every stack must NOT
+        resolve to a guessed pending/first stack and MUST NOT write to Deck.
+        """
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+        srv._set_active_intento(88, "sess-1", "voy-rojo")
+
+        mock_persistence.get_intento.return_value = {
+            "id": 88,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 5,
+            "checklist_item_id": 10,
+            "status": "running",
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+            ]),
+        }
+        mock_persistence.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        # Stacks exist, but the mission's card is NOT among them.
+        mock_call.return_value = (
+            [{"id": 111, "title": "Backlog", "cards": []}],
+            None,
+        )
+
+        result = json.loads(end_turn(88))
+
+        assert result["status"] == "ok"
+        assert result["quest_done"] is False
+        # No Deck write against a guessed stack, and no replica refresh.
+        mock_complete.assert_not_called()
+        mock_persistence.set_quest_done.assert_not_called()
+        srv._clear_active_intento()
+
+
+class TestCompactReadAndNoVerbose:
+    """WU4/§2.9, D4: no global verbose flag; read/list outputs are compact."""
+
+    def test_no_tool_exposes_a_global_verbose_param(self):
+        import asyncio
+
+        from ultratimonel.server import app
+
+        tools = asyncio.run(app.list_tools())
+        offenders = [
+            tool.name
+            for tool in tools
+            if "verbose" in (tool.parameters or {}).get("properties", {})
+        ]
+        assert offenders == []
+
+    @patch("ultratimonel.server.persistence")
+    def test_checklist_item_get_is_compact(self, mock_persistence):
+        from ultratimonel.server import checklist_item_get
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 456, "mission_id": 123, "item_index": 1,
+            "text": "Review backlog", "done": 0,
+        }
+        result = json.loads(checklist_item_get(456))
+        assert result == {"id": 456, "text": "Review backlog", "done": False}
 
 
