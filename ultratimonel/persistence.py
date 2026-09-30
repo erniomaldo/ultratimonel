@@ -427,11 +427,17 @@ class Persistence:
                 elif current_ver == 1:
                     # Migration v1 → v2
                     _migrate_v1_to_v2(conn)
-                    conn.execute(
-                        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
-                    )
-                    logger.info("Migrated DB v1→v2: %s", self._db_path)
+                    # v2 → v3: add gates_detail column to intentos
+                    try:
+                        conn.execute(
+                            "ALTER TABLE intentos ADD COLUMN gates_detail TEXT"
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # column already exists (idempotent)
+                    # v3 → v4 → v5: session_turns table + deck_stack_id
+                    _migrate_v3_to_v4(conn)
+                    _migrate_v4_to_v5(conn)
+                    logger.info("Migrated DB v1→v5: %s", self._db_path)
                 elif current_ver == 2:
                     # Migration v2 → v3: add gates_detail column to intentos
                     try:
@@ -441,18 +447,12 @@ class Persistence:
                         logger.info("Migrated DB v2→v3: added gates_detail to intentos")
                     except sqlite3.OperationalError:
                         pass  # column already exists (idempotent)
-                    # Migration v4 → v5: add missions.deck_stack_id (idempotent)
-                    try:
-                        conn.execute(
-                            "ALTER TABLE missions ADD COLUMN deck_stack_id INTEGER"
-                        )
-                    except sqlite3.OperationalError:
-                        pass  # column already exists (idempotent)
-                    conn.execute(
-                        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
-                    )
-                    logger.info("Migrated DB v2→v3: %s", self._db_path)
+                    # v3 → v4 → v5: session_turns table + deck_stack_id.
+                    # Routing through the chain keeps v2 DBs from being stamped
+                    # v5 while session_turns is still missing.
+                    _migrate_v3_to_v4(conn)
+                    _migrate_v4_to_v5(conn)
+                    logger.info("Migrated DB v2→v5: %s", self._db_path)
                 elif current_ver == 3:
                     # Migration v3 → v4 → v5: session_turns table + deck_stack_id
                     _migrate_v3_to_v4(conn)
