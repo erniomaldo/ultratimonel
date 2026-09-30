@@ -5,10 +5,12 @@ Gate states: PASS (proceed), SKIP (proceed, N/A), WARN (proceed w/ note),
              BLOCK (halt generation).
 
 Each gate is a dict with:
-  - name:       unique gate id (e.g. "1a", "1b", "1e")
-  - mandatory:  bool — whether BLOCK halts generation
-  - timeout_s:  per-gate HTTP timeout in seconds
-  - source:     external MCP tool name (informational)
+  - name:        unique gate id (e.g. "1a", "1b", "1e")
+  - mandatory:   bool — whether BLOCK halts generation
+  - best_effort: bool — advisory gate whose WARN/BLOCK never affects the
+                 aggregate overall status (design D8)
+  - timeout_s:   per-gate HTTP timeout in seconds
+  - source:      external MCP tool name (informational)
 """
 
 import logging
@@ -36,6 +38,7 @@ class GateConfig:
 
     name: str
     mandatory: bool = True
+    best_effort: bool = False
     timeout_s: float = 2.0
     source: str = ""
 
@@ -47,6 +50,7 @@ class GateResult:
     name: str
     state: str = BLOCK
     mandatory: bool = True
+    best_effort: bool = False
     duration_ms: float = 0.0
     message: str = ""
     result_data: Optional[dict] = None
@@ -58,13 +62,15 @@ DEFAULT_GATES: list[GateConfig] = [
     GateConfig(
         name="1a",
         source="mcp_agentmemory_memory_smart_search",
-        mandatory=True,
+        mandatory=False,
+        best_effort=True,
         timeout_s=2.0,
     ),
     GateConfig(
         name="1b",
         source="mcp_checkpoint_get_state",
-        mandatory=True,
+        mandatory=False,
+        best_effort=True,
         timeout_s=2.0,
     ),
     GateConfig(
@@ -108,6 +114,7 @@ def run_gate(
     result = GateResult(
         name=config.name,
         mandatory=config.mandatory,
+        best_effort=config.best_effort,
     )
 
     try:
@@ -136,6 +143,10 @@ def run_gate(
 def aggregate(results: list[GateResult]) -> tuple[str, list[dict]]:
     """Aggregate individual gate results into an overall status.
 
+    Best-effort gates (design D8) are advisory: a ``WARN`` or ``BLOCK`` from a
+    gate whose ``best_effort`` flag is set never affects the overall status.
+    Their entry is still reported in ``gate_dicts`` for visibility.
+
     Args:
         results: List of GateResult from each gate execution.
 
@@ -159,6 +170,10 @@ def aggregate(results: list[GateResult]) -> tuple[str, list[dict]]:
             "message": r.message,
         }
         gate_dicts.append(entry)
+
+        # Best-effort gates cannot degrade the aggregate (1a/1b, D8).
+        if r.best_effort:
+            continue
 
         if r.state == BLOCK:
             has_block = True

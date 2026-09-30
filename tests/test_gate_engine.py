@@ -31,13 +31,17 @@ class TestGateConfig:
         assert "1c" in names
         assert "1e" in names
 
-    def test_default_gates_all_mandatory_except_1c(self):
-        """Gate 1c (collectives) is optional; all others are mandatory."""
-        mandatory = [g for g in DEFAULT_GATES if g.mandatory]
-        optional = [g for g in DEFAULT_GATES if not g.mandatory]
-        assert len(mandatory) == 3
-        assert len(optional) == 1
-        assert optional[0].name == "1c"
+    def test_default_gates_mandatory_and_best_effort_split(self):
+        """D8: only 1e is mandatory; 1a/1b are best-effort; 1c stays optional."""
+        by_name = {g.name: g for g in DEFAULT_GATES}
+        assert by_name["1e"].mandatory is True
+        assert by_name["1e"].best_effort is False
+        for name in ("1a", "1b"):
+            assert by_name[name].mandatory is False
+            assert by_name[name].best_effort is True
+        # 1c keeps its previous classification: optional but not best-effort.
+        assert by_name["1c"].mandatory is False
+        assert by_name["1c"].best_effort is False
 
     def test_default_gates_timeout_2s(self):
         assert all(g.timeout_s == 2.0 for g in DEFAULT_GATES)
@@ -113,6 +117,52 @@ class TestAggregation:
         assert "mandatory" in entry
         assert "duration_ms" in entry
         assert "message" in entry
+
+
+class TestBestEffortAggregation:
+    """D8: best-effort WARN/BLOCK never degrades the aggregate; 1c/1e unchanged."""
+
+    def test_best_effort_warn_is_ignored(self):
+        results = [
+            GateResult(name="1a", state=WARN, mandatory=False, best_effort=True),
+            GateResult(name="1e", state=PASS, mandatory=True),
+        ]
+        overall, gates = aggregate(results)
+        assert overall == PASS
+        # The best-effort entry is still reported for visibility.
+        assert gates[0]["name"] == "1a"
+        assert gates[0]["state"] == WARN
+
+    def test_best_effort_block_is_ignored(self):
+        results = [
+            GateResult(name="1b", state=BLOCK, mandatory=False, best_effort=True),
+            GateResult(name="1e", state=PASS, mandatory=True),
+        ]
+        overall, _ = aggregate(results)
+        assert overall == PASS
+
+    def test_non_best_effort_warn_still_aggregates_to_warn(self):
+        """1c is optional but NOT best-effort: its WARN still yields WARN."""
+        results = [
+            GateResult(name="1c", state=WARN, mandatory=False, best_effort=False),
+            GateResult(name="1e", state=PASS, mandatory=True),
+        ]
+        overall, _ = aggregate(results)
+        assert overall == WARN
+
+    def test_mandatory_block_still_blocks(self):
+        results = [
+            GateResult(name="1a", state=WARN, mandatory=False, best_effort=True),
+            GateResult(name="1e", state=BLOCK, mandatory=True),
+        ]
+        overall, _ = aggregate(results)
+        assert overall == BLOCK
+
+    def test_run_gate_stamps_best_effort_from_config(self):
+        config = GateConfig(name="1a", mandatory=False, best_effort=True)
+        result = run_gate(config, {}, executor=None)
+        assert result.best_effort is True
+        assert result.mandatory is False
 
 
 class TestCanComplete:

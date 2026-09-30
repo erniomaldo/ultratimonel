@@ -145,6 +145,88 @@ class TestSyncTasksMarkdownFallback:
         assert result["synced"] == 1
         assert result["total_errors"] == 0
 
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_single_parser_matches_extract_quests(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """FIX 1(b): sync_tasks and deck_bridge.extract_quests count the SAME quests."""
+        from ultratimonel.server import sync_tasks
+        from ultratimonel import deck_bridge
+
+        shared = (
+            "Intro\n"
+            "- [ ] one\n"
+            "* [x] two\n"
+            "- [X] three\n"
+            "prose\n"
+            "- [ ] four\n"
+        )
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+        card = self._make_card(200, "Shared payload card")
+        card_detail = self._make_card_detail(shared)
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 7
+        mock_persistence.upsert_checklist_item.return_value = None
+
+        result = json.loads(sync_tasks("testproj"))
+
+        assert result["synced"] == 1
+        authoritative = deck_bridge.extract_quests(shared)
+        mission_kwargs = mock_persistence.upsert_mission.call_args_list[0][1]
+        assert mission_kwargs["checklist_total"] == len(authoritative) == 4
+        assert mission_kwargs["checklist_done"] == sum(
+            1 for q in authoritative if q["done"]
+        ) == 2
+        assert mock_persistence.upsert_checklist_item.call_count == 4
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    def test_genuine_checkbox_replica_extraction_unchanged(
+        self, mock_get_maps, mock_persistence, mock_call_mcp
+    ):
+        """FIX 1(c): genuine ``- [ ]``/``- [x]``/``* [ ]`` semantics are preserved."""
+        from ultratimonel.server import sync_tasks
+
+        mock_get_maps.return_value = {"testproj": {"deck_board_id": 42}}
+        card = self._make_card(201, "Genuine card")
+        card_detail = self._make_card_detail(
+            "Tarea\n- [ ] open\n- [x] done\n* [ ] star\n"
+        )
+
+        def call_mcp_side_effect(tool_name, tool_fn, params, **kwargs):
+            if tool_fn == "deck_get_stacks":
+                return (self._make_stacks_response([card]), None)
+            elif tool_fn == "deck_get_card":
+                return (card_detail, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = call_mcp_side_effect
+        mock_persistence.upsert_mission.return_value = 11
+        mock_persistence.upsert_checklist_item.return_value = None
+
+        json.loads(sync_tasks("testproj"))
+
+        items = [
+            call[1] for call in mock_persistence.upsert_checklist_item.call_args_list
+        ]
+        assert items == [
+            {"mission_id": 11, "item_index": 0, "text": "open", "done": 0},
+            {"mission_id": 11, "item_index": 1, "text": "done", "done": 1},
+            {"mission_id": 11, "item_index": 2, "text": "star", "done": 0},
+        ]
+
 
 class TestCompleteGate:
     """complete_gate output schema and no-op behavior."""
@@ -427,7 +509,16 @@ class TestBeginTurn:
         assert begin_result["intento_id"] == 70
 
         mock_persistence.get_intento.return_value = {
-            "id": 70, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 70,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "SKIP", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
         end_result = json.loads(end_turn(70))
         assert end_result["final_status"] == "success"
@@ -558,7 +649,17 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 42
         mock_persistence.get_intento.return_value = {
-            "id": 42, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 42,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # New snapshot contract (W-f/W-g): final_status derives from the
+            # intento's fresh gates_detail, not stale list_gate_states.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "PASS", "mandatory": 1},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
@@ -587,7 +688,16 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 44
         mock_persistence.get_intento.return_value = {
-            "id": 44, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 44,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot: 1b BLOCK (mandatory) forces final_status=fail.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "BLOCK", "mandatory": 1},
+                {"name": "1c", "state": "PASS", "mandatory": 1},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
@@ -614,7 +724,16 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 50
         mock_persistence.get_intento.return_value = {
-            "id": 50, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 50,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot: mandatory 1b WARN forces final_status=fail.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "WARN", "mandatory": 1},
+                {"name": "1c", "state": "SKIP", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
@@ -659,14 +778,35 @@ class TestEndTurn:
 
         begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user")
 
-        # Should complete with empty gates, not crash
+        # Should complete with empty gates, not crash.
+        # W-f: fail closed — no persisted mandatory-gate evidence means fail.
         result = json.loads(end_turn(51))
         assert result["status"] == "ok"
-        assert result["final_status"] == "fail"  # 0/4 gates captured
+        assert result["final_status"] == "fail"
         assert result["gates_passed"] == 0
 
         import ultratimonel.server as srv
         assert srv._get_active_intento() is None
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_without_mandatory_evidence_fails_closed(self, mock_persistence):
+        """W-f: gates present but no mandatory evidence still fails closed."""
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(55, "sess-1", "voy-rojo")
+        mock_persistence.get_intento.return_value = {
+            "id": 55, "session_id": "sess-1", "project": "voy-rojo"
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1b", "state": "PASS", "mandatory": 0, "message": "best effort"},
+        ]
+
+        result = json.loads(end_turn(55))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "fail"
+        srv._clear_active_intento()
 
     @patch("ultratimonel.server.persistence")
     def test_end_turn_no_active_turn(self, mock_persistence):
@@ -758,16 +898,26 @@ class TestEndTurn:
         ]
         mock_persistence.create_intento.return_value = 46
         mock_persistence.get_intento.return_value = {
-            "id": 46, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 46,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot: 1c WARN is non-mandatory, so mandatory gates all
+            # pass and final_status=success (D8). gates_passed is still 3/4.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "WARN", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
 
         begin_turn("sess-1", "voy-rojo", 5, 10)
 
-        # End turn — all mandatory gates are PASS (1c is non-mandatory WARN), so bouncer allows
-        # But only 3/4 gates passed (1c is WARN, not PASS/SKIP)
+        # End turn — 1c is a non-mandatory WARN. WU4/D8: only MANDATORY gates
+        # determine final_status, so the turn succeeds (gates_passed still 3/4).
         result = json.loads(end_turn(46))
         assert result["status"] == "ok"
-        assert result["final_status"] == "fail"
+        assert result["final_status"] == "success"
         assert result["gates_passed"] == 3
 
     @patch("ultratimonel.server.persistence")
@@ -792,6 +942,66 @@ class TestEndTurn:
 
         end_turn(47)
         assert srv._get_active_intento() is None
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_stale_session_pass_fails_closed_without_snapshot(
+        self, mock_persistence
+    ):
+        """FIX: a STALE session-scoped PASS must not yield success (W-f/W-g)."""
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(77, "sess-1", "voy-rojo")
+        mock_persistence.get_intento.return_value = {
+            "id": 77,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 0,
+            "checklist_item_id": 0,
+            "status": "running",
+            # No gates_detail: begin_turn degraded and captured no snapshot.
+        }
+        # Previous-turn session state claims every gate PASS — it is stale.
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1},
+        ]
+
+        result = json.loads(end_turn(77))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "fail"
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_empty_snapshot_fails_closed_despite_stale_pass(
+        self, mock_persistence
+    ):
+        """FIX: an EMPTY intento snapshot also fails closed (W-f/W-g)."""
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(78, "sess-1", "voy-rojo")
+        mock_persistence.get_intento.return_value = {
+            "id": 78,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 0,
+            "checklist_item_id": 0,
+            "status": "running",
+            "gates_detail": json.dumps([]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1},
+        ]
+
+        result = json.loads(end_turn(78))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "fail"
+        srv._clear_active_intento()
 
 
 class TestCompleteIntentoBackwardCompat:
@@ -874,7 +1084,16 @@ class TestFluxConsolidated:
         ]
         mock_persistence.create_intento.return_value = 140
         mock_persistence.get_intento.return_value = {
-            "id": 140, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 140,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
+            ]),
         }
 
         # Step 1: begin_turn — executes gates FRESH, no assert_gates needed
@@ -914,7 +1133,7 @@ class TestFluxConsolidated:
         mock_extract.return_value = {
             "sender": "user", "topic": "test", "project": "voy-rojo"
         }
-        # Gates: 1a=PASS, 1b=WARN (agentmemory down), 1c=SKIP, 1e=PASS
+        # Gates: 1a=PASS, 1b=WARN (best-effort, D8), 1c=SKIP, 1e=PASS
         mock_triple.return_value = [
             GateResult(name="1a", state=PASS, message="ok"),
             GateResult(name="1b", state=WARN, message="AgentMemory timeout"),
@@ -923,13 +1142,22 @@ class TestFluxConsolidated:
         ]
         mock_persistence.list_gate_states.return_value = [
             {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
-            {"gate_name": "1b", "state": "WARN", "mandatory": 1, "message": "AgentMemory timeout"},
+            {"gate_name": "1b", "state": "WARN", "mandatory": 0, "message": "AgentMemory timeout"},
             {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
             {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
         ]
         mock_persistence.create_intento.return_value = 141
         mock_persistence.get_intento.return_value = {
-            "id": 141, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 141,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1b", "state": "WARN", "mandatory": 0, "message": "timeout"},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "deck ok"},
+            ]),
         }
 
         # begin_turn executes gates fresh — NO assert_gates call needed
@@ -937,12 +1165,13 @@ class TestFluxConsolidated:
         assert begin_result["status"] == "started"
         assert begin_result["intento_id"] == 141
         assert begin_result["gates_captured"] == 4
-        assert begin_result["overall"] == "WARN"
+        # D8: the best-effort 1b WARN does not degrade the overall status.
+        assert begin_result["overall"] == "PASS"
 
-        # end_turn completes as fail (only 3/4 PASS+SKIP)
+        # D8: 1b is best-effort, so end_turn is NOT forced to fail.
         end_result = json.loads(end_turn(141))
         assert end_result["status"] == "ok"
-        assert end_result["final_status"] == "fail"
+        assert end_result["final_status"] == "success"
         assert end_result["gates_passed"] == 3
 
         # Verify no manual assert_gates was needed (triple_match was called directly)
@@ -974,7 +1203,16 @@ class TestFluxConsolidated:
         ]
         mock_persistence.create_intento.return_value = 142
         mock_persistence.get_intento.return_value = {
-            "id": 142, "session_id": "sess-1", "project": "voy-rojo"
+            "id": 142,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            # Fresh snapshot captured by begin_turn (W-f/W-g): 1e BLOCK.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1b", "state": "PASS", "mandatory": 1, "message": "ok"},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue"},
+            ]),
         }
 
         begin_result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10, "msg", "user"))
@@ -1184,13 +1422,26 @@ class TestDashboardStability:
 
 class TestMissionListLightMode:
     @patch("ultratimonel.server.persistence")
-    def test_default_returns_full_payload_backward_compatible(self, mock_persistence):
-        """F-TU-07: default (no param) returns full payload — dashboard unchanged."""
+    def test_default_is_compact(self, mock_persistence):
+        """WU4/D4: default (no param) returns compact {id,title,status} only."""
         from ultratimonel.server import mission_list
         full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
         mock_persistence.list_missions.return_value = [full_mission]
 
         result = json.loads(mission_list("testproj"))
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert "description" not in result["missions"][0]
+        assert "checklist_items" not in result["missions"][0]
+        assert result["total"] == 1
+
+    @patch("ultratimonel.server.persistence")
+    def test_include_description_true_returns_full_payload(self, mock_persistence):
+        """F-TU-07: opt-in full payload still returns description + checklist_items."""
+        from ultratimonel.server import mission_list
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        mock_persistence.list_missions.return_value = [full_mission]
+
+        result = json.loads(mission_list("testproj", include_description=True))
         assert result["missions"][0]["description"] == "desc"
         assert result["missions"][0]["checklist_items"] == [{"id": 10}]
         assert result["total"] == 1
@@ -1354,7 +1605,16 @@ class TestBeginTurnProjectFix:
         from ultratimonel.server import begin_turn, end_turn
 
         mock_persistence.get_intento.return_value = {
-            "id": 70, "session_id": "sess-x", "project": "voy-rojo"
+            "id": 70,
+            "session_id": "sess-x",
+            "project": "voy-rojo",
+            # New snapshot contract: final_status derives from gates_detail.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+                {"name": "1b", "state": "PASS", "mandatory": 1},
+                {"name": "1c", "state": "SKIP", "mandatory": 0},
+                {"name": "1e", "state": "PASS", "mandatory": 1},
+            ]),
         }
         mock_persistence.list_gate_states.return_value = [
             {"gate_name": "1a", "state": "PASS", "mandatory": 1},
@@ -1420,3 +1680,1386 @@ class TestCardUpdateDescription:
         payload = update_calls[0][2]
         assert payload["title"] == "Titulo original"
         assert payload["description"] == "nueva descripcion"
+
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_injected_checkboxes_are_sanitized(self, mock_call_mcp):
+        """A "- [x]" line must not reach Deck: it would be persisted as done
+        by a later sync without going through end_turn (D6 invariant)."""
+        from ultratimonel.server import card_update_description
+
+        current_card = {"id": 99, "title": "Titulo", "description": "vieja"}
+        calls = []
+
+        def side_effect(tool_name, tool_fn, params, **kwargs):
+            calls.append((tool_name, tool_fn, params))
+            if tool_fn == "deck_get_card":
+                return (current_card, None)
+            if tool_fn == "deck_update_card":
+                return ({"id": 99}, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = side_effect
+
+        result = json.loads(
+            card_update_description(
+                99,
+                "Notas\n- [x] sneaky done\n- [ ] sneaky open",
+                board_id=1,
+                stack_id=2,
+            )
+        )
+
+        assert result["status"] == "ok"
+        update_calls = [c for c in calls if c[1] == "deck_update_card"]
+        assert len(update_calls) == 1
+        payload = update_calls[0][2]
+        assert payload["title"] == "Titulo"
+        assert "- [x]" not in payload["description"]
+        assert "- [ ]" not in payload["description"]
+        assert payload["description"] == "Notas"
+
+
+# ── WU3: mission/quest write tools (Deck-first, replica refresh) ───────────
+
+
+class FakeDeck:
+    """Records Deck calls and serves canned responses keyed by tool name."""
+
+    def __init__(self):
+        self.calls = []
+        self.responses = {}
+
+    def __call__(self, server_name, tool_name, params=None, timeout=8.0):
+        self.calls.append((tool_name, dict(params or {})))
+        return self.responses.get(tool_name, (None, "unavailable"))
+
+    def calls_for(self, tool_name):
+        return [c for c in self.calls if c[0] == tool_name]
+
+
+def _write_tool_names():
+    """Enumerate the registered MCP tool surface (synchronous helper)."""
+    import asyncio
+
+    from ultratimonel.server import app
+
+    tools = asyncio.run(app.list_tools())
+    return {t.name for t in tools}
+
+
+class TestWriteToolSurface:
+    """Req: the 5 deterministic write tools exist and no mark-complete tool does."""
+
+    def test_deterministic_write_tools_registered(self):
+        names = _write_tool_names()
+        expected = {
+            "mission_create",
+            "mission_update_title",
+            "mission_update_description",
+            "quest_add",
+            "quest_update",
+        }
+        assert expected <= names
+
+    def test_no_mark_complete_tool_exists(self):
+        import re
+
+        names = _write_tool_names()
+        pattern = re.compile(
+            r"(complete|mark|finish|done).*quest|quest.*(complete|mark|finish|done)",
+            re.IGNORECASE,
+        )
+        offenders = sorted(n for n in names if pattern.search(n))
+        assert offenders == []
+
+
+class TestMissionCreate:
+    """mission_create writes Deck first, then refreshes the replica; no quests."""
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_deck_before_replica_and_no_quests(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_create
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+
+        responses = {
+            "deck_get_stacks": ([{"id": 111, "title": "Backlog"}], None),
+            "deck_create_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 7
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_side_effect
+
+        result = json.loads(mission_create("testproj", "Launch", "prose"))
+
+        assert result == {
+            "mission_id": 7,
+            "deck_task_id": 189,
+            "title": "Launch",
+            "status": "pendiente",
+        }
+        assert ("deck", "deck_create_card") in events
+        assert events.index(("deck", "deck_create_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_bridge_failure_makes_no_replica_write(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_create
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_call.side_effect = lambda *a, **k: (None, "unavailable")
+
+        result = json.loads(mission_create("testproj", "Launch"))
+
+        assert "error" in result
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_description_checkbox_lines_are_omitted(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """FIX: description checkbox lines never become quests (D2/D9, Req 1)."""
+        from ultratimonel.server import mission_create
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        responses = {
+            "deck_get_stacks": ([{"id": 111, "title": "Backlog"}], None),
+            "deck_create_card": ({"id": 189}, None),
+        }
+        mock_call.side_effect = (
+            lambda server_name, tool_name, params=None, timeout=8.0: responses.get(
+                tool_name, (None, "unavailable")
+            )
+        )
+        mock_persist.upsert_mission.return_value = 7
+
+        result = json.loads(
+            mission_create(
+                "testproj",
+                "Launch",
+                "Line one\n- [ ] injected quest\n- [x] done quest\nLine two",
+            )
+        )
+
+        assert "error" not in result
+        create_params = next(
+            c.args[2]
+            for c in mock_call.call_args_list
+            if c.args[1] == "deck_create_card"
+        )
+        assert "- [" not in create_params["description"]
+        assert create_params["description"] == "Line one\nLine two"
+        # The replica mirrors the sanitized Deck description.
+        assert (
+            mock_persist.upsert_mission.call_args.kwargs["description"]
+            == "Line one\nLine two"
+        )
+
+
+class TestMissionUpdateTitle:
+    """mission_update_title: not-found short-circuit and Deck-first ordering."""
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_unknown_mission_skips_deck(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import mission_update_title
+
+        mock_persist.get_mission.return_value = None
+
+        result = json.loads(mission_update_title(9999, "New"))
+
+        assert "error" in result
+        assert "9999" in result["error"]
+        mock_call.assert_not_called()
+        mock_maps.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_deck_before_replica_and_preserves_description(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_update_title
+
+        events = []
+        current_desc = "prose\n\n- [ ] alpha"
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Old",
+            "description": current_desc,
+            "status": "pendiente",
+            "checklist_total": 1,
+            "checklist_done": 0,
+        }
+        responses = {
+            "deck_get_card": (
+                {"title": "Old", "description": current_desc},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 5
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_side_effect
+
+        result = json.loads(mission_update_title(5, "New"))
+
+        assert result == {"mission_id": 5, "title": "New", "status": "pendiente"}
+        # deck_stack_id was replicated: no extra stack lookup
+        assert ("deck", "deck_get_stacks") not in events
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+        # description passed through the bridge is the live card description
+        update_params = mock_call.call_args_list[-1].args[2]
+        assert update_params["title"] == "New"
+        assert update_params["description"] == current_desc
+
+
+class TestMissionUpdateDescription:
+    """mission_update_description never touches quests (D3)."""
+
+    _ORIGINAL = "Old prose\n\n- [ ] alpha\n- [x] beta"
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_unknown_mission_skips_deck(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import mission_update_description
+
+        mock_persist.get_mission.return_value = None
+
+        result = json.loads(mission_update_description(9999, "prose"))
+
+        assert "error" in result
+        mock_call.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_preserves_quests_byte_identical_and_deck_first(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import mission_update_description
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Mission",
+            "description": self._ORIGINAL,
+            "status": "pendiente",
+            "checklist_total": 2,
+            "checklist_done": 1,
+        }
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission", "description": self._ORIGINAL},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 5
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_side_effect
+
+        result = json.loads(
+            mission_update_description(5, "New prose\n- [ ] sneaky")
+        )
+
+        assert result == {"mission_id": 5, "status": "ok"}
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+
+        update_params = mock_call.call_args_list[-1].args[2]
+        new_desc = update_params["description"]
+        # quest lines byte-identical, original order
+        assert "- [ ] alpha\n- [x] beta" in new_desc
+        # incoming prose cannot introduce a quest
+        assert "- [ ] sneaky" not in new_desc
+        assert "Old prose" not in new_desc
+        assert "New prose" in new_desc
+        # quest rows themselves are untouched by a description edit
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_non_card_payload_blocks_update_and_replica(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """A non-card Deck payload must not send an update nor refresh the replica."""
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Mission",
+            "description": "old",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        calls = []
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            calls.append(tool_name)
+            if tool_name == "deck_get_card":
+                return (
+                    {"content": [{"type": "text", "text": "<html>502</html>"}]},
+                    None,
+                )
+            return (None, "unavailable")
+
+        mock_call.side_effect = call_side_effect
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert "error" in result
+        assert "deck_update_card" not in calls
+        mock_persist.upsert_mission.assert_not_called()
+
+
+class TestQuestWriteTools:
+    """quest_add / quest_update are Deck-first and always set done=false."""
+
+    _MISSION = {
+        "id": 5,
+        "deck_task_id": 189,
+        "deck_stack_id": 111,
+        "project": "testproj",
+        "title": "Mission",
+        "description": "- [ ] one",
+        "status": "pendiente",
+        "checklist_total": 1,
+        "checklist_done": 0,
+    }
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_quest_add_deck_first_done_false(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import quest_add
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = dict(self._MISSION)
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission", "description": "- [ ] one"},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_checklist_item"))
+            return 77
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_checklist_item.side_effect = upsert_side_effect
+
+        result = json.loads(quest_add(5, "two"))
+
+        assert result == {
+            "quest_id": 77,
+            "mission_id": 5,
+            "title": "two",
+            "done": False,
+        }
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_checklist_item")
+        )
+        # Deck line appended with done=false
+        update_params = mock_call.call_args_list[-1].args[2]
+        assert update_params["description"] == "- [ ] one\n- [ ] two"
+        # replica row written with done=0
+        assert mock_persist.upsert_checklist_item.call_args.kwargs["done"] == 0
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_quest_update_resets_done_false(self, mock_call, mock_persist, mock_maps):
+        from ultratimonel.server import quest_update
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_checklist_item_by_id.return_value = {
+            "id": 77,
+            "mission_id": 5,
+            "item_index": 0,
+            "text": "old",
+            "done": 1,
+        }
+        mock_persist.get_mission.return_value = dict(self._MISSION)
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission", "description": "- [x] old"},
+                None,
+            ),
+            "deck_update_card": ({"id": 189}, None),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_checklist_item"))
+            return 77
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_checklist_item.side_effect = upsert_side_effect
+
+        result = json.loads(quest_update(77, title="new"))
+
+        assert result == {"quest_id": 77, "title": "new", "done": False}
+        assert events.index(("deck", "deck_update_card")) < events.index(
+            ("replica", "upsert_checklist_item")
+        )
+        update_params = mock_call.call_args_list[-1].args[2]
+        assert update_params["description"] == "- [ ] new"
+        assert mock_persist.upsert_checklist_item.call_args.kwargs["done"] == 0
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_bridge_failure_makes_no_replica_write(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import quest_add
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = dict(self._MISSION)
+        mock_call.side_effect = lambda *a, **k: (None, "unavailable")
+
+        result = json.loads(quest_add(5, "two"))
+
+        assert "error" in result
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+
+# ── WU4: turn protocol + compact output (§2.5, §2.6, §2.9) ─────────────────
+
+
+class TestBeginTurnQuestGuard:
+    """WU4/D5: begin_turn validates the quest BEFORE any mutation."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_done_quest_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        from ultratimonel.server import begin_turn
+        import ultratimonel.server as srv
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0,
+            "text": "already done", "done": 1,
+        }
+        # An orphaned active turn exists: the guard MUST run before cleanup.
+        srv._set_active_intento(99, "old-sess", "old-proj")
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+
+        assert result["code"] == "quest_done"
+        assert result["quest_id"] == 10
+        assert "error" in result
+        # Zero mutation: no orphan cleanup, no gates, no intento, no gate state.
+        mock_persistence.complete_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        mock_persistence.upsert_gate_state.assert_not_called()
+        # The orphaned turn is left untouched (the guard precedes cleanup).
+        assert srv._get_active_intento()["intento_id"] == 99
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_missing_quest_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        from ultratimonel.server import begin_turn
+
+        mock_persistence.get_checklist_item_by_id.return_value = None
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+
+        assert result["code"] == "missing_quest"
+        assert result["quest_id"] == 10
+        mock_persistence.create_intento.assert_not_called()
+        mock_triple.assert_not_called()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_open_quest_creates_intento_and_returns_ids(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        from ultratimonel.server import begin_turn
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_extract.return_value = {
+            "sender": "user", "topic": "t", "project": "voy-rojo"
+        }
+        mock_triple.return_value = [
+            GateResult(name="1a", state=PASS),
+            GateResult(name="1b", state=PASS),
+            GateResult(name="1c", state=SKIP),
+            GateResult(name="1e", state=PASS),
+        ]
+        mock_persistence.create_intento.return_value = 200
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 5, 10))
+
+        assert result["status"] == "started"
+        assert result["intento_id"] == 200
+        assert result["mission_id"] == 5
+        assert result["quest_id"] == 10
+        mock_persistence.create_intento.assert_called_once()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_checklist_item_id_alias_still_guards(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """The trailing checklist_item_id alias resolves the same quest guard."""
+        from ultratimonel.server import begin_turn
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "done", "done": 1,
+        }
+        result = json.loads(
+            begin_turn("sess-1", "voy-rojo", mission_id=5, checklist_item_id=10)
+        )
+        assert result["code"] == "quest_done"
+        assert result["quest_id"] == 10
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_missing_quest_id_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """W-a: omitting the quest id must not silently skip the guard."""
+        from ultratimonel.server import begin_turn
+        import ultratimonel.server as srv
+
+        srv._set_active_intento(99, "old-sess", "old-proj")
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", mission_id=5))
+
+        assert result["code"] == "missing_quest"
+        mock_persistence.get_checklist_item_by_id.assert_not_called()
+        mock_persistence.complete_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        # The orphaned turn is left untouched (guard precedes cleanup).
+        assert srv._get_active_intento()["intento_id"] == 99
+        srv._clear_active_intento()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_missing_mission_id_fails_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """W-a: a quest id alone is not enough; mission_id is required too."""
+        from ultratimonel.server import begin_turn
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", quest_id=10))
+
+        assert result["code"] == "missing_mission"
+        mock_persistence.get_checklist_item_by_id.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_quest_from_other_mission_is_rejected_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """A quest id that belongs to another mission fails before any effect."""
+        from ultratimonel.server import begin_turn
+        import ultratimonel.server as srv
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 2, "item_index": 0, "text": "foreign", "done": 0,
+        }
+        # An orphaned active turn exists: the mismatch guard MUST run first.
+        srv._set_active_intento(99, "old-sess", "old-proj")
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 1, 10))
+
+        assert result["code"] == "quest_mission_mismatch"
+        assert result["quest_id"] == 10
+        assert result["mission_id"] == 1
+        mock_persistence.complete_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        mock_persistence.upsert_gate_state.assert_not_called()
+        assert srv._get_active_intento()["intento_id"] == 99
+        srv._clear_active_intento()
+
+    def test_crossed_attempt_never_writes_foreign_card(self, tmp_path, monkeypatch):
+        """A crossed begin_turn records no intento, so end_turn closes nothing.
+
+        End-to-end against a real temp DB with the Deck bridge mocked: the
+        foreign quest and both cards stay untouched (zero Deck writes).
+        """
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        srv._clear_active_intento()
+        db = Persistence(db_path=str(tmp_path / "crossed.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_a = db.upsert_mission(
+            deck_task_id=189, project="voy-rojo", title="A", status="pendiente"
+        )
+        quest_a = db.upsert_checklist_item(
+            mission_id=mission_a, item_index=0, text="a", done=0
+        )
+        mission_b = db.upsert_mission(
+            deck_task_id=200, project="voy-rojo", title="B", status="pendiente"
+        )
+        quest_b = db.upsert_checklist_item(
+            mission_id=mission_b, item_index=0, text="b", done=0
+        )
+
+        deck_writes = []
+        monkeypatch.setattr(
+            srv.deck_bridge,
+            "complete_quest",
+            lambda board_id, stack_id, card_id, position: deck_writes.append(
+                (board_id, stack_id, card_id, position)
+            )
+            or (True, None),
+        )
+
+        # Crossed: mission A + a quest that belongs to mission B.
+        begin = json.loads(
+            srv.begin_turn("sess-1", "voy-rojo", mission_a, quest_id=quest_b)
+        )
+        assert begin["code"] == "quest_mission_mismatch"
+
+        # end_turn on the never-created intento is a no-op error.
+        end = json.loads(srv.end_turn(1))
+        assert end["status"] == "error"
+
+        # Zero effects: no intento, no Deck write, no foreign quest closed.
+        assert db.get_intento(1) is None
+        assert deck_writes == []
+        assert db.get_checklist_item_by_id(quest_b)["done"] == 0
+        assert db.get_checklist_item_by_id(quest_a)["done"] == 0
+        srv._clear_active_intento()
+
+    def test_record_intento_bypass_never_writes_foreign_card(
+        self, tmp_path, monkeypatch
+    ):
+        """W2: record_intento bypasses begin_turn's guard; end_turn must still
+        refuse to close a quest that belongs to another mission.
+
+        The deprecated ``record_intento`` tool creates an intento with an
+        arbitrary (mission_id, checklist_item_id) pair and no cross-check.
+        ``_complete_quest_for_intento`` revalidates membership, so end_turn
+        closes nothing and issues zero Deck writes.
+        """
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        srv._clear_active_intento()
+        db = Persistence(db_path=str(tmp_path / "bypass.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_a = db.upsert_mission(
+            deck_task_id=189, project="voy-rojo", title="A", status="pendiente"
+        )
+        db.upsert_checklist_item(
+            mission_id=mission_a, item_index=0, text="a", done=0
+        )
+        mission_b = db.upsert_mission(
+            deck_task_id=200, project="voy-rojo", title="B", status="pendiente"
+        )
+        quest_b = db.upsert_checklist_item(
+            mission_id=mission_b, item_index=0, text="b", done=0
+        )
+
+        deck_writes = []
+        monkeypatch.setattr(
+            srv.deck_bridge,
+            "complete_quest",
+            lambda board_id, stack_id, card_id, position: deck_writes.append(
+                (board_id, stack_id, card_id, position)
+            )
+            or (True, None),
+        )
+
+        # Bypass: mission A + the quest that actually belongs to mission B.
+        intento_id = json.loads(
+            srv.record_intento("sess-1", "voy-rojo", mission_a, quest_b)
+        )["intento_id"]
+        stored = db.get_intento(intento_id)
+        assert stored["mission_id"] == mission_a
+        assert stored["checklist_item_id"] == quest_b
+
+        end = json.loads(srv.end_turn(intento_id))
+
+        # Membership revalidation: zero effects, foreign quest untouched.
+        assert end["quest_done"] is False
+        assert deck_writes == []
+        assert db.get_checklist_item_by_id(quest_b)["done"] == 0
+        srv._clear_active_intento()
+
+    def test_quest_id_persisted_and_closed_end_to_end(
+        self, tmp_path, monkeypatch
+    ):
+        """CRITICAL: begin_turn(quest_id=...) persists it; end_turn closes it.
+
+        End-to-end against a real temp SQLite DB with the Deck bridge mocked:
+        (a) the intento stores the resolved quest id, (b) complete_quest is
+        called for the quest's item_index, (c) the replica quest becomes done.
+        """
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+        from ultratimonel.gate_engine import GateResult, PASS, SKIP
+
+        srv._clear_active_intento()
+        db = Persistence(db_path=str(tmp_path / "cards-solo-e2e.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_id = db.upsert_mission(
+            deck_task_id=189,
+            project="voy-rojo",
+            title="Mission",
+            status="pendiente",
+        )
+        quest_id = db.upsert_checklist_item(
+            mission_id=mission_id, item_index=0, text="do it", done=0
+        )
+
+        monkeypatch.setattr(
+            srv,
+            "extract_context",
+            lambda message, session_id, sender="user": {
+                "sender": "user",
+                "topic": "t",
+                "project": "voy-rojo",
+            },
+        )
+        monkeypatch.setattr(
+            srv,
+            "run_triple_match",
+            lambda context: [
+                GateResult(name="1a", state=PASS),
+                GateResult(name="1b", state=PASS),
+                GateResult(name="1c", state=SKIP),
+                GateResult(name="1e", state=PASS),
+            ],
+        )
+        monkeypatch.setattr(srv, "_resolve_board_id", lambda project: (21, None))
+        monkeypatch.setattr(
+            srv,
+            "_resolve_stack_for_card",
+            lambda board_id, mission=None: (111, None, None),
+        )
+        complete_calls = []
+
+        def fake_complete(board_id, stack_id, card_id, position):
+            complete_calls.append((board_id, stack_id, card_id, position))
+            return True, None
+
+        monkeypatch.setattr(srv.deck_bridge, "complete_quest", fake_complete)
+
+        begin = json.loads(
+            srv.begin_turn("sess-1", "voy-rojo", mission_id, quest_id=quest_id)
+        )
+        assert begin["status"] == "started"
+        intento_id = begin["intento_id"]
+
+        # (a) The persisted intento holds the resolved quest id.
+        intento = db.get_intento(intento_id)
+        assert intento["checklist_item_id"] == quest_id
+
+        # (b) end_turn drives the Deck write for the matching item_index.
+        end = json.loads(srv.end_turn(intento_id))
+        assert complete_calls == [(21, 111, 189, 0)]
+        assert end["quest_id"] == quest_id
+        assert end["quest_done"] is True
+
+        # (c) The replica quest is now done.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 1
+        srv._clear_active_intento()
+
+
+class TestEndTurnQuestTransition:
+    """WU4/D6: end_turn closes the quest and returns a compact payload."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    @staticmethod
+    def _intento():
+        return {
+            "id": 42,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 5,
+            "checklist_item_id": 10,
+            "status": "running",
+        }
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server._resolve_stack_id")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_flips_quest_and_returns_compact(
+        self, mock_persistence, mock_board, mock_stack, mock_complete
+    ):
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            **self._intento(),
+            # Fresh snapshot captured by begin_turn (W-f/W-g); carries the byte
+            # blobs that must never leak into the compact payload.
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1, "message": "ok",
+                 "result_data": {"blob": "x" * 5000}},
+                {"name": "1b", "state": "PASS", "mandatory": 1, "message": "ok",
+                 "result_data": {"blob": "y" * 5000}},
+                {"name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "ok",
+                 "result_data": {"deck": "z" * 5000}},
+            ]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1a", "state": "PASS", "mandatory": 1, "message": "ok",
+             "result_data": {"blob": "x" * 5000}},
+            {"gate_name": "1b", "state": "PASS", "mandatory": 1, "message": "ok",
+             "result_data": {"blob": "y" * 5000}},
+            {"gate_name": "1c", "state": "SKIP", "mandatory": 0, "message": "n/a"},
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok",
+             "result_data": {"deck": "z" * 5000}},
+        ]
+        mock_persistence.get_mission.return_value = {
+            "id": 5, "deck_task_id": 189, "deck_stack_id": 111, "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        mock_stack.return_value = (111, None)
+        mock_complete.return_value = (True, None)
+
+        raw = end_turn(42)
+        result = json.loads(raw)
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "success"
+        assert result["quest_id"] == 10
+        assert result["quest_done"] is True
+        # Deck write first, then replica refresh.
+        mock_complete.assert_called_once_with(21, 111, 189, 0)
+        mock_persistence.set_quest_done.assert_called_once_with(10, True)
+        # Compact: raw result_data never leaks into the payload.
+        assert "result_data" not in raw
+        assert result["gates"] == [
+            {"name": "1a", "state": "PASS", "mandatory": True},
+            {"name": "1b", "state": "PASS", "mandatory": True},
+            {"name": "1c", "state": "SKIP", "mandatory": False},
+            {"name": "1e", "state": "PASS", "mandatory": True},
+        ]
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server._resolve_stack_id")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_transition_is_unconditional_on_fail(
+        self, mock_persistence, mock_board, mock_stack, mock_complete
+    ):
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            **self._intento(),
+            # Fresh snapshot captured by begin_turn (W-f/W-g): 1e BLOCK.
+            "gates_detail": json.dumps([
+                {"name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue"},
+            ]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1e", "state": "BLOCK", "mandatory": 1, "message": "overdue"},
+        ]
+        mock_persistence.get_mission.return_value = {
+            "id": 5, "deck_task_id": 189, "deck_stack_id": 111, "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 2, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        mock_stack.return_value = (111, None)
+        mock_complete.return_value = (True, None)
+
+        result = json.loads(end_turn(42))
+
+        assert result["final_status"] == "fail"
+        # The quest is consumed anyway (PM: unconditional transition).
+        assert result["quest_done"] is True
+        mock_complete.assert_called_once_with(21, 111, 189, 2)
+        mock_persistence.set_quest_done.assert_called_once_with(10, True)
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server._resolve_stack_id")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_bridge_failure_skips_replica_but_still_completes(
+        self, mock_persistence, mock_board, mock_stack, mock_complete
+    ):
+        from ultratimonel.server import end_turn
+
+        mock_persistence.get_intento.return_value = {
+            **self._intento(),
+            # Fresh snapshot captured by begin_turn (W-f/W-g).
+            "gates_detail": json.dumps([
+                {"name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
+            ]),
+        }
+        mock_persistence.list_gate_states.return_value = [
+            {"gate_name": "1e", "state": "PASS", "mandatory": 1, "message": "ok"},
+        ]
+        mock_persistence.get_mission.return_value = {
+            "id": 5, "deck_task_id": 189, "deck_stack_id": 111, "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        mock_stack.return_value = (111, None)
+        mock_complete.return_value = (None, "unavailable")
+
+        result = json.loads(end_turn(42))
+
+        assert result["status"] == "ok"
+        assert result["quest_done"] is False
+        # Deck-first: no replica write when the Deck write failed (D1).
+        mock_persistence.set_quest_done.assert_not_called()
+        mock_persistence.complete_intento_with_gates.assert_called_once()
+
+    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    @patch("ultratimonel.server._resolve_board_id")
+    @patch("ultratimonel.server.persistence")
+    def test_end_turn_card_not_located_never_writes_guessed_stack(
+        self, mock_persistence, mock_board, mock_call, mock_complete
+    ):
+        """FIX 1: fail closed when the card is not in any board stack (W-g).
+
+        No cached deck_stack_id and a card absent from every stack must NOT
+        resolve to a guessed pending/first stack and MUST NOT write to Deck.
+        """
+        from ultratimonel.server import end_turn
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+        srv._set_active_intento(88, "sess-1", "voy-rojo")
+
+        mock_persistence.get_intento.return_value = {
+            "id": 88,
+            "session_id": "sess-1",
+            "project": "voy-rojo",
+            "mission_id": 5,
+            "checklist_item_id": 10,
+            "status": "running",
+            "gates_detail": json.dumps([
+                {"name": "1a", "state": "PASS", "mandatory": 1},
+            ]),
+        }
+        mock_persistence.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "voy-rojo",
+        }
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 5, "item_index": 0, "text": "open", "done": 0,
+        }
+        mock_board.return_value = (21, None)
+        # Stacks exist, but the mission's card is NOT among them.
+        mock_call.return_value = (
+            [{"id": 111, "title": "Backlog", "cards": []}],
+            None,
+        )
+
+        result = json.loads(end_turn(88))
+
+        assert result["status"] == "ok"
+        assert result["quest_done"] is False
+        # No Deck write against a guessed stack, and no replica refresh.
+        mock_complete.assert_not_called()
+        mock_persistence.set_quest_done.assert_not_called()
+        srv._clear_active_intento()
+
+
+class TestCompactReadAndNoVerbose:
+    """WU4/§2.9, D4: no global verbose flag; read/list outputs are compact."""
+
+    def test_no_tool_exposes_a_global_verbose_param(self):
+        import asyncio
+
+        from ultratimonel.server import app
+
+        tools = asyncio.run(app.list_tools())
+        offenders = [
+            tool.name
+            for tool in tools
+            if "verbose" in (tool.parameters or {}).get("properties", {})
+        ]
+        assert offenders == []
+
+    @patch("ultratimonel.server.persistence")
+    def test_checklist_item_get_is_compact(self, mock_persistence):
+        from ultratimonel.server import checklist_item_get
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 456, "mission_id": 123, "item_index": 1,
+            "text": "Review backlog", "done": 0,
+        }
+        result = json.loads(checklist_item_get(456))
+        assert result == {"id": 456, "text": "Review backlog", "done": False}
+
+
+# ── WU5: sync_task + sync_all deprecation (§2.7, §3.1) ──────────────────────
+
+
+def _tool_map():
+    """Return the registered MCP tools keyed by name (synchronous helper)."""
+    import asyncio
+
+    from ultratimonel.server import app
+
+    return {t.name: t for t in asyncio.run(app.list_tools())}
+
+
+class TestSyncToolSurface:
+    """deck-sync/mission-gate: sync_task + sync_tasks registered; sync_all marked."""
+
+    def test_sync_task_and_sync_tasks_registered(self):
+        tools = _tool_map()
+        assert "sync_task" in tools
+        assert "sync_tasks" in tools
+
+    def test_sync_all_deprecated_but_registered(self):
+        tools = _tool_map()
+        assert "sync_all" in tools
+        assert "~~DEPRECATED~~" in (tools["sync_all"].description or "")
+
+    def test_deprecation_points_to_sync_task(self):
+        tools = _tool_map()
+        # The explicit single-mission recovery path is available alongside.
+        assert "sync_task" in tools
+        assert "sync_task" in (tools["sync_all"].description or "")
+
+
+class TestSyncTask:
+    """D7: sync_task refreshes exactly one mission and backfills deck_stack_id."""
+
+    _CARD_DESC = "Prose line\n\n- [ ] one\n- [x] two"
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_unknown_mission_not_found_no_deck(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import sync_task
+
+        mock_persist.get_mission.return_value = None
+
+        result = json.loads(sync_task(9999))
+
+        assert "error" in result
+        assert "9999" in result["error"]
+        mock_call.assert_not_called()
+        mock_maps.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_refreshes_single_mission_and_backfills_stack(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import sync_task
+
+        events = []
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        responses = {
+            "deck_get_stacks": (
+                [{"id": 111, "title": "Backlog", "cards": [{"id": 189}]}],
+                None,
+            ),
+            "deck_get_card": (
+                {"title": "New title", "description": self._CARD_DESC},
+                None,
+            ),
+        }
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            events.append(("deck", tool_name))
+            return responses.get(tool_name, (None, "unavailable"))
+
+        def upsert_mission_side_effect(*args, **kwargs):
+            events.append(("replica", "upsert_mission"))
+            return 5
+
+        mock_call.side_effect = call_side_effect
+        mock_persist.upsert_mission.side_effect = upsert_mission_side_effect
+
+        result = json.loads(sync_task(5))
+
+        assert result == {
+            "mission_id": 5,
+            "deck_task_id": 189,
+            "status": "pendiente",
+            "quests_synced": 2,
+        }
+        # Exactly one mission is refreshed.
+        assert mock_persist.upsert_mission.call_count == 1
+        assert mock_persist.get_mission.call_count == 1
+        upsert_kwargs = mock_persist.upsert_mission.call_args.kwargs
+        assert upsert_kwargs["title"] == "New title"
+        assert upsert_kwargs["checklist_total"] == 2
+        assert upsert_kwargs["checklist_done"] == 1
+        # deck_stack_id is backfilled so later writes skip deck_get_stacks.
+        mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 111)
+        # Both quests refreshed, done flags preserved from the card.
+        assert mock_persist.upsert_checklist_item.call_count == 2
+        done_flags = [
+            c.kwargs["done"]
+            for c in mock_persist.upsert_checklist_item.call_args_list
+        ]
+        assert done_flags == [0, 1]
+        # Deck read happens before the replica refresh (Deck-first).
+        assert events.index(("deck", "deck_get_card")) < events.index(
+            ("replica", "upsert_mission")
+        )
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_cached_stack_skips_stack_lookup(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "en_progreso",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        responses = {
+            "deck_get_card": ({"title": "Old", "description": "- [ ] only"}, None),
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: responses.get(
+            tool_name, (None, "unavailable")
+        )
+
+        result = json.loads(sync_task(5))
+
+        assert result["quests_synced"] == 1
+        called_tools = [c.args[1] for c in mock_call.call_args_list]
+        assert "deck_get_stacks" not in called_tools
+        mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 111)
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_card_not_found_leaves_stack_null_no_backfill(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """W-g: a card missing from every stack is an error, never a guess."""
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: {
+            "deck_get_stacks": (
+                [{"id": 111, "title": "Backlog", "cards": [{"id": 999}]}],
+                None,
+            ),
+        }.get(tool_name, (None, "unavailable"))
+
+        result = json.loads(sync_task(5))
+
+        assert "error" in result
+        # No guess persisted: deck_stack_id stays NULL and no replica row moves.
+        mock_persist.set_mission_deck_stack_id.assert_not_called()
+        mock_persist.upsert_mission.assert_not_called()
+        mock_persist.upsert_checklist_item.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_removed_deck_quests_delete_stale_replica_rows(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """W3: replica rows beyond the parsed Deck quest set are deleted."""
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 3,
+            "checklist_done": 0,
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: {
+            "deck_get_card": ({"title": "Old", "description": "- [ ] only"}, None),
+        }.get(tool_name, (None, "unavailable"))
+
+        result = json.loads(sync_task(5))
+
+        assert result["quests_synced"] == 1
+        # The two replica rows no longer present in Deck are dropped.
+        mock_persist.delete_checklist_items_beyond.assert_called_once_with(5, 1)
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_status_derived_from_card_stack(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """W3: mission status is refreshed from the card's Deck stack."""
+        from ultratimonel.server import sync_task
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": None,
+            "project": "testproj",
+            "title": "Old",
+            "description": "",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        mock_call.side_effect = lambda server_name, tool_name, params=None, timeout=8.0: {
+            "deck_get_stacks": (
+                [{"id": 222, "title": "Done", "cards": [{"id": 189}]}],
+                None,
+            ),
+            "deck_get_card": ({"title": "Old", "description": "- [x] done"}, None),
+        }.get(tool_name, (None, "unavailable"))
+
+        result = json.loads(sync_task(5))
+
+        assert result["status"] == "completada"
+        assert mock_persist.upsert_mission.call_args.kwargs["status"] == "completada"
+        mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 222)
