@@ -3,16 +3,40 @@
 **Change**: cards-solo-ultratimonel
 **Version**: N/A (delta specs, 6 capabilities)
 **Mode**: Standard (`strict_tdd: false`; runner `.venv/bin/pytest` exists — no strict-TDD module loaded)
-**Branch**: `feature_189_cards-solo-ultratimonel` (inspected by reading files only; NO git command executed)
+**Branch**: `feature_189_s7_docs` (PR #29 tip, per the PM contract; inspected by reading files only; NO git command executed)
 **Verifier**: fresh-context adversarial `sdd-verify` executor (no code modified)
+
+---
+
+## Revision Note (documentation-only, post-review)
+
+A reorder commit, `42d55df`, moved code inside `ultratimonel/server.py`, which shifted
+every line number the original report cited for that module. Those citations were
+invalidated. This revision re-anchors each citation to the current tip and refreshes
+the test counts; it does not rewrite the original findings or the code history.
+
+**Post-verification residuals closed (review follow-up):**
+
+- **Spec 1c consistency.** The `triple-match` scenario "Non-best-effort behavior
+  unchanged" stated "gates 1c and 1e are configured as mandatory", but 1c is
+  `mandatory=False` in `gate_engine.py` (1e is the only mandatory one). The scenario
+  now reads "gate 1e is configured as mandatory and gate 1c as non-mandatory", in line
+  with the D8 alignment.
+- **`end_turn` never writes a foreign card (invariant hardening).** The `begin_turn`
+  guard rejects a crossed quest, but the deprecated `record_intento` tool can still
+  create an intento whose `checklist_item_id` belongs to another mission.
+  `_complete_quest_for_intento` now revalidates `quest["mission_id"] == mission_id`
+  (fail closed, zero Deck/replica writes). New end-to-end test:
+  `TestBeginTurnQuestGuard::test_record_intento_bypass_never_writes_foreign_card`.
+  Covered counts moved from 227 to 228.
 
 ---
 
 ## Executive Summary
 
 The change is additively implemented across 9 files (2 new modules, 7 modified), all
-20 tasks are checked, and the bounded deterministic suite passes **193/193 with 0
-failures** (12 deselected). The declared 13-requirement / 34-scenario mapping is
+20 tasks are checked, and the bounded deterministic suite passes **228/228 with 0
+failures** (12 deselected, measured on this host after the review fixes). The declared 13-requirement / 34-scenario mapping is
 substantially correct: **33/34 scenarios have a passing covering test**; the
 remaining one (`Raw external mark call is eliminated`) is inherently an out-of-repo
 Hermes cutover and is only partially covered. Verification surfaced **0 CRITICAL**, **6
@@ -45,7 +69,7 @@ No unchecked implementation task → no CRITICAL on completeness.
 **Linter / Type-checker**: ➖ Not available (`config.yaml`: `linter.available: false`,
 `type_checker.available: false`).
 
-**Tests**: ✅ 193 passed / ❌ 0 failed / ⚠️ 12 deselected (bounded deterministic subset)
+**Tests**: ✅ 228 passed / ❌ 0 failed / ⚠️ 12 deselected (bounded deterministic subset, measured on this host after the review fixes)
 
 ```text
 timeout 300 .venv/bin/pytest \
@@ -60,12 +84,23 @@ timeout 300 .venv/bin/pytest \
   --deselect tests/test_server.py::TestEndTurn::test_end_turn_partial_pass \
   --deselect tests/test_server.py::TestEndTurn::test_end_turn_clears_active_turn \
   --deselect tests/test_server.py::TestBeginTurnProjectFix::test_end_turn_validates_against_persisted_project
-→ 193 passed, 12 deselected in 10.31s   (exit 0)
+→ 228 passed, 12 deselected in 11.40s   (exit 0)
 ```
 
-Reproduced the exact apply-phase command; result matches the apply claim (193 / 12).
+Re-ran the exact apply-phase command on the current tip after the review fixes: 228 passed / 12 deselected. This is the locally reproducible figure for this host.
 
-Additional independent runs (this verifier):
+**Evidence sources (figures are labelled by origin; do not conflate them):**
+
+| Source | Figures | Notes |
+|--------|---------|-------|
+| PM-declared PR #29 CI/tip | **226 passed / 15 failed (pre-existing)**; `tests/test_integration.py` = **18 tests** | Declared evidence for the PR body; the 15 failures are pre-existing (identical on `main`) and out of scope. |
+| Locally measured, this host, current tip after review fixes | **228 passed / 0 failed / 12 deselected** (exit 0, 11.40s) | Bounded subset of 7 files; excludes `tests/test_context_extractor.py` and the hanging files, so it is not directly comparable to the full CI run above. |
+
+**Hang caveat (this host):** `tests/test_triple_match.py::TestTripleMatch` (5 tests) and
+`tests/test_integration.py` (18 tests) hang (exit 124). They were **not run** locally, so
+their tests are neither in the 228 passed nor in any failure count here.
+
+Additional independent runs (original pre-fix verification, historical):
 
 | Command | Result |
 |---------|--------|
@@ -98,7 +133,7 @@ or the envelope. (The PM note says "1 line"; factually it is a comment plus a 4-
   best_effort=True` (`gate_engine.py:62-75`). `aggregate()` `continue`s past
   best-effort gates (`gate_engine.py:174-176`), so their WARN/BLOCK cannot degrade the
   aggregate. `end_turn` computes `final_status` from persisted mandatory gates only
-  (`server.py:2042-2048`), so 1a/1b WARN cannot force `fail`. Confirmed at runtime by
+  (`server.py:2148-2162`), so 1a/1b WARN cannot force `fail`. Confirmed at runtime by
   `TestBestEffortClassification::test_run_stamps_best_effort_and_later_gates_still_run`
   (1a/1b unavailable → WARN, overall PASS) and
   `TestFluxConsolidated::test_workflow_no_assert_gates_required` (1b WARN mandatory=0 →
@@ -110,7 +145,7 @@ or the envelope. (The PM note says "1 line"; factually it is a comment plus a 4-
   `test_non_best_effort_warn_still_aggregates_to_warn`, `test_mandatory_block_still_blocks`
   — all **PASSED**.
 - **Caveat (WARNING W5)**: the *end_turn* criterion was changed from the old hardcoded
-  `gates_passed >= 4` to mandatory-only (`server.py:2042-2048`, task 2.6/WU4). This is
+  `gates_passed >= 4` to mandatory-only (`server.py:2148-2162`, task 2.6/WU4). This is
   the designed D8 behavior and it preserves 1c's **aggregate** classification, but it
   means a 1c WARN no longer forces `end_turn` `fail` (under the old `>=4` criterion it
   did). So "non-best-effort behavior unchanged" holds at the aggregate layer, not at the
@@ -133,8 +168,8 @@ The deselection is **defensible but does remove integration-level runtime covera
   `…partial_pass`, `…clears_active_turn`, `TestBeginTurnProjectFix::test_end_turn_validates_against_persisted_project`):
   they call `begin_turn` **without** patching `run_triple_match`, so they hit real MCP.
   They are **order-dependent**: each **hangs when run in isolation** (exit 124) and as a
-  group (1/7 completed), yet `tests/test_server.py` **as a whole passes 84/84 four times
-  in a row** (they complete in ~1.1s in-file). This confirms pre-existing host-specific
+  group (1/7 completed), yet `tests/test_server.py` **as a whole passed 84/84 four times
+  in a row in the original pre-fix verification** (they complete in ~1.1s in-file). This confirms pre-existing host-specific
   non-determinism, not a regression.
 - **Net coverage impact**: the bounded subset does not exercise (a) real `run_triple_match`
   orchestration through `begin_turn`, nor (b) the pre-existing `TestEndTurn` assertions in
@@ -174,9 +209,10 @@ against the verbose runtime pass list. Result: **33/34 COMPLIANT**, **1/34 PARTI
 
 ### Focus 5 — Regression (bounded deterministic subset)
 
-Exact command and counts are in "Build & Tests Execution". **193 passed, 0 failed, 12
-deselected**, exit 0 — matches the apply claim. `test_server.py` full-file run also
-passes 84/84 (×4). The 5 `TestTripleMatch` tests and `test_integration.py` are confirmed
+Exact command and counts are in "Build & Tests Execution". **228 passed, 0 failed, 12
+deselected**, exit 0 (current tip after the review fixes). The `test_server.py` full-file
+run also passed 84/84 (×4) in the original pre-fix verification. The 5 `TestTripleMatch`
+tests and `test_integration.py` (18 tests) are confirmed
 pre-existing hangs, not regressions caused by this change (they were not touched by the
 change surface).
 
@@ -184,10 +220,10 @@ change surface).
 
 | Declared policy | Evidence | Verdict |
 |---|---|---|
-| `sync_task` refreshes a **single** mission; does **not delete** quests removed in Deck | `server.py:1078-1151`: reads one mission, upserts one mission row, loops quests with `upsert_checklist_item(item_index=idx)`. No delete call. `TestSyncTask::test_refreshes_single_mission_and_backfills_stack` asserts `upsert_mission.call_count == 1`. | Single-mission ✅; deletion ❌ not implemented (WARNING W3, deviation 16) |
-| Quest closure is **Deck-first**; bridge failure → no replica write; turn closes with `quest_done=false`; recoverable via `sync_task` | `server.py:1908-1923`: `set_quest_done` only after `deck_bridge.complete_quest` returns ok; on failure returns `(quest_id, False)` and `end_turn` still completes. `TestEndTurnQuestTransition::test_end_turn_bridge_failure_skips_replica_but_still_completes` asserts `set_quest_done.assert_not_called()` and `complete_intento_with_gates` called. `sync_task` re-reads Deck and refreshes replica → recoverable. | ✅ Confirmed |
-| `end_turn` compact output (no `result_data`) | `server.py:2084` uses `compact.compact_gates(final_gates)` = `{name, state, mandatory}`. Test asserts `"result_data" not in raw` and exact compact gate list. | ✅ Confirmed |
-| `begin_turn` hard-fail guard on a done quest (zero mutation) | `server.py:1712-1737`: guard runs before orphan cleanup/gates; returns `{error, code:"quest_done", quest_id}`. `TestBeginTurnQuestGuard::test_done_quest_fails_with_no_mutation` asserts no cleanup/gates/intento/gate-state writes. | ✅ Confirmed |
+| `sync_task` refreshes a **single** mission; does **not delete** quests removed in Deck | `server.py:1106-1213`: reads one mission, upserts one mission row, loops quests with `upsert_checklist_item(item_index=idx)`. No delete call. `TestSyncTask::test_refreshes_single_mission_and_backfills_stack` asserts `upsert_mission.call_count == 1`. | Single-mission ✅; deletion ❌ not implemented (WARNING W3, deviation 16) |
+| Quest closure is **Deck-first**; bridge failure → no replica write; turn closes with `quest_done=false`; recoverable via `sync_task` | `server.py:2019-2027`: `set_quest_done` only after `deck_bridge.complete_quest` returns ok; on failure returns `(quest_id, False)` and `end_turn` still completes. `TestEndTurnQuestTransition::test_end_turn_bridge_failure_skips_replica_but_still_completes` asserts `set_quest_done.assert_not_called()` and `complete_intento_with_gates` called. `sync_task` re-reads Deck and refreshes replica → recoverable. | ✅ Confirmed |
+| `end_turn` compact output (no `result_data`) | `server.py:2198` uses `compact.compact_gates(final_gates)` = `{name, state, mandatory}`. Test asserts `"result_data" not in raw` and exact compact gate list. | ✅ Confirmed |
+| `begin_turn` hard-fail guard on a done quest (zero mutation) | `server.py:1805-1825`: guard runs before orphan cleanup/gates; returns `{error, code:"quest_done", quest_id}`. `TestBeginTurnQuestGuard::test_done_quest_fails_with_no_mutation` asserts no cleanup/gates/intento/gate-state writes. | ✅ Confirmed |
 
 ---
 
@@ -256,7 +292,7 @@ Status legend: ✅ COMPLIANT (covering test passed) · ⚠️ PARTIAL · ❌ UNT
 | end_turn Owns the Only false→true Transition | end_turn completes the quest | `test_server.py > TestEndTurnQuestTransition::test_end_turn_flips_quest_and_returns_compact` | ✅ COMPLIANT |
 | end_turn Owns the Only false→true Transition | No other tool transitions a quest | `test_server.py > TestWriteToolSurface::test_no_mark_complete_tool_exists` | ✅ COMPLIANT |
 | end_turn Owns the Only false→true Transition | Raw external mark call is eliminated | Repo-side: `test_no_mark_complete_tool_exists` + `test_end_turn_flips_quest_and_returns_compact` (transition only via `deck_bridge.complete_quest`). Hermes-side (no raw Nextcloud call) is out-of-repo cutover. | ⚠️ PARTIAL |
-| end_turn Remains a Wrapper | Existing behavior preserved | `test_server.py > TestEndTurnQuestTransition` (3); pre-existing `TestEndTurn` passes in full-file run (`test_server.py` = 84/84) but is deselected in the bounded subset | ✅ COMPLIANT |
+| end_turn Remains a Wrapper | Existing behavior preserved | `test_server.py > TestEndTurnQuestTransition` (3); pre-existing `TestEndTurn` passed in the original pre-fix full-file run (`test_server.py` = 84/84) but is deselected in the bounded subset | ✅ COMPLIANT |
 | end_turn Remains a Wrapper | No new bottleneck tool | `test_server.py > TestWriteToolSurface::test_no_mark_complete_tool_exists` | ✅ COMPLIANT |
 
 **Compliance summary**: 33/34 scenarios COMPLIANT, 1/34 PARTIAL (0 UNTESTED, 0 FAILING).
@@ -267,15 +303,15 @@ Status legend: ✅ COMPLIANT (covering test passed) · ⚠️ PARTIAL · ❌ UNT
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Deterministic Mission Write Tools | ✅ Implemented | `mission_create` / `mission_update_title` / `mission_update_description` present, Deck-first via `deck_bridge`, not-found short-circuits before any Deck call (`server.py:1351-1522`). |
+| Deterministic Mission Write Tools | ✅ Implemented | `mission_create` / `mission_update_title` / `mission_update_description` present, Deck-first via `deck_bridge`, not-found short-circuits before any Deck call (`server.py:1413-1591`). |
 | Quest Write Tools / No Mark-Complete | ✅ Implemented | `quest_add` / `quest_update` always `done=False`; no tool matches mark-complete patterns (verified by `app.list_tools()` test). |
 | Deck Is the Source of Truth | ✅ Implemented | Bridge writes Deck via `mcp_client`; replica refreshed only after ack; bridge failure returns error and performs no local write. |
-| begin_turn Fails on a Done Quest | ✅ Implemented | Guard at `server.py:1712-1737`, before orphan cleanup/gates; `quest_id` canonical 4th positional + `checklist_item_id` alias. |
-| end_turn Owns the Only false→true Transition | ✅ Implemented | `_complete_quest_for_intento` (`server.py:1863-1923`) is the only `set_quest_done(…, True)` path; unconditional on `final_status`. |
+| begin_turn Fails on a Done Quest | ✅ Implemented | Guard at `server.py:1805-1825`, before orphan cleanup/gates; `quest_id` canonical 4th positional + `checklist_item_id` alias. |
+| end_turn Owns the Only false→true Transition | ✅ Implemented | `_complete_quest_for_intento` (`server.py:1971-2035`) is the only `set_quest_done(…, True)` path; unconditional on `final_status`. |
 | end_turn Remains a Wrapper | ✅ Implemented | Pre-existing flow preserved; compact `gates` + `quest_id`/`quest_done` added. |
 | sync_task Recovers One Mission | ⚠️ Partial | Single-mission refresh + `deck_task_id` resolution ✅. Deletion of quests removed in Deck is **not** performed (W3). |
 | sync_tasks Is Retained | ✅ Implemented | `sync_tasks` untouched. |
-| sync_all Is Deprecated but Registered | ✅ Implemented | Docstring starts with `~~DEPRECATED~~`, points to `sync_task`, remains registered (`server.py:1154-1200`). |
+| sync_all Is Deprecated but Registered | ✅ Implemented | Docstring starts with `~~DEPRECATED~~`, points to `sync_task`, remains registered (`server.py:1216-1263`). |
 | Compact Output by Default | ✅ Implemented | `compact.py` pure serializers; `mission_list` default `include_description=False`; `checklist_item_get` compact; `end_turn` drops `result_data`. |
 | No Global Verbose Flag | ✅ Implemented | No `verbose` parameter anywhere in the tool surface (test-enforced). |
 | Gate Orchestration / Best-Effort | ✅ Implemented | `best_effort` on `GateConfig`/`GateResult`; 1a/1b `mandatory=False, best_effort=True`; `aggregate` skips best-effort WARN/BLOCK; `run_triple_match` stamps classification; `end_turn` uses mandatory-only criterion. |
@@ -349,8 +385,10 @@ passing covering test (one process/cutover half is PARTIAL, recorded as WARNING)
   `run_gate` is not used in the production path (server uses `run_triple_match`), but it is
   a latent behavior change for any future caller/test.
 - **S3 — Redundant classification stamping.** The stamp exists in `run_triple_match`
-  (authoritative), `begin_turn` (`server.py:1783-1788`), and `assert_gates`
-  (`server.py:2170`). Harmless but duplicated; a single helper would reduce drift risk.
+  (authoritative, `triple_match.py:401-406`) and is re-applied in `begin_turn`
+  (`server.py:1887-1892`). `assert_gates` inherits the stamped results from
+  `run_triple_match` (`server.py:2265`) rather than stamping again; a single helper would
+  reduce drift risk.
 - **S4 — Dead local in `aggregate`.** `all_pass = True` (`gate_engine.py:161`) is assigned
   but never used.
 - **S5 — `mission_update_description` replica stores incoming prose only.** The replica
@@ -363,17 +401,17 @@ passing covering test (one process/cutover half is PARTIAL, recorded as WARNING)
 
 **PASS WITH WARNINGS**
 
-All 20 tasks complete, the bounded deterministic suite is green (193 passed / 0 failed /
-12 deselected, exit 0), and 33/34 spec scenarios have a passing covering test (1 PARTIAL
+All 20 tasks complete, the bounded deterministic suite is green (228 passed / 0 failed /
+12 deselected, exit 0; current tip after the review fixes), and 33/34 spec scenarios have a passing covering test (1 PARTIAL
 out-of-repo cutover). No CRITICAL issues. The change is spec-coherent and design-coherent
 within the limits of its declared evidence; the warnings are honest scope/limitation gaps
 (partial runtime coverage, no real Deck E2E, `sync_task` non-deletion, spec-schema
 deviation, and the D8 end_turn-criterion nuance) that the apply phase largely disclosed.
 
 ### Limitations (declared honestly)
-- 12 tests deselected; 5 `TestTripleMatch` + all `test_integration.py` confirmed hanging
-  (pre-existing). The 7 `test_server.py` deselections are order-dependent and pass only
-  in the full-file run.
+- 12 tests deselected; 5 `TestTripleMatch` and all `test_integration.py` (18 tests)
+  confirmed hanging (pre-existing) and **not run** locally. The 7 `test_server.py`
+  deselections are order-dependent and pass only in the full-file run.
 - No live Deck E2E; all new write paths verified against mocks/fakes.
 - No coverage tool, linter, type-checker, or build step available.
 - Source inspection only; **no git command was executed** and **no code was modified** by

@@ -4,8 +4,8 @@
 
 ### Requirement: Gate Orchestration and Best-Effort Classification
 
-The triple match SHALL execute gates in sequence 1a -> 1b -> 1c -> 1e and compile their results into a single `context_envelope` containing memory snippets, checkpoint state, steering docs, and deck cards. Gate 1a (agentmemory) and Gate 1b (agentcheckpoint) SHALL leave the mandatory gate set and become best-effort. Failure or warning from 1a or 1b MUST NOT block turn success and MUST NOT force the `end_turn` final status to `fail`. Behavior of gates 1c and 1e and independent per-gate timeouts MUST be preserved.
-(Previously: 1a and 1b were mandatory gates, and accumulated WARN states from them forced the `end_turn` final status to `fail`.)
+The triple match SHALL execute gates in sequence 1a -> 1b -> 1c -> 1e and compile their results into a single `context_envelope` containing memory snippets, checkpoint state, steering docs, and deck cards. Gate 1a (agentmemory) and Gate 1b (agentcheckpoint) SHALL leave the mandatory gate set and become best-effort. Failure or warning from 1a or 1b MUST NOT block turn success and MUST NOT force the `end_turn` final status to `fail`. Gates 1c and 1e SHALL keep their existing configuration, mandatory classification, and aggregate failure handling, and independent per-gate timeouts MUST be preserved. Per design D8, `end_turn` SHALL compute `final_status` from mandatory gates only, so a non-`PASS` state from a non-mandatory gate (1a, 1b, or 1c) MUST NOT force `final_status` to `fail`.
+(Previously: 1a and 1b were mandatory gates, and accumulated WARN states from them forced the `end_turn` final status to `fail`. Also previously: the preservation clause read as an unconditional "1c/1e behavior MUST be preserved"; design D8 supersedes that reading by scoping preservation to 1c/1e's configuration and aggregate behavior, and by deriving `end_turn` `final_status` from mandatory gates only.)
 
 #### Scenario: Full triple match succeeds
 
@@ -40,6 +40,6 @@ The triple match SHALL execute gates in sequence 1a -> 1b -> 1c -> 1e and compil
 
 #### Scenario: Non-best-effort behavior unchanged
 
-- GIVEN gates 1c and 1e are configured as mandatory
+- GIVEN gate 1e is configured as mandatory and gate 1c as non-mandatory
 - WHEN the triple match executes
-- THEN their mandatory classification and failure handling are unchanged
+- THEN their configuration (1e mandatory, 1c non-mandatory) and aggregate failure handling are unchanged
