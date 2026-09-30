@@ -91,22 +91,41 @@ def _as_text(value: Any) -> Optional[str]:
 
 
 def _normalize_card(card: Any) -> Optional[dict[str, Any]]:
-    """Normalize a ``deck_get_card`` payload to a single card dict, or None."""
+    """Normalize a ``deck_get_card`` payload to a single card dict, or None.
+
+    A dict is only accepted when it actually has the shape of a card: a
+    non-empty ``title`` and a ``description`` field. Any other payload — a
+    textual error (``{"type": "text", "text": "Deck unavailable"}``), an HTML
+    gateway page wrapped in a content block, or a missing/empty title — yields
+    ``None`` so callers fail with ``unexpected Deck response shape`` instead of
+    overwriting the card with ``title=''`` and losing the title and its quests.
+    """
     candidate = card
     if isinstance(candidate, list) and candidate:
         candidate = candidate[0]
 
-    if isinstance(candidate, dict):
-        # Defensive double-unwrap for http-to-stdio content blocks.
-        text = _as_text(candidate)
-        if text is not None:
-            try:
-                parsed = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                return candidate
-            candidate = parsed[0] if isinstance(parsed, list) and parsed else parsed
+    if not isinstance(candidate, dict):
+        return None
 
-    return candidate if isinstance(candidate, dict) else None
+    # Defensive double-unwrap for http-to-stdio content blocks.
+    text = _as_text(candidate)
+    if text is not None:
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, list) and parsed:
+            candidate = parsed[0]
+        elif parsed is not None:
+            candidate = parsed
+
+    if not isinstance(candidate, dict):
+        return None
+    if not candidate.get("title"):
+        return None
+    if "description" not in candidate:
+        return None
+    return candidate
 
 
 def _read_card(
@@ -298,6 +317,9 @@ def update_description(
         return None, err
 
     title = card.get("title", "") or ""
+    if not title:
+        # Baseline guard: never write a card whose title could not be resolved.
+        return None, "unexpected Deck response shape"
     current = card.get("description", "") or ""
     original_lines = current.split("\n")
     preserved = [

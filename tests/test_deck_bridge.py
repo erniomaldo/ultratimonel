@@ -325,6 +325,44 @@ class TestQuestTextSingleLine:
         assert fake_mcp.calls_for("deck_update_card") == []
 
 
+class TestUnexpectedResponseShape:
+    """A non-card Deck payload fails the read, never sends ``title=''``."""
+
+    _NON_CARD_PAYLOADS = [
+        {"type": "text", "text": "Deck unavailable"},
+        {"content": [{"type": "text", "text": "<html>502</html>"}]},
+    ]
+
+    @pytest.mark.parametrize("payload", _NON_CARD_PAYLOADS)
+    def test_update_description_rejects_non_card_payload(self, fake_mcp, payload):
+        fake_mcp.responses["deck_get_card"] = (payload, None)
+
+        ok, err = deck_bridge.update_description(21, 111, 42, "prose")
+
+        assert ok is None
+        assert err == "unexpected Deck response shape"
+        assert fake_mcp.calls_for("deck_update_card") == []
+
+    @pytest.mark.parametrize("payload", _NON_CARD_PAYLOADS)
+    def test_update_title_rejects_non_card_payload(self, fake_mcp, payload):
+        fake_mcp.responses["deck_get_card"] = (payload, None)
+
+        ok, err = deck_bridge.update_title(21, 111, 42, "New")
+
+        assert ok is None
+        assert err == "unexpected Deck response shape"
+        assert fake_mcp.calls_for("deck_update_card") == []
+
+    def test_card_without_description_field_is_rejected(self, fake_mcp):
+        fake_mcp.responses["deck_get_card"] = ({"title": "Only title"}, None)
+
+        ok, err = deck_bridge.update_description(21, 111, 42, "prose")
+
+        assert ok is None
+        assert err == "unexpected Deck response shape"
+        assert fake_mcp.calls_for("deck_update_card") == []
+
+
 class TestBridgeUnavailable:
     """A dead bridge must fail loudly and never touch local persistence."""
 
