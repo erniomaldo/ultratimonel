@@ -1681,6 +1681,43 @@ class TestCardUpdateDescription:
         assert payload["title"] == "Titulo original"
         assert payload["description"] == "nueva descripcion"
 
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_injected_checkboxes_are_sanitized(self, mock_call_mcp):
+        """A "- [x]" line must not reach Deck: it would be persisted as done
+        by a later sync without going through end_turn (D6 invariant)."""
+        from ultratimonel.server import card_update_description
+
+        current_card = {"id": 99, "title": "Titulo", "description": "vieja"}
+        calls = []
+
+        def side_effect(tool_name, tool_fn, params, **kwargs):
+            calls.append((tool_name, tool_fn, params))
+            if tool_fn == "deck_get_card":
+                return (current_card, None)
+            if tool_fn == "deck_update_card":
+                return ({"id": 99}, None)
+            return (None, "unknown tool")
+
+        mock_call_mcp.side_effect = side_effect
+
+        result = json.loads(
+            card_update_description(
+                99,
+                "Notas\n- [x] sneaky done\n- [ ] sneaky open",
+                board_id=1,
+                stack_id=2,
+            )
+        )
+
+        assert result["status"] == "ok"
+        update_calls = [c for c in calls if c[1] == "deck_update_card"]
+        assert len(update_calls) == 1
+        payload = update_calls[0][2]
+        assert payload["title"] == "Titulo"
+        assert "- [x]" not in payload["description"]
+        assert "- [ ]" not in payload["description"]
+        assert payload["description"] == "Notas"
+
 
 # ── WU3: mission/quest write tools (Deck-first, replica refresh) ───────────
 
@@ -1993,6 +2030,46 @@ class TestMissionUpdateDescription:
         # quest rows themselves are untouched by a description edit
         mock_persist.upsert_checklist_item.assert_not_called()
 
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_non_card_payload_blocks_update_and_replica(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """A non-card Deck payload must not send an update nor refresh the replica."""
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = {
+            "id": 5,
+            "deck_task_id": 189,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Mission",
+            "description": "old",
+            "status": "pendiente",
+            "checklist_total": 0,
+            "checklist_done": 0,
+        }
+        calls = []
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            calls.append(tool_name)
+            if tool_name == "deck_get_card":
+                return (
+                    {"content": [{"type": "text", "text": "<html>502</html>"}]},
+                    None,
+                )
+            return (None, "unavailable")
+
+        mock_call.side_effect = call_side_effect
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert "error" in result
+        assert "deck_update_card" not in calls
+        mock_persist.upsert_mission.assert_not_called()
+
 
 class TestQuestWriteTools:
     """quest_add / quest_update are Deck-first and always set done=false."""
@@ -2265,6 +2342,145 @@ class TestBeginTurnQuestGuard:
         mock_persistence.create_intento.assert_not_called()
         mock_extract.assert_not_called()
         mock_triple.assert_not_called()
+
+    @patch("ultratimonel.server.run_triple_match")
+    @patch("ultratimonel.server.extract_context")
+    @patch("ultratimonel.server.persistence")
+    def test_quest_from_other_mission_is_rejected_with_no_mutation(
+        self, mock_persistence, mock_extract, mock_triple
+    ):
+        """A quest id that belongs to another mission fails before any effect."""
+        from ultratimonel.server import begin_turn
+        import ultratimonel.server as srv
+
+        mock_persistence.get_checklist_item_by_id.return_value = {
+            "id": 10, "mission_id": 2, "item_index": 0, "text": "foreign", "done": 0,
+        }
+        # An orphaned active turn exists: the mismatch guard MUST run first.
+        srv._set_active_intento(99, "old-sess", "old-proj")
+
+        result = json.loads(begin_turn("sess-1", "voy-rojo", 1, 10))
+
+        assert result["code"] == "quest_mission_mismatch"
+        assert result["quest_id"] == 10
+        assert result["mission_id"] == 1
+        mock_persistence.complete_intento.assert_not_called()
+        mock_extract.assert_not_called()
+        mock_triple.assert_not_called()
+        mock_persistence.create_intento.assert_not_called()
+        mock_persistence.upsert_gate_state.assert_not_called()
+        assert srv._get_active_intento()["intento_id"] == 99
+        srv._clear_active_intento()
+
+    def test_crossed_attempt_never_writes_foreign_card(self, tmp_path, monkeypatch):
+        """A crossed begin_turn records no intento, so end_turn closes nothing.
+
+        End-to-end against a real temp DB with the Deck bridge mocked: the
+        foreign quest and both cards stay untouched (zero Deck writes).
+        """
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        srv._clear_active_intento()
+        db = Persistence(db_path=str(tmp_path / "crossed.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_a = db.upsert_mission(
+            deck_task_id=189, project="voy-rojo", title="A", status="pendiente"
+        )
+        quest_a = db.upsert_checklist_item(
+            mission_id=mission_a, item_index=0, text="a", done=0
+        )
+        mission_b = db.upsert_mission(
+            deck_task_id=200, project="voy-rojo", title="B", status="pendiente"
+        )
+        quest_b = db.upsert_checklist_item(
+            mission_id=mission_b, item_index=0, text="b", done=0
+        )
+
+        deck_writes = []
+        monkeypatch.setattr(
+            srv.deck_bridge,
+            "complete_quest",
+            lambda board_id, stack_id, card_id, position: deck_writes.append(
+                (board_id, stack_id, card_id, position)
+            )
+            or (True, None),
+        )
+
+        # Crossed: mission A + a quest that belongs to mission B.
+        begin = json.loads(
+            srv.begin_turn("sess-1", "voy-rojo", mission_a, quest_id=quest_b)
+        )
+        assert begin["code"] == "quest_mission_mismatch"
+
+        # end_turn on the never-created intento is a no-op error.
+        end = json.loads(srv.end_turn(1))
+        assert end["status"] == "error"
+
+        # Zero effects: no intento, no Deck write, no foreign quest closed.
+        assert db.get_intento(1) is None
+        assert deck_writes == []
+        assert db.get_checklist_item_by_id(quest_b)["done"] == 0
+        assert db.get_checklist_item_by_id(quest_a)["done"] == 0
+        srv._clear_active_intento()
+
+    def test_record_intento_bypass_never_writes_foreign_card(
+        self, tmp_path, monkeypatch
+    ):
+        """W2: record_intento bypasses begin_turn's guard; end_turn must still
+        refuse to close a quest that belongs to another mission.
+
+        The deprecated ``record_intento`` tool creates an intento with an
+        arbitrary (mission_id, checklist_item_id) pair and no cross-check.
+        ``_complete_quest_for_intento`` revalidates membership, so end_turn
+        closes nothing and issues zero Deck writes.
+        """
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        srv._clear_active_intento()
+        db = Persistence(db_path=str(tmp_path / "bypass.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_a = db.upsert_mission(
+            deck_task_id=189, project="voy-rojo", title="A", status="pendiente"
+        )
+        db.upsert_checklist_item(
+            mission_id=mission_a, item_index=0, text="a", done=0
+        )
+        mission_b = db.upsert_mission(
+            deck_task_id=200, project="voy-rojo", title="B", status="pendiente"
+        )
+        quest_b = db.upsert_checklist_item(
+            mission_id=mission_b, item_index=0, text="b", done=0
+        )
+
+        deck_writes = []
+        monkeypatch.setattr(
+            srv.deck_bridge,
+            "complete_quest",
+            lambda board_id, stack_id, card_id, position: deck_writes.append(
+                (board_id, stack_id, card_id, position)
+            )
+            or (True, None),
+        )
+
+        # Bypass: mission A + the quest that actually belongs to mission B.
+        intento_id = json.loads(
+            srv.record_intento("sess-1", "voy-rojo", mission_a, quest_b)
+        )["intento_id"]
+        stored = db.get_intento(intento_id)
+        assert stored["mission_id"] == mission_a
+        assert stored["checklist_item_id"] == quest_b
+
+        end = json.loads(srv.end_turn(intento_id))
+
+        # Membership revalidation: zero effects, foreign quest untouched.
+        assert end["quest_done"] is False
+        assert deck_writes == []
+        assert db.get_checklist_item_by_id(quest_b)["done"] == 0
+        srv._clear_active_intento()
 
     def test_quest_id_persisted_and_closed_end_to_end(
         self, tmp_path, monkeypatch

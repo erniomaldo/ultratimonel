@@ -1823,6 +1823,22 @@ def begin_turn(
             ensure_ascii=False,
             default=str,
         )
+    if isinstance(target_quest, dict) and target_quest.get("mission_id") != mission_id:
+        # The quest must belong to the requested mission (D5). Otherwise a
+        # crossed id would let end_turn close the wrong card position.
+        return json.dumps(
+            {
+                "error": (
+                    f"Quest {resolved_quest_id} does not belong to "
+                    f"mission {mission_id}"
+                ),
+                "code": "quest_mission_mismatch",
+                "quest_id": resolved_quest_id,
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     # 1. Check for orphaned/active turn — auto-cleanup if needed
     active = _get_active_intento()
@@ -1984,6 +2000,18 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
             "Quest closure skipped: mission #%s or quest #%s not found",
             mission_id,
             quest_id,
+        )
+        return quest_id, False
+
+    # Membership parity (W2): revalidate here too. begin_turn rejects a crossed
+    # quest, but the deprecated record_intento tool can still create an intento
+    # whose checklist_item_id belongs to another mission. end_turn must NEVER
+    # write the foreign card, so fail closed with zero effects.
+    if quest.get("mission_id") != mission_id:
+        logger.warning(
+            "Quest closure skipped: quest #%s does not belong to mission #%s",
+            quest_id,
+            mission_id,
         )
         return quest_id, False
 
@@ -2398,7 +2426,10 @@ def card_update_description(
     if not current_title:
         return json.dumps({"error": "Could not determine current card title"})
 
-    # Update only description — title explicitly preserved
+    # Update only description — title explicitly preserved. The incoming prose
+    # is sanitized first: a raw "- [x]" line would otherwise be persisted by a
+    # later sync as done WITHOUT going through end_turn (D6 invariant).
+    cleaned_description = deck_bridge.clean_prose(description)
     result, update_err = call_mcp_tool(
         "nextcloud",
         TOOL_NAMES["nextcloud"]["deck_update_card"],
@@ -2407,7 +2438,7 @@ def card_update_description(
             "card_id": card_id,
             "stack_id": stack_id,
             "title": current_title,
-            "description": description,
+            "description": cleaned_description,
         },
         timeout=8.0,
     )
