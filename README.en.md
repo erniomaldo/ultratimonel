@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Ultratimonel](docs/logo.png)
+<img src="docs/logo.png" alt="Ultratimonel" width="320">
 
 **Pre-flight gate enforcement + Missions + Dashboard for [Hermes Agent](https://hermes-agent.nousresearch.com/docs).**
 
