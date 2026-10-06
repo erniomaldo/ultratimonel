@@ -63,10 +63,10 @@ their immediate parent; a polluted diff is a branching bug → retarget/rebase.
 
 ## Phase 1: Data model & migration
 
-- [ ] 1.1 `persistence.py`: bump `SCHEMA_VERSION` 5→6; `_migrate_v5_to_v6` adding `checklist_items.attempts_authorized/attempts_used`, `intentos.summary/evidence/closed_at` (idempotent). [TCE2]
-- [ ] 1.2 `persistence.py`: `CREATE TABLE IF NOT EXISTS attempt_grants` + `turn_bitacora` (append-only) in fresh DDL and migration. [TCE2, TT2]
-- [ ] 1.3 `persistence.py`: methods `grant_attempts`, `get_attempt_budget`, `increment_attempts_used`, `append_bitacora` (INSERT-only), `complete_intento_with_summary`. [TT2, TCE2]
-- [ ] 1.4 `tests/test_persistence.py`: v5→v6 migration idempotency, budget round-trip, bitácora append preserves prior rows. [TT2, TCE2]
+- [x] 1.1 `persistence.py`: bump `SCHEMA_VERSION` 5→6; `_migrate_v5_to_v6` adding `checklist_items.attempts_authorized/attempts_used`, `intentos.summary/evidence/closed_at` (idempotent). [TCE2]
+- [x] 1.2 `persistence.py`: `CREATE TABLE IF NOT EXISTS attempt_grants` + `turn_bitacora` (append-only) in fresh DDL and migration. [TCE2, TT2]
+- [x] 1.3 `persistence.py`: methods `grant_attempts`, `get_attempt_budget`, `increment_attempts_used`, `append_bitacora` (INSERT-only), `complete_intento_with_summary`. [TT2, TCE2]
+- [x] 1.4 `tests/test_persistence.py`: v5→v6 migration idempotency, budget round-trip, bitácora append preserves prior rows. [TT2, TCE2]
 
 ## Phase 2: Turn enforcement & telemetry
 
