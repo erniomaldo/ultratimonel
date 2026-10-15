@@ -177,6 +177,9 @@ new bitácora view; legacy `dashboard/app.js` parity for staging.
 so actions must be client-side fetches), Astro-only (leaves staging broken).
 **Rationale**: matches the existing client-fetch pattern (`useApi.js`) and ADR-5's
 canonical Astro root.
+**Spec**: `specs/dashboard-authorize/spec.md` (**DASH1–DASH5**). The authorize
+endpoint is **human-gated** and off the agent surface (DASH2); this is the spec
+backing all four endpoints above (C6b).
 
 ## Data Flow
 

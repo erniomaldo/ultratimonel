@@ -1,6 +1,6 @@
 # Tasks: cards-deterministas
 
-> Citation legend (I2): `[Req N]` = requirement N of **Card Deck #2389** (tracked in PR #31; see proposal `## Requirement sources`). Spec tags are `[TT#]`, `[TCE#]`, `[TSP#]`, `[MQM#]`.
+> Citation legend (I2): `[Req N]` = requirement N of **Card Deck #2389** (tracked in PR #31; see proposal `## Requirement sources`). Spec tags are `[TT#]`, `[TCE#]`, `[TSP#]`, `[MQM#]`, `[DASH#]`.
 > Sequencing note (M4): if `cards-solo-ultratimonel` archives first, its base spec becomes the baseline for the MODIFIED capabilities; re-check ADDED-vs-MODIFIED before apply.
 
 ## Review Workload Forecast
@@ -91,7 +91,7 @@ their immediate parent; a polluted diff is a branching bug → retarget/rebase.
 
 - [ ] 2.1 `server.py` `begin_turn`: order validation, binding check, budget check for armed quests with `code="attempt_budget_exhausted"` and zero mutation; legacy quest (`authorized=0`, no grant) allowed; increment `attempts_used` **atomically** (single `UPDATE … WHERE used < authorized`, fail on 0 rows — M1). [TCE1, TCE2, TCE4, TSP1]
 - [ ] 2.2 `server.py` `begin_turn`: internal checkpoint sub-step (best-effort, non-blocking); keep the existing done/missing quest guard (also the external-close reconciliation point, TCE3). [TT1, TT3, TSP2]
-- [ ] 2.3 `server.py` `end_turn`: `summary: str = ""` optional param + deterministic `auto:` fallback; set `closed_at`. [Req 3, D3]
+- [ ] 2.3 `server.py` `end_turn`: `summary: str = ""` optional param + deterministic `auto:<final_status> gates=<p>/<t>` fallback + `evidence.summary_source` (`caller`/`auto`, schema DASH4); set `closed_at`. [Req 3, D3, TT1, DASH4]
 - [ ] 2.4 `server.py` `end_turn`: single SQLite transaction = append `turn_bitacora` + complete intento + mark item done (Deck-first, **only on a success verdict** — a `fail` leaves the quest open, TCE3); the bitácora append is **not** best-effort — on failure roll the TXN back and return a retryable error with the turn open; checkpoint mirror best-effort after commit. [TT1, TT2, TCE3, TSP3]
 - [ ] 2.5 `tests/test_server.py`: budget hard-fail (no intento) + legacy/unbounded allowed then armed; order/binding fail; atomic closure (item+bitácora together, rollback on bitácora failure); checkpoint/mirror failure still completes; no-summary cycle still works; no telemetry read required for the cycle. [TCE1–4, TT1–4, TSP1, TSP3]
 
@@ -105,16 +105,18 @@ their immediate parent; a polluted diff is a branching bug → retarget/rebase.
 
 ## Phase 4: Dashboard (API + UI)
 
-- [ ] 4.1 `dashboard_server.py`: `POST /api/checklist/{item_id}/authorize_attempts` → insert grant + bump authorized (arms the budget). [Req 6, TCE2]
-- [ ] 4.2 `dashboard_server.py`: expose `attempts_authorized/used` on mission detail; `summary/evidence/closed_at` on intentos; add `GET /api/bitacora?mission_id=` (the explicit human-requested telemetry read). [Req 6, TT2, TT4]
-- [ ] 4.3 `dashboard-astro`: "Authorize attempts" button (`ChecklistCard.jsx`), summary display (`IntentoCard.jsx`), bitácora view + `useApi.js` clients. [Req 6]
-- [ ] 4.4 `dashboard/app.js` + `index.html`: staging parity. [Req 6]
-- [ ] 4.5 `tests/test_dashboard*.py`: authorize increments/arms budget; bitácora endpoint returns appended rows. [Req 6]
+Spec: `specs/dashboard-authorize/spec.md` (`DASH1–DASH5`).
+
+- [ ] 4.1 `dashboard_server.py`: `POST /api/checklist/{item_id}/authorize_attempts` → insert grant + bump authorized (arms the budget), with input validation (`amount>0`, known `item_id`, non-empty `granted_by`) and grant+bump atomicity; human-gated, off the agent surface. [Req 6, DASH1, DASH2, DASH5]
+- [ ] 4.2 `dashboard_server.py`: expose `attempts_authorized/used` on mission detail; `summary/evidence/closed_at` on intentos (evidence schema DASH4); add `GET /api/bitacora?mission_id=` (the explicit human-requested telemetry read). [Req 6, DASH3, DASH4, TT2, TT4]
+- [ ] 4.3 `dashboard-astro`: "Authorize attempts" button (`ChecklistCard.jsx`), summary display (`IntentoCard.jsx`), bitácora view + `useApi.js` clients. [Req 6, DASH3]
+- [ ] 4.4 `dashboard/app.js` + `index.html`: staging parity. [Req 6, DASH3]
+- [ ] 4.5 `tests/test_dashboard*.py`: authorize increments/arms budget; validation (amount≤0, unknown item, empty granted_by) rejects with no mutation; grant+bump atomicity; agent tool catalog has no grant op; bitácora endpoint returns appended rows. [Req 6, DASH1, DASH2, DASH3, DASH5]
 
 ## Phase 5: Verification
 
-- [ ] 5.1 `.venv/bin/pytest` full suite green; map each of the **15** requirements (TT1–4, TCE1–4, TSP1–3, MQM1–4) to at least one passing test — including TT4 (no required telemetry read + human-requested read) and TSP3 (internal sub-steps are not agent calls). [all]
-- [ ] 5.2 Manual smoke: authorize → begin/end cycle → bitácora shows the appended turn; `fail` verdict leaves the quest open.
+- [ ] 5.1 `.venv/bin/pytest` full suite green; map each of the **20** requirements (TT1–4, TCE1–4, TSP1–3, MQM1–4, DASH1–5) to at least one passing test — including TT4 (no required telemetry read + human-requested read), TSP3 (internal sub-steps are not agent calls), and DASH2 (no grant op on the agent surface). [all]
+- [ ] 5.2 Manual smoke: authorize → begin/end cycle → bitácora shows the appended turn; `fail` verdict leaves the quest open; invalid authorize (`amount=0`, unknown item) is rejected with no mutation.
 
 ## Phase 6: Docs
 

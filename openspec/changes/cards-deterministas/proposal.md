@@ -45,6 +45,7 @@ additive: it changes the agent-facing channel and telemetry, not the data origin
 ### New Capabilities
 - `turn-telemetry`: internal, append-only telemetry (checkpoint + bitácora) persisted inside `begin_turn`/`end_turn`; no agent-facing write tools.
 - `turn-cycle-enforcement`: order validation, attempt budget, closure and binding for the `begin_turn → work → end_turn` cycle.
+- `dashboard-authorize`: human-gated dashboard HTTP endpoints — attempt-budget authorize (arms TCE2) and explicit reads (missions attempts, intento summary/evidence, bitácora); **not** on the agent tool surface.
 
 ### Modified Capabilities
 > Base definitions come from `cards-solo-ultratimonel` (pending archive).

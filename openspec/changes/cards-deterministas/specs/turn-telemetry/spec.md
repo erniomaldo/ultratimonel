@@ -15,6 +15,8 @@
 - `begin_turn` sub-step: checkpoint `{session_id, project, mission_id, quest_id}`.
 - `end_turn` sub-step: checkpoint + one bitácora entry `{intento_id, final_status, gates_passed, timestamp}`.
 
+**Summary fallback (design D3):** `end_turn(intento_id, summary="")` persists the caller-supplied summary when present, otherwise a deterministic fallback `auto:<final_status> gates=<p>/<t>` (`<p>`/`<t>` = gates passed/total). It records `evidence.summary_source="caller"` or `"auto"` accordingly (evidence schema: DASH4). `closed_at` is always set. This makes the summary mandatory at storage while keeping the proven 2-call signature compatible.
+
 #### Scenario: begin_turn writes an internal checkpoint
 
 - GIVEN a valid quest
@@ -34,6 +36,21 @@
 - WHEN it is enumerated
 - THEN no tool writes telemetry on behalf of the agent
 - AND telemetry exists only as internal sub-steps of the turn calls
+
+#### Scenario: Empty summary gets the deterministic auto fallback
+
+- GIVEN an `end_turn` call with an empty summary
+- WHEN the intento is persisted
+- THEN its summary is `auto:<final_status> gates=<p>/<t>`
+- AND `evidence.summary_source` is `"auto"`
+- AND `closed_at` is set
+
+#### Scenario: Caller summary is preserved
+
+- GIVEN an `end_turn` call with a caller-supplied summary
+- WHEN the intento is persisted
+- THEN that summary is stored unchanged
+- AND `evidence.summary_source` is `"caller"`
 
 ### Requirement TT2: Append-only Bitácora Integrity
 
