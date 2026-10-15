@@ -24,6 +24,12 @@ additive: it changes the agent-facing channel and telemetry, not the data origin
 | 2 | INTERNAL cycle telemetry | `begin_turn`/`end_turn` persist checkpoint + memory/append-only log (bitácora) **internally**. The agent MUST NOT call `mcp__agentmemory__*` / `mcp__checkpoint__*` to **write** (reads only on explicit human request). |
 | 3 | Cycle enforcement | `begin_turn → work → end_turn` is the ONLY state channel: order validation, attempt budget, closure and binding enforced server-side. |
 
+### Requirement sources (resolves I2 citations)
+
+- Change-level requirements **1–3** above are defined by this proposal.
+- Spec requirement tags (`TT1–TT4`, `TCE1–TCE4`, `TSP1–TSP3`, `MQM1–MQM4`) are defined in the four `specs/**/spec.md` deltas.
+- Card-level requirements cited in `tasks.md` as `[Req N]` are **Card Deck #2389** requirement strings, tracked in PR #31 (the tracker). They are not restated here, to avoid drift (M5).
+
 ### In Scope
 - Card editing internalized as a turn step; `card_update_description` out of the agent catalog.
 - Append-only telemetry (checkpoint + bitácora) written inside `begin_turn`/`end_turn`.
@@ -70,7 +76,7 @@ additive: it changes the agent-facing channel and telemetry, not the data origin
 
 - Git-revert the change commit: surface and turn logic are additive, so reverting restores the prior MCP catalog.
 - `card_update_description` remains in code (only leaves the catalog), so no caller contract is lost.
-- No destructive DDL; any migration is additive (NF-GP-05) and reverts safely (`SCHEMA_AHEAD` fails safe).
+- No destructive DDL; any migration is additive (NF-GP-05) and reverts safely. There is **no `SCHEMA_AHEAD` symbol** (verified: it is only *named* at `persistence.py:195` as the gate-persistence spec contract). The real mechanism: older code tolerates the unknown `schema_version` row, and re-running the additive `ALTER TABLE … ADD COLUMN` is idempotent because `_migrate_v4_to_v5` (`persistence.py:190-199`) swallows the `sqlite3.OperationalError` on an existing column. Proven by the S1 downgrade test (task 1.4).
 - Deck is never mutated by rollback; data stays canonical.
 
 ## Dependencies
@@ -91,8 +97,10 @@ additive: it changes the agent-facing channel and telemetry, not the data origin
 
 ## Success Criteria
 
-- [ ] Agents issue zero `mcp__nextcloud__deck_*` card calls and zero manual `agentmemory`/`checkpoint` writes.
-- [ ] `card_update_description` absent from the agent catalog; card editing handled inside the turn.
-- [ ] `begin_turn`/`end_turn` persist checkpoint + append-only bitácora internally.
-- [ ] Order, attempt budget, closure and binding validations enforced server-side.
-- [ ] Deck remains the source of truth; rollback restores the prior surface without data loss.
+Each criterion states its measurement, so the review can be answered point by point.
+
+- [ ] Agents issue **zero** `mcp__nextcloud__deck_*` card calls and **zero** manual `agentmemory`/`checkpoint` writes. **Measured by**: `plugin_preflight` block counters for `deck_*` card ops = 0 allowed over the soak window, plus a log grep for raw calls = 0.
+- [ ] `card_update_description` absent from the agent catalog. **Measured by**: `tools/list` enumeration test asserting the tool is absent and still importable internally (`test_server.py`).
+- [ ] `begin_turn`/`end_turn` persist checkpoint + append-only bitácora internally. **Measured by**: integration test asserting one `turn_bitacora` row per closed turn and prior rows unchanged (TT1/TT2).
+- [ ] Order, attempt budget, closure and binding validations enforced server-side. **Measured by**: hard-fail tests (no mutation) for order/binding/budget plus the success-vs-fail closure tests (TCE1–TCE4).
+- [ ] Deck remains the source of truth; rollback restores the prior surface without data loss. **Measured by**: the S1 downgrade test (open the v6 DB with v5 code, pre-existing data intact) and a green full suite after `git revert`.

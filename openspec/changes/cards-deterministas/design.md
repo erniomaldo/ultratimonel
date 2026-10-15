@@ -2,8 +2,10 @@
 
 ## Context
 
-Card #2389 (mission #2389): deterministic card management — card editing as a
-`begin_turn`/`end_turn` step, attempt budget, and an append-only log (bitácora).
+Source requirement: **Card Deck #2389** — deterministic card management (card
+editing as a `begin_turn`/`end_turn` step, attempt budget, and an append-only log
+(bitácora)). Tracked in PR #31 (`feature_2389_cards-deterministas`); card
+requirement strings are cited as `[Req N]` (see proposal `## Requirement Sources`).
 
 Verified facts driving this design (read from the live code, not guessed):
 
@@ -12,16 +14,18 @@ Verified facts driving this design (read from the live code, not guessed):
   `attempts_authorized`/`attempts_used`; there is **no** `attempt_grants` and
   **no** `turn_bitacora` table.
 - `begin_turn` (`server.py:1737`) already runs: quest guard (done/missing) →
-  orphan cleanup → 4 gates → `create_intento`. Binding is the in-memory
-  `_active_intento` + `_resolve_requesting_intento`; there is **no** attempt budget.
+  orphan cleanup → 4 gates → `create_intento`. It already resolves the canonical
+  quest as `resolved_quest_id = quest_id or checklist_item_id` (`server.py:1783`).
+  Binding is the in-memory `_active_intento` + `_resolve_requesting_intento`;
+  there is **no** attempt budget.
 - `end_turn` (`server.py:2050`) completes the intento and closes the quest in
-  Deck via `_complete_quest_for_intento`; it does **not** require a summary and
-  does **not** append a turn log.
+  Deck via `_complete_quest_for_intento` (`server.py:1971`, called at `:2178`);
+  it does **not** require a summary and does **not** append a turn log.
 - `card_update_description` (`server.py:2372`) is an `@app.tool()`; it is the
   last raw Deck write on the agent surface and is pointed to by
   `plugin_preflight.py:166`.
 - Titles are **not** server-owned: any caller can write an arbitrary title.
-- The canonical dashboard is the Astro build (`dashboard-astro/dist/`, ADR-5);
+- The canonical dashboard is the Astro build (`ultratimonel/dashboard-astro/dist/`, ADR-5);
   legacy `dashboard/` serves only staging ports (`dashboard_server.py:6-11`).
 - `deck_bridge.py` already provides `update_description`, `complete_quest`,
   `extract_quests` etc. — the internal Deck write path is proven.
@@ -48,6 +52,8 @@ summaries + bitácora.
 
 **Choice**: `checklist_items.attempts_authorized`, `checklist_items.attempts_used`
 (integers, default 0); `attempt_grants` rows record each authorization.
+`attempts_authorized=0` **and** no grant = legacy/unbounded until the first grant
+arms the budget (TCE2).
 **Rationale**: spec TCE2 needs a bounded, per-quest budget read cheaply at
 `begin_turn`; the ledger gives the dashboard an audit trail and the bitácora its
 "who authorized what, when".
@@ -78,23 +84,33 @@ contract calls out.
 
 ### D4: `end_turn` closure is atomic; external telemetry stays best-effort
 
-**Choice**: append the `turn_bitacora` row **and** mark the item done **and**
-complete the intento in a **single SQLite transaction**. Only the external
-checkpoint/memory mirror (spec TT3) is best-effort and non-blocking.
+**Choice**: append the `turn_bitacora` row **and** (only on a `success` verdict)
+mark the item done **and** complete the intento in a **single SQLite transaction**.
+A `fail` verdict finalizes the intento and appends the bitácora row in the same
+transaction but leaves the quest `done=false` (TCE3, so the budget governs further
+attempts). Only the external checkpoint/memory mirror (spec TT3) is best-effort
+and non-blocking; the **bitácora append is NOT best-effort** — if it fails the
+transaction rolls back and `end_turn` returns a retryable error with the turn open.
 **Alternatives**: separate best-effort writes for closure+log (partial state:
 closed item with no log entry — rejected), two-phase with compensation (overkill).
-**Rationale**: reconciles spec TT3 (telemetry failures must not force a fail)
-with the contract's "atomic write (append-only bitácora + mark item)" — the
-*bitácora* is authoritative and transactional; the *checkpoint mirror* is not.
+**Rationale**: reconciles spec TT3 (mirror failures must not force a fail) with
+the contract's "atomic write (append-only bitácora + mark item)" — the *bitácora*
+is authoritative and transactional; the *checkpoint mirror* is not.
 
 ### D5: `begin_turn` enforces order, binding and budget in one guard chain
 
 **Choice**: after the existing quest guard, run, in order: (a) order validation —
 reject if a turn is already active for another intento without recovery; (b)
 binding — resolve/validate `{session_id, project, mission_id, quest_id}` against
-`_active_intento`; (c) budget — fail hard with `code="attempt_budget_exhausted"`
-when `attempts_used >= attempts_authorized`; then increment `attempts_used` and
-create the intento. Budget exhaustion mutates nothing.
+`_active_intento`; (c) budget — for an **armed** quest (`attempts_authorized > 0`)
+fail hard with `code="attempt_budget_exhausted"` when
+`attempts_used >= attempts_authorized`; a **legacy** quest
+(`attempts_authorized = 0` and no grant) is unbounded until its first grant (TCE2).
+The budget check and the increment are **one atomic statement**
+(`UPDATE checklist_items SET attempts_used = attempts_used + 1 WHERE id = ? AND
+attempts_used < attempts_authorized`, fail on 0 rows affected) — never a
+two-step check-then-increment (M1). Budget exhaustion mutates nothing; then the
+intento is created.
 **Alternatives**: budget check inside `create_intento` (too late), budget on the
 plugin only (server must be the second lock — `endturn-bouncer` precedent).
 **Rationale**: specs TCE1/TCE2/TCE4 and TSP1 require a server-side, no-mutation
@@ -115,7 +131,9 @@ import the function directly.
 ### D7: Server-owned title with fixed format `#{id} {title}`
 
 **Choice**: `deck_bridge` renders the Deck title as `f"#{mission_id} {title}"`
-on every create/update, after stripping any caller-supplied `#…` prefix.
+on every create/update, after stripping any caller-supplied `#…` prefix. A
+description-only edit strips then re-renders the prefix from the stored title,
+leaving the human title text unchanged (MQM4).
 **Alternatives**: store the rendered title in SQLite (duplication, drift), block
 all title edits (the contract implies edits remain possible).
 **Rationale**: req 5 — the numeric prefix must be unforgeable by the agent; render
@@ -125,7 +143,8 @@ at the write boundary so Deck is always canonical.
 
 **Choice**: table `turn_bitacora(id, intento_id, session_id, project, mission_id,
 checklist_item_id, final_status, gates_passed, summary, created_at)`; only INSERTs,
-no UPDATE/DELETE exposed. Spec TT2.
+no UPDATE/DELETE exposed. Spec TT2. (`checklist_item_id` is the stored quest
+column; public name is `quest_id` — see I1.)
 **Alternatives**: reuse `intentos` rows as the log (loses the append-only invariant
 and mixes live/mutable state with the immutable log).
 **Rationale**: append-only integrity is a named requirement; a dedicated table
@@ -138,8 +157,13 @@ keeps it clean and cheap to read for the dashboard.
 `CREATE TABLE IF NOT EXISTS attempt_grants / turn_bitacora`. Fresh-DB DDL mirrors it.
 **Alternatives**: destructive rewrite (forbidden), no schema change (impossible —
 the columns are required).
-**Rationale**: additive and reversible; older code ignoring v6 fails safe
-(`SCHEMA_AHEAD`, gate-persistence).
+**Rationale**: additive and reversible. There is **no `SCHEMA_AHEAD` symbol**
+(verified: it is only *named* at `persistence.py:195` as the gate-persistence
+spec contract). The real mechanism: older code reads the unknown `schema_version`
+row and simply does not use the new columns, and re-running `ALTER TABLE … ADD
+COLUMN` is idempotent because `_migrate_v4_to_v5` (`persistence.py:190-199`)
+swallows the `sqlite3.OperationalError` on an existing column. S1 MUST prove this
+with a downgrade test (task 1.4).
 
 ### D10: Dashboard = API endpoints in `dashboard_server.py` + Astro UI
 
@@ -157,11 +181,13 @@ canonical Astro root.
 ## Data Flow
 
 ```
-begin_turn:  guard(quest) → order → binding → budget(check+increment) →
-             checkpoint(best-effort) → gates → create_intento
+begin_turn:  guard(quest) → order validation → binding → budget(atomic
+             check+increment, armed only) → checkpoint(best-effort) →
+             gates → create_intento
 end_turn:    resolve intento → binding validate → gate verdict →
-             [TXN] mark item in Deck + upsert replica + append turn_bitacora +
-                   complete intento(summary,evidence,closed_at) →
+             [TXN] append turn_bitacora + complete intento(summary,evidence,closed_at)
+                   + mark item done in Deck + upsert replica — item done only on a
+                   success verdict (TCE3/D4) →
              checkpoint mirror (best-effort) → compact response
 ```
 
@@ -182,6 +208,14 @@ end_turn:    resolve intento → binding validate → gate verdict →
 
 ## Interfaces / Contracts
 
+**Canonical naming rule (I1).** The canonical quest parameter name is `quest_id`.
+`checklist_item_id` is a legacy **alias** (live code already resolves
+`resolved_quest_id = quest_id or checklist_item_id`, `server.py:1783`). SQLite
+keeps the existing stored column name `checklist_item_id` on `intentos`/`turn_bitacora`
+(additive-only constraint); `attempt_grants` and the authorize API use
+`checklist_item_id` as well. Public routes use the quest id as `{item_id}`. Use
+these names uniformly — no third spelling.
+
 ```sql
 -- v5 → v6 (additive)
 ALTER TABLE checklist_items ADD COLUMN attempts_authorized INTEGER NOT NULL DEFAULT 0;
@@ -201,6 +235,8 @@ CREATE TABLE IF NOT EXISTS turn_bitacora (
 ```
 
 ```python
+# Canonical: quest_id. Legacy alias: checklist_item_id (resolved_quest_id =
+# quest_id or checklist_item_id, server.py:1783). DB column: checklist_item_id.
 begin_turn(session_id, project, mission_id=0, quest_id=0, message="", sender="user",
            checklist_item_id=0) -> str
     # order/binding fail → {"error","code":"turn_order"|"binding_mismatch"}
@@ -213,8 +249,8 @@ authorize_attempts(quest_id: int, amount: int, granted_by: str) -> str   # inter
 
 | Layer | What | Approach |
 |-------|------|----------|
-| Unit | migration v5→v6 idempotency; budget check; title rendering; summary fallback | `pytest`, temp DB, pure helpers |
-| Integration | `begin_turn` budget/order/binding hard fail (no mutation); `end_turn` atomic closure + bitácora append; telemetry failure non-blocking | mocked `deck_bridge` + real temp SQLite |
+| Unit | migration v5→v6 idempotency + downgrade; budget check (armed/legacy); title rendering; summary fallback | `pytest`, temp DB, pure helpers |
+| Integration | `begin_turn` budget/order/binding hard fail (no mutation); `end_turn` atomic closure + bitácora append (rollback on failure); checkpoint/mirror failure non-blocking | mocked `deck_bridge` + real temp SQLite |
 | Regression | existing `begin_turn`/`end_turn` cycle still works with no `summary`; `card_update_description` absent from `tools/list`, present internally | `test_server.py` |
 | API | authorize/budget/summary/bitácora endpoints | HTTP client against `dashboard_server` |
 | E2E | Not available (`config.yaml`: e2e `available: false`) | manual smoke |
@@ -225,18 +261,21 @@ authorize_attempts(quest_id: int, amount: int, granted_by: str) -> str   # inter
 
 1. **SQLite v5→v6**: additive columns + two new tables; idempotent; no data rewrite.
 2. **Backfill**: existing quests start at `attempts_authorized=0`, `attempts_used=0`.
-   To avoid instantly blocking live turns, `attempts_authorized=0` MUST be treated
-   as "unbounded/legacy" until the first grant (documented) — a rollout guard.
+   To avoid instantly blocking live turns, `attempts_authorized=0` (with no
+   `attempt_grants` row) MUST be treated as "unbounded/legacy" until the first
+   grant — a rollout guard now **specced in TCE2** (the spec is authoritative; the
+   legacy-arming scenario lives there).
 3. **Surface**: `card_update_description` leaves the catalog (function kept);
    `plugin_preflight` blocks raw `deck_*`; Hermes catalog pruned (out of repo).
 4. **Rollback**: `git revert` restores the surface; new columns/tables are inert
-   to older code; Deck is never modified by rollback.
+   to older code (no `SCHEMA_AHEAD` symbol — see D9); Deck is never modified by
+   rollback.
 
 ## Risks / Tradeoffs
 
 | Risk | Likelihood | Mitigation |
 |------|------------|------------|
-| `attempts_authorized=0` blocks live turns after cutover | High | Treat 0 as legacy-unbounded until a grant (rollout guard, step 2) |
+| `attempts_authorized=0` blocks live turns after cutover | High | TCE2: 0 + no grant = legacy-unbounded until a grant (rollout guard, Migration step 2) |
 | Atomic closure vs best-effort telemetry confusion | Med | D4 splits authoritative bitácora (transactional) from checkpoint mirror (best-effort) |
 | Raw `deck_*` still used despite guidance | Med | Server-side plugin block, not just instructions |
 | Title rendering double-prefix | Low | Strip caller `#…` before rendering; regression test |
@@ -252,7 +291,8 @@ tracker branch `feature_2389_cards-deterministas` plus 5 chained PRs
 (S1 persistence → S2 turn-enforcement → S3 card-surface → S4 dashboard →
 S5 docs), each ≤400 changed lines, reviewed against its immediate parent. No
 `size:exception` is used. **The design decisions (D1–D10) remain valid and map
-one-to-one onto these slices.**
+one-to-one onto these slices.** S2 pre-splits into S2a/S2b if its draft exceeds
+~350 lines (I6, see tasks.md).
 
 ## Open Questions
 

@@ -1,10 +1,12 @@
 # Delta for turn-telemetry
 
 > NEW capability. Base main spec does NOT exist yet: `cards-solo-ultratimonel` is verified but not archived, so all requirements are declared ADDED (no invented base).
+>
+> **Sequencing (M4)**: if `cards-solo-ultratimonel` archives first, its base spec becomes the baseline and this delta's ADDED-vs-MODIFIED split must be re-checked before apply. Requirement IDs `TT1–TT4` stay stable regardless.
 
 ## ADDED Requirements
 
-### Requirement: Internal Turn Telemetry Persistence
+### Requirement TT1: Internal Turn Telemetry Persistence
 
 `begin_turn` SHALL persist a checkpoint record internally. `end_turn` SHALL persist a checkpoint record and append one entry to the append-only turn log (bitácora). The agent MUST NOT be required to invoke `mcp__agentmemory__*` or `mcp__checkpoint__*` to produce this telemetry.
 
@@ -33,7 +35,7 @@
 - THEN no tool writes telemetry on behalf of the agent
 - AND telemetry exists only as internal sub-steps of the turn calls
 
-### Requirement: Append-only Bitácora Integrity
+### Requirement TT2: Append-only Bitácora Integrity
 
 The bitácora SHALL be append-only. The system MUST NOT update or delete previously written entries.
 
@@ -44,18 +46,30 @@ The bitácora SHALL be append-only. The system MUST NOT update or delete previou
 - THEN the previous N entries remain unchanged
 - AND the new entry is appended at the end
 
-### Requirement: Best-effort Telemetry Failure
+### Requirement TT3: Best-effort Checkpoint/Memory Mirror (NOT the bitácora)
 
-Telemetry persistence SHALL be best-effort. When a checkpoint or bitácora write fails, the turn MUST still complete and the failure MUST NOT force the turn status to `fail`.
+Only the **external checkpoint/memory mirror** is best-effort. When a checkpoint or memory-mirror write fails, the turn MUST still complete and that failure MUST NOT force the turn status to `fail`.
 
-#### Scenario: Telemetry failure does not block the turn
+The **append-only bitácora write is explicitly out of scope of this requirement**: per design **D4/D8** it is part of the single closure transaction, together with marking the item done and completing the intento. This requirement does NOT authorize swallowing a bitácora failure.
 
-- GIVEN a turn reaching `end_turn`
-- WHEN the telemetry persistence raises an error
-- THEN `end_turn` still completes the turn
+**Transactional append failure mode (design D4):** if the `turn_bitacora` INSERT fails inside the closure transaction, the whole transaction rolls back — the checklist item is NOT marked done, the intento is NOT finalized, and `end_turn` returns a retryable error with the turn left open. There is never a closed item without its matching bitácora row (reconciles TT3 with D4; closes the "audit gap" risk).
+
+#### Scenario: Checkpoint/memory-mirror failure does not block the turn
+
+- GIVEN a turn reaching `end_turn` whose closure transaction has already committed
+- WHEN the checkpoint/memory-mirror write raises an error
+- THEN `end_turn` still returns success
 - AND the failure is recorded as a non-blocking warning
 
-### Requirement: Telemetry Reads Are Explicit Only
+#### Scenario: Bitácora append failure rolls back the closure (atomic, D4)
+
+- GIVEN a turn reaching `end_turn`
+- WHEN the `turn_bitácora` INSERT inside the closure transaction raises an error
+- THEN the transaction rolls back: the item is NOT marked done and the intento is NOT finalized
+- AND `end_turn` returns a retryable error with the turn still open
+- AND no closed item is left without a matching bitácora row
+
+### Requirement TT4: Telemetry Reads Are Explicit Only
 
 Reading telemetry MUST NOT be required for the turn cycle. The agent MAY read telemetry only when the human explicitly requests it.
 
