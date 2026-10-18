@@ -62,6 +62,7 @@ class TestIntegration:
         assert "assert_gates" in names
         assert "check_gate" in names
         assert "complete_gate" in names
+        assert "quest_list" in names
 
     async def test_assert_gates_returns_expected_shape(self, client_session):
         """assert_gates should return gates, overall, context, timestamp."""
