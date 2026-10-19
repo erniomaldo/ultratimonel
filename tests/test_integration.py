@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import pytest
+import pytest_asyncio
 from unittest.mock import patch
 
 from mcp import ClientSession, StdioServerParameters
@@ -21,17 +22,18 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MAIN_PY = os.path.join(PROJECT_ROOT, "main.py")
 
 
-@pytest.fixture(scope="function")
-def event_loop():
-    """Create a single event loop for the module scope."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def client_session():
-    """Start Ultratimonel and return an MCP ClientSession."""
+    """Start Ultratimonel once per module and return a connected MCP ClientSession.
+
+    ``stdio_client`` and ``ClientSession`` are anyio task groups whose cancel
+    scopes must be entered and exited in the same task. pytest-asyncio drives an
+    async-generator fixture in two different tasks (one for setup, another for
+    teardown), so keeping those context managers inside the fixture body raises
+    "Attempted to exit cancel scope in a different task than it was entered in".
+    Instead a single background task owns the transport for the whole module and
+    the fixture only signals it to start and stop.
+    """
     env = os.environ.copy()
     env["ULTRATIMONEL_DB_PATH"] = ":memory:"
     env["PYTHONPATH"] = PROJECT_ROOT + ":" + env.get("PYTHONPATH", "")
@@ -43,13 +45,43 @@ async def client_session():
         env=env,
     )
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            result = await session.initialize()
-            assert result.serverInfo.name == "ultratimonel"
-            yield session
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    stop = asyncio.Event()
+
+    async def serve():
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    result = await session.initialize()
+                    ready.set_result((session, result))
+                    await stop.wait()
+        except BaseException as exc:  # noqa: BLE001 - re-raised or forwarded below
+            if not ready.done():
+                ready.set_exception(exc)
+                return
+            if not stop.is_set():
+                raise
+
+    task = loop.create_task(serve())
+    try:
+        session, result = await ready
+        assert result.serverInfo.name == "ultratimonel"
+        yield session
+    finally:
+        stop.set()
+        try:
+            await task
+        except BaseException:
+            # A startup failure was already surfaced through ``ready``; don't
+            # report the same error twice. Any other shutdown failure stands.
+            if ready.done() and ready.exception() is not None:
+                pass
+            else:
+                raise
 
 
+@pytest.mark.asyncio(loop_scope="module")
 class TestIntegration:
     async def test_server_initializes(self, client_session):
         """Server responds to initialize (already done in fixture)."""
