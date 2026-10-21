@@ -83,6 +83,19 @@ async def client_session():
 
 @pytest.mark.asyncio(loop_scope="module")
 class TestIntegration:
+    """Live MCP integration smoke tests.
+
+    These spawn real MCP servers (agentmemory, checkpoint, nextcloud) through
+    the stdio bridge, so they need a working environment and can spend ~30 s
+    per server initialization. They are marked ``integration`` and excluded
+    from the default run (``pytest.ini`` -> ``addopts``). Run them explicitly:
+
+        ULTRATIMONEL_NEXTCLOUD_COMMAND=... ULTRATIMONEL_NEXTCLOUD_ARGS=... \
+            .venv/bin/pytest -m integration
+    """
+
+    pytestmark = pytest.mark.integration
+
     async def test_server_initializes(self, client_session):
         """Server responds to initialize (already done in fixture)."""
         assert client_session is not None
@@ -302,6 +315,7 @@ class TestToolsUsabilityRetroIntegration:
         from ultratimonel.gate_engine import GateResult, PASS, SKIP
 
         p, db_path = self._make_db()
+        quest_id = p.list_checklist_items(1)[0]["id"]
         try:
             orig_persistence = srv.persistence
             srv.persistence = p
@@ -316,17 +330,17 @@ class TestToolsUsabilityRetroIntegration:
                     ]
 
                     result = json.loads(srv.begin_turn(
-                        "sess-int-001", "voy-rojo", 0, 0,
+                        "sess-int-001", "test-proj", 1, quest_id,
                         "talk about unknown topic", "user"
                     ))
                     intento_id = result["intento_id"]
                     assert intento_id is not None
 
-                    # Verify gates were persisted under "voy-rojo", not "unknown"
-                    gate_states = p.list_gate_states("sess-int-001", "voy-rojo")
+                    # Verify gates were persisted under "test-proj", not "unknown"
+                    gate_states = p.list_gate_states("sess-int-001", "test-proj")
                     assert len(gate_states) == 4
 
-                    # end_turn should validate against "voy-rojo"
+                    # end_turn should validate against "test-proj"
                     result = json.loads(srv.end_turn(intento_id))
                     assert result["final_status"] == "success"
             finally:
@@ -348,7 +362,7 @@ class TestToolsUsabilityRetroIntegration:
                 start = time.perf_counter()
                 for _ in range(iterations):
                     srv.mission_get(1)
-                elapsed_ms = (time.perf_counter() - start) / iterations * iterations / 1000
+                elapsed_ms = (time.perf_counter() - start) / iterations * 1000
                 assert elapsed_ms < 5, f"mission_get took {elapsed_ms:.2f} ms"
             finally:
                 srv.persistence = orig_persistence
@@ -368,7 +382,7 @@ class TestToolsUsabilityRetroIntegration:
                 start = time.perf_counter()
                 for _ in range(iterations):
                     srv.checklist_item_get(1)
-                elapsed_ms = (time.perf_counter() - start) / iterations * iterations / 1000
+                elapsed_ms = (time.perf_counter() - start) / iterations * 1000
                 assert elapsed_ms < 5, f"checklist_item_get took {elapsed_ms:.2f} ms"
             finally:
                 srv.persistence = orig_persistence
@@ -424,10 +438,12 @@ class TestEnforcementV3Integration:
         # Set up test context - mock persistence layer instead of global state
         original_last_session_id = plugin._last_session_id
         original_last_gates_parsed = plugin._last_gates_parsed
+        original_turn_count = plugin._turn_count
 
         try:
-            # Mock get_turn_count to return 5 (> GRACE_TURNS default of 3)
+            # Post-grace scenario: turn counter above GRACE_TURNS
             with patch("ultratimonel.ultratimonel_client.get_turn_count", return_value=5):
+                plugin._turn_count = 5
                 plugin._last_session_id = "test-sess"
                 plugin._last_gates_parsed = [
                     {"name": "1a", "state": "BLOCK", "mandatory": True, "message": ""},
@@ -440,9 +456,10 @@ class TestEnforcementV3Integration:
                 result = plugin._gates_bouncer(tool_name="mcp__ultratimonel__complete_intento")
                 assert result is not None
                 assert result["action"] == "block"
-                assert "Tiempo de gracia agotado" in result["message"]
+                assert "Gates obligatorios no pasaron" in result["message"]
 
         finally:
             # Restore original state
             plugin._last_session_id = original_last_session_id
             plugin._last_gates_parsed = original_last_gates_parsed
+            plugin._turn_count = original_turn_count
