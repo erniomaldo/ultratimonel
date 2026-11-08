@@ -43,8 +43,9 @@ Recommended order: T1 → T2 → T3 → T4.
 
 **What:** Document intent, scope, the R4 symmetry decision (not implemented —
 see proposal), RFC 2119 spec with explicit input/output schemas, and these task
-phases. `design.md` omitted: the only real decision (R4) is recorded in the
-proposal per the contract.
+phases. `design.md` delivered retroactively on 2026-10-21 (card #194): it records
+the context, the R4 symmetry decision (same as the proposal) and the
+`quest_list` contract.
 
 **Done when:**
 - [x] Proposal records the R4 decision and rationale
@@ -167,11 +168,14 @@ Correcciones aplicadas en esta rama:
    (`/ iterations * iterations / 1000` → siempre pasaba): corregida a
    `/ iterations * 1000`.
 
-**Veredicto judgment-day:** APPROVE. El cambio es puramente aditivo, reutiliza
-`compact_quest`, no toca esquema ni bridge, y sus 5 unit tests cubren orden,
-filtrado, error y registro en catálogo. Sin hallazgos bloqueantes.
+**Veredicto judgment-day:** APPROVE WITH FIXES — ver `judgment-day.md` (ronda 1,
+2026-10-21), artefacto independiente que emite el veredicto. El cambio es puramente
+aditivo, reutiliza `compact_quest`, no toca esquema ni bridge, y sus 5 unit tests
+cubren orden, filtrado, error y registro en catálogo. Las tres correcciones
+exigidas (JD-1/JD-2/JD-3) son documentales y no bloquean el merge.
 
-**Changed lines (esta rama):** SDD 312 + código/tests 119 + harness 92 = **523**.
+**Changed lines (esta rama):** `git diff --stat origin/main...HEAD` → **1013
+insertions, 23 deletions = 1036 líneas cambiadas en 12 archivos**.
 Excede el presupuesto de 400: corte natural ya aplicado y reportado
 (**artefactos SDD | código+tests**); el harness de tests se separó como commit
 propio para revisión aislada.
