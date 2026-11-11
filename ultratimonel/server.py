@@ -1468,13 +1468,23 @@ def mission_list(project: str, include_description: bool = False) -> str:
 
 @app.tool()
 def mission_get(mission_id: int) -> str:
-    """Retrieve a single mission by ID with minimal fields."""
+    """Retrieve a single mission by ID with minimal fields.
+
+    ``deck_stack_id`` is returned verbatim (``null`` when the replica has not
+    backfilled it yet) so a caller can resolve the Deck board+stack without an
+    extra lookup. It is never guessed or filled in here.
+    """
     mission = persistence.get_mission(mission_id)
     if not mission:
         return json.dumps({"error": f"Mission {mission_id} not found"})
     item_ids = [ci["id"] for ci in persistence.list_checklist_items(mission["id"])]
     return json.dumps(
-        {"id": mission["id"], "title": mission["title"], "checklist_item_ids": item_ids},
+        {
+            "id": mission["id"],
+            "title": mission["title"],
+            "checklist_item_ids": item_ids,
+            "deck_stack_id": mission.get("deck_stack_id"),
+        },
         ensure_ascii=False,
         default=str,
     )
@@ -1847,6 +1857,98 @@ def mission_update_description(mission_id: int, description: str) -> str:
         response["replica_refresh_error"] = refresh_error
     return json.dumps(
         response,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def mission_delete(
+    mission_id: int,
+    confirm: bool = False,
+    reason: str = "",
+    requested_by: str = "hermes",
+) -> str:
+    """Delete ONE mission from the replica, with an audit trail. NEVER touches Deck.
+
+    This is a REPLICA-ONLY cleanup: the Deck card is not deleted, archived, or
+    moved. Everything the replica holds for the mission — the mission row, its
+    quests (``checklist_items``), ``intentos``, ``attempt_grants`` and
+    ``turn_bitacora`` rows — is removed in a single transaction, or not at all.
+
+    Deleting a mission is never a side effect of a typo: both ``confirm=True``
+    and a non-empty ``reason`` are required. When either is missing the call
+    fails validation and mutates nothing. An unknown ``mission_id`` fails with
+    an explicit error naming the id.
+
+    The deletion is recorded in the replica's ``mission_deletions`` audit ledger
+    (who, when, why, and the deleted ids), which survives the mission.
+
+    Args:
+        mission_id: Local mission id.
+        confirm: Must be True; guards against accidental deletion.
+        reason: Non-empty justification, stored in the audit ledger.
+        requested_by: Who requested the deletion (audit ``who``).
+
+    Returns:
+        JSON {status, mission_id, deck_task_id, project, title, deleted, audit_id}
+        or a validation/not-found error object.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to delete",
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": "reason required: mission_delete needs a non-empty reason",
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    try:
+        result = persistence.delete_mission(
+            mission_id, reason=reason, requested_by=requested_by
+        )
+    except ValueError as exc:
+        return json.dumps(
+            {"error": str(exc), "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if result is None:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found", "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return json.dumps(
+        {
+            "status": "deleted",
+            "mission_id": result["mission_id"],
+            "deck_task_id": result["deck_task_id"],
+            "project": result["project"],
+            "title": result["title"],
+            "deleted": {
+                "quests": result["quests_deleted"],
+                "intentos": result["intentos_deleted"],
+                "attempt_grants": result["grants_deleted"],
+                "turn_bitacora": result["bitacora_deleted"],
+            },
+            "audit_id": result["audit_id"],
+            "replica_only": True,
+            "deck_untouched": True,
+            "note": "Replica only: the Deck card was NOT deleted, archived, or moved.",
+        },
         ensure_ascii=False,
         default=str,
     )
@@ -2818,23 +2920,67 @@ def record_intento(
 
 @app.tool()
 def card_update_description(
-    card_id: int,
-    description: str,
-    board_id: int,
-    stack_id: int,
+    card_id: int | None = None,
+    description: str = "",
+    board_id: int | None = None,
+    stack_id: int | None = None,
+    mission_id: int | None = None,
 ) -> str:
     """Update only the description of a Deck card — NEVER changes the title.
 
+    With an explicit ``card_id``/``board_id``/``stack_id`` this behaves exactly
+    as before. When ``mission_id`` is supplied, the missing pieces are resolved
+    from the replica: the board from the project map and the stack from the
+    mission's replicated ``deck_stack_id``. A backfilled ``deck_stack_id``
+    avoids the ``deck_get_stacks`` lookup entirely; when it is ``NULL`` the
+    existing lookup fallback is used.
+
     Args:
-        card_id: Numeric card ID.
+        card_id: Numeric card ID (defaults to the mission's ``deck_task_id``).
         description: New description content (markdown).
-        board_id: Numeric board ID.
-        stack_id: Numeric stack ID.
+        board_id: Numeric board ID (defaults to the mission's board).
+        stack_id: Numeric stack ID (defaults to ``deck_stack_id``/lookup).
+        mission_id: Optional local mission id used to resolve the Deck target.
 
     Returns:
         JSON string confirming update.
     """
     from .mcp_client import call_mcp_tool, TOOL_NAMES
+
+    if mission_id is not None:
+        mission = persistence.get_mission(mission_id)
+        if not mission:
+            return json.dumps(
+                {"error": f"Mission {mission_id} not found"},
+                ensure_ascii=False,
+                default=str,
+            )
+        if board_id is None:
+            board_id, err = _resolve_board_id(mission.get("project", ""))
+            if err:
+                return json.dumps({"error": err}, ensure_ascii=False, default=str)
+        if stack_id is None:
+            stack_id, err = _resolve_stack_id(board_id, mission)
+            if err:
+                return json.dumps(
+                    {"error": f"Cannot resolve Deck stack: {err}"},
+                    ensure_ascii=False,
+                    default=str,
+                )
+        if card_id is None:
+            card_id = mission.get("deck_task_id")
+
+    if card_id is None or board_id is None or stack_id is None:
+        return json.dumps(
+            {
+                "error": (
+                    "card_id, board_id and stack_id are required unless a "
+                    "mission_id resolves them"
+                )
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     # Fetch current card detail to preserve the title
     card, err = call_mcp_tool(

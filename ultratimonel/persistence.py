@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SCHEMA_DESCRIPTION = (
-    "v7: intentos.status accepts aborted/partial (honest terminal states)"
+    "v8: mission_deletions audit ledger (replica-only mission_delete)"
 )
 
 # v6 tables — shared by the fresh-DB DDL and the v5→v6 migration (additive, D9).
@@ -113,6 +113,32 @@ INTENTOS_V7_COLUMNS = (
     "gates_passed, gates_total, started_at, completed_at, summary, evidence, "
     "closed_at, gates_detail"
 )
+
+# v8 tables — append-only audit of replica-only mission deletions.
+#
+# ``turn_bitacora`` cannot carry this event: its rows are keyed by mission_id
+# and are themselves deleted with the mission, so an audit row stored there
+# would vanish in the same transaction. ``gate_logs`` is gate-specific. The
+# deletion ledger therefore lives in its own table and outlives the mission.
+DDL_V8_TABLES = [
+    """CREATE TABLE IF NOT EXISTS mission_deletions (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id        INTEGER NOT NULL,
+        deck_task_id      INTEGER,
+        project           TEXT,
+        title             TEXT,
+        reason            TEXT NOT NULL,
+        requested_by      TEXT NOT NULL,
+        quests_deleted    INTEGER NOT NULL DEFAULT 0,
+        intentos_deleted  INTEGER NOT NULL DEFAULT 0,
+        grants_deleted    INTEGER NOT NULL DEFAULT 0,
+        bitacora_deleted  INTEGER NOT NULL DEFAULT 0,
+        deleted_ids       TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_mission_deletions_mission"
+    " ON mission_deletions(mission_id)",
+]
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -322,11 +348,29 @@ def _migrate_v6_to_v7(conn) -> None:
             conn.execute(stmt)
         logger.info("Migrated DB v6→v7: rebuilt intentos with honest status states")
 
-    # INSERT OR IGNORE keeps the migration replay-safe.
+    # INSERT OR IGNORE keeps the migration replay-safe. The version is pinned
+    # to 7 so a later SCHEMA_VERSION bump cannot make this step stamp a version
+    # whose migration has not run yet.
     conn.execute(
         "INSERT OR IGNORE INTO schema_version (version, description) VALUES (?, ?)",
-        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
+        (7, "v7: intentos.status accepts aborted/partial (honest terminal states)"),
     )
+
+
+def _migrate_v7_to_v8(conn) -> None:
+    """v7→v8: add the ``mission_deletions`` audit ledger.
+
+    Additive only: one table plus its index, no data rewrite and no destructive
+    DDL. ``CREATE TABLE IF NOT EXISTS`` plus ``INSERT OR IGNORE`` make replay a
+    no-op, and older code keeps working against the extra table (SCHEMA_AHEAD).
+    """
+    for stmt in DDL_V8_TABLES:
+        conn.execute(stmt)
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (version, description) VALUES (?, ?)",
+        (8, "v8: mission_deletions audit ledger (replica-only mission_delete)"),
+    )
+    logger.info("Migrated DB v7→v8: added mission_deletions audit ledger")
 
 
 def _is_v1_style_missions_table(conn) -> bool:
@@ -543,6 +587,9 @@ class Persistence:
                         pass
                     # Add v4 session_turns table for fresh install
                     conn.execute(DDL_SESSION_TURNS[0])
+                    # v8 audit ledger (additive)
+                    for stmt in DDL_V8_TABLES:
+                        conn.execute(stmt)
                     conn.execute(
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
@@ -564,7 +611,8 @@ class Persistence:
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
-                    logger.info("Migrated DB v1→v7: %s", self._db_path)
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v1→v8: %s", self._db_path)
                 elif current_ver == 2:
                     # Migration v2 → v3: add gates_detail column to intentos
                     try:
@@ -582,29 +630,38 @@ class Persistence:
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
-                    logger.info("Migrated DB v2→v7: %s", self._db_path)
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v2→v8: %s", self._db_path)
                 elif current_ver == 3:
                     # Migration v3 → v4 → v5 → v6 → v7
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
-                    logger.info("Migrated DB v3→v7: %s", self._db_path)
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v3→v8: %s", self._db_path)
                 elif current_ver == 4:
                     # Migration v4 → v5 → v6 → v7
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
-                    logger.info("Migrated DB v4→v7: %s", self._db_path)
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v4→v8: %s", self._db_path)
                 elif current_ver == 5:
                     # Migration v5 → v6 → v7
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
-                    logger.info("Migrated DB v5→v7: %s", self._db_path)
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v5→v8: %s", self._db_path)
                 elif current_ver == 6:
-                    # Migration v6 → v7: honest intento statuses
+                    # Migration v6 → v7 → v8: honest intento statuses + ledger
                     _migrate_v6_to_v7(conn)
-                    logger.info("Migrated DB v6→v7: %s", self._db_path)
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v6→v8: %s", self._db_path)
+                elif current_ver == 7:
+                    # Migration v7 → v8: mission_deletions audit ledger
+                    _migrate_v7_to_v8(conn)
+                    logger.info("Migrated DB v7→v8: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
                     # Already current — ensure all tables exist
                     for stmt in DDL_V2:
@@ -630,6 +687,9 @@ class Persistence:
                     # a v7 stamp whose intentos CHECK is still the v6 one: the
                     # guard makes this a no-op on an honest table.
                     _migrate_v6_to_v7(conn)
+                    # Ensure the v8 audit ledger exists on a current DB.
+                    for stmt in DDL_V8_TABLES:
+                        conn.execute(stmt)
                     logger.debug("DB schema up to date (v%s)", SCHEMA_VERSION)
 
     # ── session CRUD ───────────────────────────────────────────────────
@@ -984,13 +1044,133 @@ class Persistence:
                 cursor = conn.execute("DELETE FROM missions WHERE id = ?", (mission_id,))
                 return cursor.rowcount > 0
 
+    def delete_mission(
+        self,
+        mission_id: int,
+        reason: str,
+        requested_by: str = "hermes",
+    ) -> Optional[dict]:
+        """Delete ONE mission and every replica row that depends on it.
+
+        Replica-only: this never touches Deck. The card is not deleted,
+        archived, or moved — ``mission_delete`` is a local cleanup operation.
+
+        Everything happens in a single transaction, including the audit row, so
+        the mission can never be left half removed and an audit entry can never
+        describe a deletion that did not happen. The audit row itself is written
+        to ``mission_deletions``, which is not keyed by the mission and therefore
+        survives (unlike ``turn_bitacora`` rows, which are deleted with it).
+
+        Returns a summary dict, or ``None`` when the mission does not exist.
+        Raises ``ValueError`` when ``reason`` is empty — callers must pass a
+        real justification before any row is touched.
+        """
+        if not (reason or "").strip():
+            raise ValueError("mission_delete requires a non-empty reason")
+        actor = (requested_by or "").strip() or "unknown"
+
+        with self._lock:
+            with self._conn() as conn:
+                mission = conn.execute(
+                    "SELECT * FROM missions WHERE id = ?", (mission_id,)
+                ).fetchone()
+                if mission is None:
+                    return None
+
+                quest_rows = conn.execute(
+                    "SELECT id FROM checklist_items WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchall()
+                intento_rows = conn.execute(
+                    "SELECT id FROM intentos WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchall()
+                grant_rows = conn.execute(
+                    "SELECT id FROM attempt_grants WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchall()
+                bitacora_rows = conn.execute(
+                    "SELECT id FROM turn_bitacora WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchall()
+
+                quest_ids = [r["id"] for r in quest_rows]
+                intento_ids = [r["id"] for r in intento_rows]
+                grant_ids = [r["id"] for r in grant_rows]
+                bitacora_ids = [r["id"] for r in bitacora_rows]
+
+                deleted_ids = json.dumps(
+                    {
+                        "mission_ids": [mission_id],
+                        "deck_task_id": mission["deck_task_id"],
+                        "checklist_item_ids": quest_ids,
+                        "intento_ids": intento_ids,
+                        "attempt_grant_ids": grant_ids,
+                        "turn_bitacora_ids": bitacora_ids,
+                    },
+                    ensure_ascii=False,
+                )
+
+                cursor = conn.execute(
+                    """INSERT INTO mission_deletions
+                           (mission_id, deck_task_id, project, title, reason,
+                            requested_by, quests_deleted, intentos_deleted,
+                            grants_deleted, bitacora_deleted, deleted_ids)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        mission_id,
+                        mission["deck_task_id"],
+                        mission["project"],
+                        mission["title"],
+                        reason.strip(),
+                        actor,
+                        len(quest_ids),
+                        len(intento_ids),
+                        len(grant_ids),
+                        len(bitacora_ids),
+                        deleted_ids,
+                    ),
+                )
+                audit_id = cursor.lastrowid
+
+                conn.execute(
+                    "DELETE FROM turn_bitacora WHERE mission_id = ?", (mission_id,)
+                )
+                conn.execute(
+                    "DELETE FROM attempt_grants WHERE mission_id = ?", (mission_id,)
+                )
+                conn.execute("DELETE FROM intentos WHERE mission_id = ?", (mission_id,))
+                conn.execute(
+                    "DELETE FROM checklist_items WHERE mission_id = ?", (mission_id,)
+                )
+                conn.execute("DELETE FROM missions WHERE id = ?", (mission_id,))
+
+                return {
+                    "mission_id": mission_id,
+                    "deck_task_id": mission["deck_task_id"],
+                    "project": mission["project"],
+                    "title": mission["title"],
+                    "audit_id": audit_id,
+                    "quests_deleted": len(quest_ids),
+                    "intentos_deleted": len(intento_ids),
+                    "grants_deleted": len(grant_ids),
+                    "bitacora_deleted": len(bitacora_ids),
+                    "deleted_ids": {
+                        "checklist_item_ids": quest_ids,
+                        "intento_ids": intento_ids,
+                        "attempt_grant_ids": grant_ids,
+                        "turn_bitacora_ids": bitacora_ids,
+                    },
+                }
+
     def list_missions(self, project: str) -> list[dict]:
         """List missions for a project."""
         with self._lock:
             with self._conn() as conn:
                 rows = conn.execute("""
-                    SELECT id, deck_task_id, project, title, description,
-                           status, checklist_total, checklist_done, last_sync, created_at
+                    SELECT id, deck_task_id, deck_stack_id, project, title,
+                           description, status, checklist_total, checklist_done,
+                           last_sync, created_at
                     FROM missions
                     WHERE project = ?
                     ORDER BY created_at DESC

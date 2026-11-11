@@ -800,14 +800,14 @@ class TestDbMigrationV6ToV7:
             db_path = f.name
         try:
             _build_legacy_v6_db(db_path)
-            Persistence(db_path=db_path).close()  # runs v6→v7
+            Persistence(db_path=db_path).close()  # runs v6→v7→v8
 
             p = Persistence(db_path=db_path)
             try:
                 with p._conn() as conn:
                     assert conn.execute(
                         "SELECT MAX(version) FROM schema_version"
-                    ).fetchone()[0] == 7
+                    ).fetchone()[0] == 8
 
                     # Every pre-existing row survives verbatim.
                     rows = conn.execute(
@@ -884,7 +884,7 @@ class TestDbMigrationV6ToV7:
             db_path = f.name
         try:
             _build_legacy_v6_db(db_path)
-            Persistence(db_path=db_path).close()  # upgrade to v7
+            Persistence(db_path=db_path).close()  # upgrade to v8
 
             with patch.object(persistence_mod, "SCHEMA_VERSION", 6), patch.object(
                 persistence_mod, "SCHEMA_DESCRIPTION", "v6"
@@ -900,7 +900,7 @@ class TestDbMigrationV6ToV7:
                     with v6_runtime._conn() as conn:
                         assert conn.execute(
                             "SELECT MAX(version) FROM schema_version"
-                        ).fetchone()[0] == 7
+                        ).fetchone()[0] == 8
                 finally:
                     v6_runtime.close()
         finally:

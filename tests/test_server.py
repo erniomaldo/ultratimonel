@@ -1425,11 +1425,11 @@ class TestMissionListLightMode:
     def test_default_is_compact(self, mock_persistence):
         """WU4/D4: default (no param) returns compact {id,title,status} only."""
         from ultratimonel.server import mission_list
-        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "deck_stack_id": 7, "checklist_items": [{"id": 10}]}
         mock_persistence.list_missions.return_value = [full_mission]
 
         result = json.loads(mission_list("testproj"))
-        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente", "deck_stack_id": 7}
         assert "description" not in result["missions"][0]
         assert "checklist_items" not in result["missions"][0]
         assert result["total"] == 1
@@ -1450,11 +1450,11 @@ class TestMissionListLightMode:
     def test_include_description_false_returns_light_mode(self, mock_persistence):
         """F-TU-03: opt-in light mode omits description and checklist_items."""
         from ultratimonel.server import mission_list
-        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "deck_stack_id": 7, "checklist_items": [{"id": 10}]}
         mock_persistence.list_missions.return_value = [full_mission]
 
         result = json.loads(mission_list("testproj", include_description=False))
-        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente", "deck_stack_id": 7}
         assert "description" not in result["missions"][0]
         assert "checklist_items" not in result["missions"][0]
 
@@ -1464,11 +1464,11 @@ class TestMissionGet:
     def test_mission_get_returns_minimal_fields(self, mock_persistence):
         """F-TU-01: mission_get returns id, title, checklist_item_ids only."""
         from ultratimonel.server import mission_get
-        mock_persistence.get_mission.return_value = {"id": 123, "title": "Sprint Planning", "description": "..."}
+        mock_persistence.get_mission.return_value = {"id": 123, "title": "Sprint Planning", "description": "...", "deck_stack_id": 9}
         mock_persistence.list_checklist_items.return_value = [{"id": 456}, {"id": 457}]
 
         result = json.loads(mission_get(123))
-        assert result == {"id": 123, "title": "Sprint Planning", "checklist_item_ids": [456, 457]}
+        assert result == {"id": 123, "title": "Sprint Planning", "checklist_item_ids": [456, 457], "deck_stack_id": 9}
         assert "description" not in result
         assert "checklist_items" not in result
 

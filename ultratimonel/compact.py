@@ -54,15 +54,18 @@ def compact_gates(gates: Iterable[Any]) -> list[dict[str, Any]]:
 
 
 def compact_mission(mission: Any) -> dict[str, Any]:
-    """Serialize a mission to ``{id, title, status}``.
+    """Serialize a mission to ``{id, title, status, deck_stack_id}``.
 
     Drops ``description``, ``checklist_items`` and every other verbose field;
-    callers that need the full payload must opt in explicitly.
+    callers that need the full payload must opt in explicitly. ``deck_stack_id``
+    is exposed verbatim (``None`` when the replica has not backfilled it yet) so
+    callers can resolve board+stack without a Deck lookup.
     """
     return {
         "id": _field(mission, "id"),
         "title": _field(mission, "title", ""),
         "status": _field(mission, "status", ""),
+        "deck_stack_id": _field(mission, "deck_stack_id"),
     }
 
 
