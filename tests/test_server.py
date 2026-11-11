@@ -2647,7 +2647,7 @@ class TestEndTurnQuestTransition:
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
-    def test_end_turn_transition_is_unconditional_on_fail(
+    def test_end_turn_fail_leaves_quest_open(
         self, mock_persistence, mock_board, mock_stack, mock_complete
     ):
         from ultratimonel.server import end_turn
@@ -2675,10 +2675,13 @@ class TestEndTurnQuestTransition:
         result = json.loads(end_turn(42))
 
         assert result["final_status"] == "fail"
-        # The quest is consumed anyway (PM: unconditional transition).
-        assert result["quest_done"] is True
-        mock_complete.assert_called_once_with(21, 111, 189, 2)
-        mock_persistence.set_quest_done.assert_called_once_with(10, True)
+        # Card #218: only a successful turn consumes the quest.
+        assert result["quest_id"] == 10
+        assert result["quest_done"] is False
+        mock_complete.assert_not_called()
+        mock_persistence.set_quest_done.assert_not_called()
+        # The intento is still finalized (never left running).
+        mock_persistence.complete_intento_with_gates.assert_called_once()
 
     @patch("ultratimonel.server.deck_bridge.complete_quest")
     @patch("ultratimonel.server._resolve_stack_id")
@@ -2770,6 +2773,162 @@ class TestEndTurnQuestTransition:
         mock_complete.assert_not_called()
         mock_persistence.set_quest_done.assert_not_called()
         srv._clear_active_intento()
+
+
+class TestEndTurnStatusVocabulary:
+    """Card #218: end_turn honours the requested ``status``.
+
+    Real temp SQLite DB so the quest replica state is observable, with the Deck
+    bridge, board and stack resolution mocked.
+    """
+
+    _GATES_ALL_PASS = [
+        {"name": "1a", "state": "PASS", "mandatory": 1},
+        {"name": "1b", "state": "PASS", "mandatory": 1},
+        {"name": "1c", "state": "PASS", "mandatory": 1},
+        {"name": "1e", "state": "PASS", "mandatory": 1},
+    ]
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def teardown_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def _make_turn(self, tmp_path, monkeypatch, gates=None):
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        db = Persistence(db_path=str(tmp_path / "status-vocab.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_id = db.upsert_mission(
+            deck_task_id=807, project="voy-rojo", title="Card #218", status="pendiente"
+        )
+        quest_id = db.upsert_checklist_item(
+            mission_id=mission_id, item_index=0, text="open", done=0
+        )
+        intento_id = db.create_intento("sess-1", "voy-rojo", mission_id, quest_id)
+        db.capture_gates_for_intento(
+            intento_id, gates if gates is not None else self._GATES_ALL_PASS
+        )
+        srv._set_active_intento(intento_id, "sess-1", "voy-rojo")
+
+        monkeypatch.setattr(srv, "_resolve_board_id", lambda project: (21, None))
+        monkeypatch.setattr(
+            srv, "_resolve_stack_for_card", lambda board_id, mission=None: (111, None, None)
+        )
+        writes = []
+        monkeypatch.setattr(
+            srv.deck_bridge,
+            "complete_quest",
+            lambda board_id, stack_id, card_id, position: writes.append(
+                (board_id, stack_id, card_id, position)
+            )
+            or (True, None),
+        )
+        return db, mission_id, quest_id, intento_id, writes
+
+    @pytest.mark.parametrize("requested", ["success", "aborted", "failed", "partial"])
+    def test_end_turn_status_each_valid_sets_final_status_and_quest_state(
+        self, requested, tmp_path, monkeypatch
+    ):
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, requested))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == requested
+        expected_done = requested == "success"
+        assert result["quest_done"] is expected_done
+        assert result["quest_id"] == quest_id
+        # The intento is ALWAYS finalized — never left running.
+        stored = db.get_intento(intento_id)
+        assert stored["status"] != "running"
+        assert stored["completed_at"] is not None
+        # The quest replica is consumed only on success.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == int(expected_done)
+        assert len(writes) == (1 if expected_done else 0)
+
+    def test_end_turn_status_unknown_is_rejected_with_zero_mutation(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, "bogus"))
+
+        assert result["status"] == "error"
+        assert "Invalid status" in result["error"]
+        # No completion: the intento is still running and open.
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "running"
+        assert stored["completed_at"] is None
+        # Quest untouched, no Deck write, active turn still recoverable.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+        assert srv._get_active_intento() is not None
+
+    def test_end_turn_status_is_case_insensitive_and_normalized(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        _db, _mission_id, _quest_id, intento_id, _writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, "ABORTED"))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "aborted"
+        assert result["quest_done"] is False
+
+    def test_end_turn_status_forum_regression_abandoned_turn_stays_open(self, tmp_path, monkeypatch):
+        """Reported case: turn opened and abandoned, closed with status=aborted.
+
+        Must NOT report success and must NOT consume the quest.
+        """
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, "aborted"))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "aborted"
+        assert result["quest_done"] is False
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+        assert db.get_intento(intento_id)["status"] != "running"
+
+    def test_end_turn_status_missing_still_closes_as_success(self, tmp_path, monkeypatch):
+        """Compatibility: no ``status`` behaves exactly as before (success)."""
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "success"
+        assert result["gates_passed"] == 4
+        assert result["gates_total"] == 4
+        assert result["quest_done"] is True
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 1
+        assert len(writes) == 1
 
 
 class TestCompactReadAndNoVerbose:

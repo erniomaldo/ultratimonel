@@ -2004,9 +2004,10 @@ def begin_turn(
 def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
     """Flip the intento's quest to done in Deck, then refresh the replica (D6).
 
-    Unconditional quest closure: whenever a turn closes the intento's quest
-    becomes ``done=true``, regardless of the turn's success/fail. Deck stays the
-    source of truth, so the local replica is refreshed only after
+    Closes the intento's quest in Deck (``done=true``) and refreshes the local
+    replica. ``end_turn`` calls this ONLY when the turn's ``final_status`` is
+    ``success``; an aborted, failed or partial turn leaves the quest open. Deck
+    stays the source of truth, so the local replica is refreshed only after
     ``deck_bridge.complete_quest`` acknowledges the write (D1). Failures are
     logged and never raise — closing a turn must not be blocked by a bridge or
     resolution problem (a later ``sync_task`` can recover).
@@ -2095,11 +2096,15 @@ def end_turn(
 
     end_turn is the ONLY false→true quest transition path (design D6). It flips
     the intento's quest to ``done`` in Deck (``- [ ]`` → ``- [x]``) and refreshes
-    the replica. The transition is UNCONDITIONAL: the quest is consumed whenever
-    the turn closes, while the success/fail result lives on the intento.
+    the replica. The transition happens ONLY when ``final_status`` is
+    ``success``: an aborted, failed or partial turn leaves the quest open so the
+    dashboard can tell a completed quest from an abandoned turn.
 
     ``final_status`` derives from MANDATORY gates only (design D8): a
-    non-mandatory gate that is not PASS/SKIP never forces a fail.
+    non-mandatory gate that is not PASS/SKIP never forces a fail. When a
+    mandatory gate does not pass, ``final_status`` is ``fail`` regardless of the
+    requested ``status``; when all mandatory gates pass, ``final_status`` is the
+    requested ``status``.
 
     end_turn NEVER blocks permanently. When gates do not pass, it completes
     the intento with final_status="fail" and real gate detail, then clears
@@ -2110,14 +2115,32 @@ def end_turn(
 
     Args:
         intento_id: Numeric intento ID returned by begin_turn().
-        status:     Final status hint ('success' or 'fail'). Used for logging;
-                    actual completion status derives from gate validation.
+        status:     Terminal status for the turn. Accepts ``success``,
+                    ``aborted``, ``failed`` or ``partial`` (case-insensitive).
+                    An unrecognized value is rejected with zero mutation.
 
     Returns:
         JSON string with completion status, gates_passed count, compact gate
-        detail, and the closed quest_id/quest_done.
+        detail, and the quest_id/quest_done.
     """
     global _active_intento
+
+    # 0. Validate the requested terminal status BEFORE any mutation. An unknown
+    #    value must leave the intento, the quest and the active-turn state
+    #    untouched (no completion, no Deck write).
+    normalized_status = status.strip().lower() if isinstance(status, str) else ""
+    if normalized_status not in ("success", "aborted", "failed", "partial"):
+        return json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    f"Invalid status {status!r}. Expected one of: "
+                    "success, aborted, failed, partial."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     # 1. Resolve session_id + project from the DB (no delegation to orchestrator)
     intento = persistence.get_intento(intento_id)
@@ -2202,19 +2225,30 @@ def end_turn(
     ]
     has_mandatory_evidence = any(bool(g.get("mandatory")) for g in final_gates)
     if final_gates and has_mandatory_evidence and not mandatory_failed:
-        final_status = "success"
+        # Gates pass: the caller's requested terminal status wins.
+        final_status = normalized_status
     else:
+        # A mandatory gate did not pass: the gates own the verdict.
         final_status = "fail"
 
-    # 5b. Quest closure (D6): UNCONDITIONAL '- [ ]' -> '- [x]' in Deck, then
-    #     replica refresh, independent of final_status. Never blocks the close.
-    quest_id_closed, quest_done = _complete_quest_for_intento(intento)
+    # 5b. Quest closure (D6): only a genuinely successful turn consumes the
+    #     quest. Aborted/failed/partial (and gate-fail) leave it open so the
+    #     dashboard can distinguish "quest done" from "turn abandoned".
+    if final_status == "success":
+        quest_id_closed, quest_done = _complete_quest_for_intento(intento)
+    else:
+        quest_id_closed = intento.get("checklist_item_id") or None
+        quest_done = False
 
     # 6. Completar intento con detalle completo (NEVER blocks — always completes)
+    #    The intentos.status CHECK only accepts 'running', 'success' and 'fail';
+    #    a non-success terminal state is persisted as 'fail' while the honest
+    #    requested state is reported through ``final_status`` in the response.
+    persisted_status = final_status if final_status in ("success", "fail") else "fail"
     try:
         persistence.complete_intento_with_gates(
             intento_id=intento_id,
-            status=final_status,
+            status=persisted_status,
             gates_passed=gates_passed,
             gates_detail=final_gates,
         )
