@@ -303,7 +303,7 @@ mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP
 
 | Tool | Descripción |
 |------|-------------|
-| `sync_tasks(project)` | Sincroniza cards de Deck → tabla missions para un proyecto |
+| `sync_tasks(project, prune=False)` | Sincroniza cards de Deck → tabla missions y reporta deriva (`missing_in_deck`, `skipped`). `prune=true` poda sólo huérfanas demostradas sobre una lectura completa de Deck |
 | `sync_all()` | Sincroniza todos los proyectos mapeados |
 | `mission_list(project)` | Lista misiones (Deck tasks) de un proyecto |
 | `mission_get(mission_id)` | Recupera una misión por ID |

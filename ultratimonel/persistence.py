@@ -956,6 +956,34 @@ class Persistence:
                 )
                 return cursor.rowcount > 0
 
+    def prune_mission(self, mission_id: int) -> bool:
+        """Delete one mission and every row that depends on it.
+
+        Internal helper for the drift-pruning branch of ``sync_tasks`` (card
+        #218). It is NOT the public ``mission_delete`` tool: callers must have
+        already proven the mission is an orphan against a complete Deck read.
+
+        Deletion is a single transaction so a mission can never be left half
+        removed (mission gone, quests still behind). Returns True when a
+        mission row was actually deleted.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                # turn_bitacora is keyed by mission_id (no FK enforcement).
+                conn.execute(
+                    "DELETE FROM turn_bitacora WHERE mission_id = ?", (mission_id,)
+                )
+                # attempt_grants carries mission_id/checklist_item_id, no FK.
+                conn.execute(
+                    "DELETE FROM attempt_grants WHERE mission_id = ?", (mission_id,)
+                )
+                conn.execute("DELETE FROM intentos WHERE mission_id = ?", (mission_id,))
+                conn.execute(
+                    "DELETE FROM checklist_items WHERE mission_id = ?", (mission_id,)
+                )
+                cursor = conn.execute("DELETE FROM missions WHERE id = ?", (mission_id,))
+                return cursor.rowcount > 0
+
     def list_missions(self, project: str) -> list[dict]:
         """List missions for a project."""
         with self._lock:

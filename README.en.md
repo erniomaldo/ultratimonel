@@ -306,7 +306,7 @@ kept for compatibility). Every tool is auto-discovered via the MCP protocol.
 
 | Tool | Description |
 |------|-------------|
-| `sync_tasks(project)` | Syncs Deck cards → missions table for a project |
+| `sync_tasks(project, prune=False)` | Syncs Deck cards → missions table and reports drift (`missing_in_deck`, `skipped`). `prune=true` deletes only proven orphans from a complete Deck read |
 | `sync_all()` | Syncs all mapped projects |
 | `mission_list(project)` | Lists missions (Deck tasks) for a project |
 | `mission_get(mission_id)` | Retrieves a mission by ID |

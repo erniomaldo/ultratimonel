@@ -847,18 +847,27 @@ def map_sync() -> str:
 
 
 @app.tool()
-def sync_tasks(project: str) -> str:
-    """Sync Deck cards from Nextcloud → missions table for a project.
+def sync_tasks(project: str, prune: bool = False) -> str:
+    """Sync Deck cards from Nextcloud → missions table and report drift.
 
     Fetches all stacks/cards from the project's mapped Deck board, extracts
     quests (markdown checkbox lines in the card description; ``done`` = ``[x]``),
     and upserts into the missions + checklist_items tables.
 
+    Always reports drift: missions in the replica whose card is missing from a
+    complete Deck read (``missing_in_deck``) and cards that were in Deck but not
+    refreshed (``skipped``, each with its cause). ``prune=True`` additionally
+    deletes the proven orphans. Pruning never happens over a failed, partial,
+    or unresolvable Deck read: a false orphan destroys real work.
+
     Args:
         project: Project slug (e.g. "voy-rojo").
+        prune: Delete replica missions proven absent from a complete Deck read.
+            Defaults to False (report drift only, delete nothing).
 
     Returns:
-        JSON with sync results (missions created/updated, errors).
+        JSON with ``synced``, ``pruned``, ``missing_in_deck``, ``skipped`` and
+        ``errors`` (plus counters and ``read_complete``).
     """
     from .context_extractor import get_project_maps
     from .mcp_client import call_mcp_tool, TOOL_NAMES
@@ -879,30 +888,127 @@ def sync_tasks(project: str) -> str:
         timeout=15.0,
     )
     if stacks_data is None:
-        return json.dumps({"error": f"Cannot reach Deck: {err}"})
+        # Failed read: nothing is synced, nothing is pruned, and the failure is
+        # reported in the same shape as a successful run.
+        return json.dumps(
+            {
+                "project": project,
+                "board_id": board_id,
+                "synced": 0,
+                "pruned": [],
+                "missing_in_deck": [],
+                "skipped": [],
+                "errors": [f"Cannot reach Deck: {err}"],
+                "total_errors": 1,
+                "total_pruned": 0,
+                "total_missing_in_deck": 0,
+                "total_skipped": 0,
+                "prune_requested": prune,
+                "read_complete": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
-    stacks = (
-        stacks_data
-        if isinstance(stacks_data, list)
-        else stacks_data.get("stacks", stacks_data.get("result", []))
-    )
+    # A successful read is not the same as a COMPLETE read. Pruning deletes
+    # real work when a card is merely invisible because the read was partial,
+    # so every shape problem below marks the read incomplete and forbids
+    # pruning (requirement 4: a false orphan is worse than an extra card).
+    read_complete = True
+    read_issues: list[str] = []
+
+    if isinstance(stacks_data, list):
+        stacks = stacks_data
+    elif isinstance(stacks_data, dict):
+        if isinstance(stacks_data.get("stacks"), list):
+            stacks = stacks_data["stacks"]
+        elif isinstance(stacks_data.get("result"), list):
+            stacks = stacks_data["result"]
+        else:
+            read_complete = False
+            read_issues.append("Deck response has no 'stacks'/'result' list")
+            stacks = []
+    else:
+        read_complete = False
+        read_issues.append(
+            f"Deck response has unexpected shape: {type(stacks_data).__name__}"
+        )
+        stacks = []
 
     created = 0
     updated_count = 0
     errors = []
+    skipped: list[dict] = []
+    seen_card_ids: set[int] = set()
 
     for stack in stacks:
+        if not isinstance(stack, dict) or stack.get("id") is None:
+            read_complete = False
+            read_issues.append("Stack without id in Deck read")
+            continue
         stack_name = stack.get("title", "?")
-        cards = stack.get("cards", [])
+        cards = stack.get("cards") or []
+        if not isinstance(cards, list):
+            read_complete = False
+            read_issues.append(f"Stack {stack.get('id')}: 'cards' is not a list")
+            continue
         if not cards:
             continue
 
+        # Map stack title → mission status
+        status_map = {
+            "backlog": "pendiente",
+            "pendiente": "pendiente",
+            "to do": "pendiente",
+            "en progreso": "en_progreso",
+            "in progress": "en_progreso",
+            "doing": "en_progreso",
+            "done": "completada",
+            "hecho": "completada",
+            "completada": "completada",
+            "completado": "completada",
+        }
+        status = status_map.get(str(stack_name).lower().strip())
+
         for card in cards:
             try:
-                card_id = card.get("id")
-                if not card_id:
+                if not isinstance(card, dict) or not card.get("id"):
+                    read_complete = False
+                    read_issues.append("Card without id in Deck read")
+                    skipped.append(
+                        {
+                            "deck_task_id": None,
+                            "title": card.get("title") if isinstance(card, dict) else None,
+                            "reason": "card_unreadable",
+                        }
+                    )
                     continue
+                card_id = card.get("id")
+                # Membership is known as soon as the card id is: record it
+                # before any skip so a skipped card is never a false orphan.
+                seen_card_ids.add(card_id)
                 title = card.get("title", "Sin título")
+
+                if card.get("archived"):
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": "archived",
+                        }
+                    )
+                    continue
+
+                if status is None:
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": f"stack_unmapped: {stack_name}",
+                        }
+                    )
+                    continue
+
                 description = card.get("description", "")
 
                 # Get card detail for checklist info
@@ -916,6 +1022,23 @@ def sync_tasks(project: str) -> str:
                     },
                     timeout=8.0,
                 )
+
+                # A card we cannot read is a card we cannot refresh. Report it
+                # as skipped with its cause instead of silently keeping stale
+                # data, and treat the read as partial so nothing is pruned.
+                if detail_err or not isinstance(card_detail, dict):
+                    read_complete = False
+                    read_issues.append(
+                        f"Card {card_id}: detail unavailable ({detail_err or 'empty'})"
+                    )
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": f"card_read_failed: {detail_err or 'unavailable'}",
+                        }
+                    )
+                    continue
 
                 # Infer checklist_total from description parsing
                 # Deck stores checklist as "n/N" or markdown checkboxes - we count items
@@ -970,20 +1093,7 @@ def sync_tasks(project: str) -> str:
                         if done:
                             checklist_done += 1
 
-                # Map stack title → mission status
-                status_map = {
-                    "backlog": "pendiente",
-                    "pendiente": "pendiente",
-                    "to do": "pendiente",
-                    "en progreso": "en_progreso",
-                    "in progress": "en_progreso",
-                    "doing": "en_progreso",
-                    "done": "completada",
-                    "hecho": "completada",
-                    "completada": "completada",
-                    "completado": "completada",
-                }
-                status = status_map.get(stack_name.lower().strip(), "pendiente")
+                # Map stack title → mission status (computed per stack above).
 
                 # Upsert mission
                 mission_id = persistence.upsert_mission(
@@ -997,6 +1107,13 @@ def sync_tasks(project: str) -> str:
                 )
                 if mission_id == 0:
                     errors.append(f"Card {card_id}: upsert returned 0")
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": "upsert_failed",
+                        }
+                    )
                     continue
 
                 # Upsert checklist items
@@ -1014,13 +1131,65 @@ def sync_tasks(project: str) -> str:
                 errors.append(f"Card {card.get('id', '?')}: {exc}")
                 logger.exception("sync_tasks card error")
 
+    # ── Drift report (always computed, prune or not) ──────────────────────
+    # A mission is drift when the replica still holds it but a complete Deck
+    # read no longer knows its card. Without a complete read we cannot tell
+    # "not in Deck" from "I could not read it", so no orphan is ever inferred.
+    missing_in_deck: list[dict] = []
+    if read_complete:
+        for mission in persistence.list_missions(project):
+            deck_task_id = mission.get("deck_task_id")
+            if deck_task_id is None:
+                continue
+            if deck_task_id not in seen_card_ids:
+                missing_in_deck.append(
+                    {
+                        "mission_id": mission.get("id"),
+                        "deck_task_id": deck_task_id,
+                        "title": mission.get("title"),
+                    }
+                )
+    else:
+        errors.append(
+            "drift_undetermined: Deck read incomplete ("
+            + "; ".join(read_issues[:5])
+            + ")"
+        )
+
+    # ── Prune (explicit, and only over a complete read) ──────────────────
+    pruned: list[int] = []
+    if prune:
+        if not read_complete:
+            errors.append("prune_skipped: incomplete Deck read, nothing deleted")
+        else:
+            for entry in missing_in_deck:
+                mission_id = entry["mission_id"]
+                try:
+                    if persistence.prune_mission(mission_id):
+                        pruned.append(mission_id)
+                    else:
+                        errors.append(
+                            f"prune {mission_id}: mission row not found"
+                        )
+                except Exception as exc:
+                    errors.append(f"prune {mission_id}: {exc}")
+                    logger.exception("sync_tasks prune error")
+
     return json.dumps(
         {
             "project": project,
             "board_id": board_id,
             "synced": created,
+            "pruned": pruned,
+            "missing_in_deck": missing_in_deck,
+            "skipped": skipped,
             "errors": errors,
             "total_errors": len(errors),
+            "total_pruned": len(pruned),
+            "total_missing_in_deck": len(missing_in_deck),
+            "total_skipped": len(skipped),
+            "prune_requested": prune,
+            "read_complete": read_complete,
         },
         ensure_ascii=False,
         default=str,
