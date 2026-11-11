@@ -2084,6 +2084,7 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
 def end_turn(
     intento_id: int,
     status: str = "success",
+    quest_done: bool | None = None,
 ) -> str:
     """End the current turn: validate gates, complete the intento, close the quest.
 
@@ -2118,14 +2119,35 @@ def end_turn(
         status:     Terminal status for the turn. Accepts ``success``,
                     ``aborted``, ``failed`` or ``partial`` (case-insensitive).
                     An unrecognized value is rejected with zero mutation.
+        quest_done: Explicit quest-closure intent. ``None`` (default) keeps the
+                    original behaviour: the quest is consumed only when
+                    ``final_status`` is ``success``. ``False`` never consumes the
+                    quest, even on a successful turn — this closes an empty turn
+                    without lying. ``True`` with a ``final_status`` other than
+                    ``success`` is rejected with zero mutation: there is no path
+                    to force a dishonest closure.
 
     Returns:
         JSON string with completion status, gates_passed count, compact gate
-        detail, and the quest_id/quest_done.
+        detail, and the quest_id/quest_done that reflect what actually happened.
     """
     global _active_intento
 
-    # 0. Validate the requested terminal status BEFORE any mutation. An unknown
+    # 0a. Validate quest_done's type BEFORE any mutation.
+    if quest_done is not None and not isinstance(quest_done, bool):
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_quest_done",
+                "error": (
+                    f"Invalid quest_done {quest_done!r}. Expected true, false or None."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # 0b. Validate the requested terminal status BEFORE any mutation. An unknown
     #    value must leave the intento, the quest and the active-turn state
     #    untouched (no completion, no Deck write).
     normalized_status = status.strip().lower() if isinstance(status, str) else ""
@@ -2231,20 +2253,40 @@ def end_turn(
         # A mandatory gate did not pass: the gates own the verdict.
         final_status = "fail"
 
+    # 5c. quest_done=True with a non-success verdict is a validation error with
+    #     zero mutation: an explicit closure must never override the gates, and
+    #     nothing above this point has written anything.
+    if quest_done is True and final_status != "success":
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_quest_done",
+                "error": (
+                    f"Cannot mark the quest done with final_status "
+                    f"{final_status!r}: only a successful turn closes the quest."
+                ),
+                "intento_id": intento_id,
+                "final_status": final_status,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     # 5b. Quest closure (D6): only a genuinely successful turn consumes the
-    #     quest. Aborted/failed/partial (and gate-fail) leave it open so the
+    #     quest, and an explicit quest_done=False vetoes the closure even on
+    #     success. Aborted/failed/partial (and gate-fail) leave it open so the
     #     dashboard can distinguish "quest done" from "turn abandoned".
-    if final_status == "success":
-        quest_id_closed, quest_done = _complete_quest_for_intento(intento)
+    if final_status == "success" and quest_done is not False:
+        quest_id_closed, quest_is_done = _complete_quest_for_intento(intento)
     else:
         quest_id_closed = intento.get("checklist_item_id") or None
-        quest_done = False
+        quest_is_done = False
 
     # 6. Completar intento con detalle completo (NEVER blocks — always completes)
-    #    The intentos.status CHECK only accepts 'running', 'success' and 'fail';
-    #    a non-success terminal state is persisted as 'fail' while the honest
-    #    requested state is reported through ``final_status`` in the response.
-    persisted_status = final_status if final_status in ("success", "fail") else "fail"
+    #    v7 widens intentos.status to the honest terminal vocabulary, so the
+    #    persisted state matches the verdict instead of collapsing aborted and
+    #    partial into 'fail'. Only the legacy 'failed' spelling is normalised.
+    persisted_status = "fail" if final_status == "failed" else final_status
     try:
         persistence.complete_intento_with_gates(
             intento_id=intento_id,
@@ -2276,7 +2318,116 @@ def end_turn(
             "gates_total": len(final_gates) if final_gates else 4,
             "gates": compact.compact_gates(final_gates),
             "quest_id": quest_id_closed,
-            "quest_done": quest_done,
+            "quest_done": quest_is_done,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def abort_turn(intento_id: int, reason: str) -> str:
+    """Abort an in-flight turn without touching the quest.
+
+    Finalises a ``running`` intento with the honest ``aborted`` status, stores
+    ``reason`` in the intento's existing ``summary`` column, and leaves the
+    quest, the gates and the attempt budget untouched. This is the companion of
+    ``end_turn(quest_done=False)`` for the interrupted case: an abandoned turn
+    is recorded as abandoned instead of being reported as a failure.
+
+    Only a ``running`` intento can be aborted. Any other state returns an
+    explicit error naming the current status and mutates nothing.
+
+    Args:
+        intento_id: Numeric intento ID returned by begin_turn().
+        reason:     Non-empty explanation of why the turn was aborted.
+
+    Returns:
+        JSON string with ``final_status``/``persisted_status`` = ``aborted``,
+        the untouched ``quest_id`` with ``quest_done`` false, and the stored
+        reason. Errors: ``invalid_reason``, ``intento_not_found`` or
+        ``intento_not_running``.
+    """
+    normalized_reason = reason.strip() if isinstance(reason, str) else ""
+    if not normalized_reason:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_reason",
+                "error": "A non-empty reason is required to abort a turn.",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    intento = persistence.get_intento(intento_id)
+    if intento is None:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "intento_not_found",
+                "error": f"Intento #{intento_id} not found in database.",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    current_status = intento.get("status")
+    if current_status != "running":
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "intento_not_running",
+                "error": (
+                    f"Intento #{intento_id} is not running "
+                    f"(current status: {current_status})."
+                ),
+                "intento_id": intento_id,
+                "current_status": current_status,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    gates_passed = intento.get("gates_passed") or 0
+    try:
+        persistence.complete_intento_with_summary(
+            intento_id=intento_id,
+            status="aborted",
+            gates_passed=gates_passed,
+            summary=normalized_reason,
+        )
+    except Exception as exc:
+        logger.error("Failed to abort intento #%d: %s", intento_id, exc)
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "abort_failed",
+                "error": f"Failed to persist the abort: {exc}",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Only the server-side turn bookkeeping is cleared; the quest and gates are
+    # deliberately untouched.
+    active = _get_active_intento()
+    if active is not None and active["intento_id"] == intento_id:
+        _clear_active_intento()
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "intento_id": intento_id,
+            "final_status": "aborted",
+            "persisted_status": "aborted",
+            "gates_passed": gates_passed,
+            "quest_id": intento.get("checklist_item_id") or None,
+            "quest_done": False,
+            "reason": normalized_reason,
         },
         ensure_ascii=False,
         default=str,

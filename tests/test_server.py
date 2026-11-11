@@ -2931,6 +2931,274 @@ class TestEndTurnStatusVocabulary:
         assert len(writes) == 1
 
 
+_CARD_218_GATES_PASS = [
+    {"name": "1a", "state": "PASS", "mandatory": 1},
+    {"name": "1b", "state": "PASS", "mandatory": 1},
+    {"name": "1c", "state": "PASS", "mandatory": 1},
+    {"name": "1e", "state": "PASS", "mandatory": 1},
+]
+
+_CARD_218_GATES_BLOCKED = [
+    {"name": "1a", "state": "PASS", "mandatory": 1},
+    {"name": "1b", "state": "BLOCK", "mandatory": 1},
+    {"name": "1c", "state": "PASS", "mandatory": 1},
+    {"name": "1e", "state": "PASS", "mandatory": 1},
+]
+
+
+def _build_real_turn(tmp_path, monkeypatch, gates=None, db_name="card-218.db"):
+    """Real temp SQLite turn with the Deck bridge/board/stack mocked.
+
+    Returns (db, mission_id, quest_id, intento_id, writes) so the tests can read
+    the persisted state back instead of trusting the payload.
+    """
+    from ultratimonel import server as srv
+    from ultratimonel.persistence import Persistence
+
+    db = Persistence(db_path=str(tmp_path / db_name))
+    monkeypatch.setattr(srv, "persistence", db)
+
+    mission_id = db.upsert_mission(
+        deck_task_id=907, project="voy-rojo", title="Card #218", status="pendiente"
+    )
+    quest_id = db.upsert_checklist_item(
+        mission_id=mission_id, item_index=0, text="open", done=0
+    )
+    intento_id = db.create_intento("sess-1", "voy-rojo", mission_id, quest_id)
+    db.capture_gates_for_intento(
+        intento_id, gates if gates is not None else _CARD_218_GATES_PASS
+    )
+    srv._set_active_intento(intento_id, "sess-1", "voy-rojo")
+
+    monkeypatch.setattr(srv, "_resolve_board_id", lambda project: (21, None))
+    monkeypatch.setattr(
+        srv, "_resolve_stack_for_card", lambda board_id, mission=None: (111, None, None)
+    )
+    writes = []
+    monkeypatch.setattr(
+        srv.deck_bridge,
+        "complete_quest",
+        lambda board_id, stack_id, card_id, position: writes.append(
+            (board_id, stack_id, card_id, position)
+        )
+        or (True, None),
+    )
+    return db, mission_id, quest_id, intento_id, writes
+
+
+class TestEndTurnQuestDoneExplicit:
+    """Card #218 Q3: ``quest_done`` is explicit and never lies."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def teardown_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def test_quest_done_false_on_success_leaves_quest_open(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, quest_done=False))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "success"
+        assert result["quest_done"] is False
+        # The intento really succeeded; only the quest closure was vetoed.
+        assert db.get_intento(intento_id)["status"] == "success"
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+
+    def test_quest_done_none_keeps_legacy_closure(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, quest_done=None))
+
+        assert result["quest_done"] is True
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 1
+        assert len(writes) == 1
+
+    def test_quest_done_true_with_aborted_is_rejected_with_zero_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        from ultratimonel import server as srv
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, status="aborted", quest_done=True))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_quest_done"
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "running"
+        assert stored["completed_at"] is None
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+        assert srv._get_active_intento() is not None
+
+    def test_quest_done_true_with_gate_failure_is_rejected(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(
+            tmp_path, monkeypatch, gates=_CARD_218_GATES_BLOCKED
+        )
+
+        result = json.loads(end_turn(intento_id, quest_done=True))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_quest_done"
+        assert db.get_intento(intento_id)["status"] == "running"
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+
+    def test_quest_done_non_bool_is_rejected(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, _quest_id, intento_id, _writes = _build_real_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, quest_done="yes"))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_quest_done"
+        assert db.get_intento(intento_id)["status"] == "running"
+
+    @pytest.mark.parametrize(
+        "requested,persisted",
+        [("aborted", "aborted"), ("partial", "partial"), ("failed", "fail")],
+    )
+    def test_end_turn_persists_the_real_terminal_status(
+        self, requested, persisted, tmp_path, monkeypatch
+    ):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, status=requested))
+
+        assert result["final_status"] == requested
+        # Read from the DB, not the payload: v7 keeps the honest state.
+        assert db.get_intento(intento_id)["status"] == persisted
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+
+
+class TestAbortTurn:
+    """Card #218 Q3: ``abort_turn`` finalises an interrupted turn honestly."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def teardown_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def _make_running(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        db = Persistence(db_path=str(tmp_path / "abort-turn.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+        mission_id = db.upsert_mission(
+            deck_task_id=808, project="voy-rojo", title="Card #218", status="pendiente"
+        )
+        quest_id = db.upsert_checklist_item(
+            mission_id=mission_id, item_index=0, text="open", done=0
+        )
+        intento_id = db.create_intento("sess-1", "voy-rojo", mission_id, quest_id)
+        srv._set_active_intento(intento_id, "sess-1", "voy-rojo")
+        return db, mission_id, quest_id, intento_id
+
+    def test_abort_turn_persists_aborted_and_reason(self, tmp_path, monkeypatch):
+        from ultratimonel.server import abort_turn
+
+        db, _mid, quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+
+        result = json.loads(abort_turn(intento_id, "network died mid-turn"))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "aborted"
+        assert result["persisted_status"] == "aborted"
+        assert result["quest_done"] is False
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "aborted"
+        assert stored["summary"] == "network died mid-turn"
+        assert stored["closed_at"] is not None
+        assert stored["completed_at"] is not None
+        # Quest, gates and budget are untouched.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert db.list_gate_states("sess-1", "voy-rojo") == []
+        assert db.get_attempt_budget(quest_id)["used"] == 0
+
+    def test_abort_turn_clears_the_active_turn(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.server import abort_turn
+
+        _db, _mid, _quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+
+        abort_turn(intento_id, "interrupted")
+
+        assert srv._get_active_intento() is None
+
+    @pytest.mark.parametrize("prior", ["success", "fail", "aborted", "partial"])
+    def test_abort_turn_on_closed_intento_is_rejected(
+        self, prior, tmp_path, monkeypatch
+    ):
+        from ultratimonel.server import abort_turn
+
+        db, _mid, _quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+        db.complete_intento_with_summary(intento_id, prior, 4, "already closed")
+
+        result = json.loads(abort_turn(intento_id, "too late"))
+
+        assert result["status"] == "error"
+        assert result["code"] == "intento_not_running"
+        assert result["current_status"] == prior
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == prior
+        assert stored["summary"] == "already closed"
+
+    @pytest.mark.parametrize("reason", ["", "   ", "\n\t "])
+    def test_abort_turn_empty_reason_is_rejected(self, reason, tmp_path, monkeypatch):
+        from ultratimonel.server import abort_turn
+
+        db, _mid, _quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+
+        result = json.loads(abort_turn(intento_id, reason))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_reason"
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "running"
+        assert stored["summary"] is None
+
+    def test_abort_turn_missing_intento_is_rejected(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+        from ultratimonel.server import abort_turn
+
+        monkeypatch.setattr(
+            srv, "persistence", Persistence(db_path=str(tmp_path / "missing.db"))
+        )
+
+        result = json.loads(abort_turn(9999, "nope"))
+
+        assert result["status"] == "error"
+        assert result["code"] == "intento_not_found"
+
+
 class TestCompactReadAndNoVerbose:
     """WU4/§2.9, D4: no global verbose flag; read/list outputs are compact."""
 

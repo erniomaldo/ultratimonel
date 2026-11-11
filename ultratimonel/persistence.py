@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SCHEMA_DESCRIPTION = (
-    "v6: attempt budget (attempt_grants + checklist counters) and turn_bitacora"
+    "v7: intentos.status accepts aborted/partial (honest terminal states)"
 )
 
 # v6 tables — shared by the fresh-DB DDL and the v5→v6 migration (additive, D9).
@@ -80,6 +80,39 @@ DDL_V6_ALTERS = [
     "ALTER TABLE intentos ADD COLUMN evidence TEXT",
     "ALTER TABLE intentos ADD COLUMN closed_at TEXT",
 ]
+
+# v7: intentos.status widens to the honest terminal vocabulary. SQLite cannot
+# ALTER a CHECK constraint, so v6→v7 rebuilds the table (see _migrate_v6_to_v7).
+DDL_V7_INTENTOS = """CREATE TABLE IF NOT EXISTS intentos (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id        TEXT NOT NULL,
+        project           TEXT NOT NULL,
+        mission_id        INTEGER NOT NULL REFERENCES missions(id),
+        checklist_item_id INTEGER NOT NULL REFERENCES checklist_items(id),
+        status            TEXT NOT NULL DEFAULT 'running'
+                          CHECK(status IN ('running','success','fail','aborted','partial')),
+        gates_passed      INTEGER NOT NULL DEFAULT 0,
+        gates_total       INTEGER NOT NULL DEFAULT 4,
+        started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at      TEXT,
+        summary           TEXT,
+        evidence          TEXT,
+        closed_at         TEXT,
+        gates_detail      TEXT
+    )"""
+
+DDL_V7_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_intentos_checklist ON intentos(checklist_item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_intentos_mission ON intentos(mission_id)",
+    "CREATE INDEX IF NOT EXISTS idx_intentos_session ON intentos(session_id)",
+]
+
+# Columns copied verbatim by the v6→v7 table rebuild (identity + data only).
+INTENTOS_V7_COLUMNS = (
+    "id, session_id, project, mission_id, checklist_item_id, status, "
+    "gates_passed, gates_total, started_at, completed_at, summary, evidence, "
+    "closed_at, gates_detail"
+)
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -178,22 +211,7 @@ DDL_V2 = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_checklist_mission ON checklist_items(mission_id)",
     # Table 9: intentos — one assert_gates cycle (1a→1e) for a checklist item
-    """CREATE TABLE IF NOT EXISTS intentos (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id        TEXT NOT NULL,
-        project           TEXT NOT NULL,
-        mission_id        INTEGER NOT NULL REFERENCES missions(id),
-        checklist_item_id INTEGER NOT NULL REFERENCES checklist_items(id),
-        status            TEXT NOT NULL DEFAULT 'running'
-                          CHECK(status IN ('running','success','fail')),
-        gates_passed      INTEGER NOT NULL DEFAULT 0,
-        gates_total       INTEGER NOT NULL DEFAULT 4,
-        started_at        TEXT NOT NULL DEFAULT (datetime('now')),
-        completed_at      TEXT,
-        summary           TEXT,
-        evidence          TEXT,
-        closed_at         TEXT
-    )""",
+    DDL_V7_INTENTOS,
     "CREATE INDEX IF NOT EXISTS idx_intentos_checklist ON intentos(checklist_item_id)",
     "CREATE INDEX IF NOT EXISTS idx_intentos_mission ON intentos(mission_id)",
     "CREATE INDEX IF NOT EXISTS idx_intentos_session ON intentos(session_id)",
@@ -261,12 +279,54 @@ def _migrate_v5_to_v6(conn) -> None:
     for stmt in DDL_V6_TABLES:
         conn.execute(stmt)
     # INSERT OR IGNORE keeps the migration replay-safe (a plain INSERT would
-    # raise on the schema_version PK when the v6 row already exists).
+    # raise on the schema_version PK when the v6 row already exists). The
+    # version is pinned to 6 so a later SCHEMA_VERSION bump cannot make this
+    # step stamp a version whose migration has not run yet.
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (version, description) VALUES (?, ?)",
+        (6, "v6: attempt budget (attempt_grants + checklist counters) and turn_bitacora"),
+    )
+    logger.info("Migrated DB v5→v6: attempt budget + turn_bitacora")
+
+
+def _intentos_status_check_allows_honest_states(conn) -> bool:
+    """True when the live ``intentos`` table already accepts aborted/partial."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='intentos'"
+    ).fetchone()
+    if row is None:
+        return True  # no table yet: nothing to widen, fresh DDL will be used
+    return "aborted" in (row[0] or "")
+
+
+def _migrate_v6_to_v7(conn) -> None:
+    """v6→v7: widen ``intentos.status`` CHECK to aborted/partial.
+
+    SQLite cannot alter a CHECK constraint in place, so the table is rebuilt:
+    rename, create the v7 table, copy every row verbatim, drop the old table,
+    recreate the indexes. The whole rebuild runs inside one explicit
+    transaction so a failure cannot leave a half-renamed table behind, and the
+    guard against an already-widened CHECK makes replay a no-op.
+    """
+    if not _intentos_status_check_allows_honest_states(conn):
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ALTER TABLE intentos RENAME TO intentos_v6_backup")
+        conn.execute(DDL_V7_INTENTOS)
+        conn.execute(
+            f"INSERT INTO intentos ({INTENTOS_V7_COLUMNS}) "
+            f"SELECT {INTENTOS_V7_COLUMNS} FROM intentos_v6_backup"
+        )
+        conn.execute("DROP TABLE intentos_v6_backup")
+        for stmt in DDL_V7_INDEXES:
+            conn.execute(stmt)
+        logger.info("Migrated DB v6→v7: rebuilt intentos with honest status states")
+
+    # INSERT OR IGNORE keeps the migration replay-safe.
     conn.execute(
         "INSERT OR IGNORE INTO schema_version (version, description) VALUES (?, ?)",
         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
     )
-    logger.info("Migrated DB v5→v6: attempt budget + turn_bitacora")
 
 
 def _is_v1_style_missions_table(conn) -> bool:
@@ -487,7 +547,7 @@ class Persistence:
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
-                    logger.info("Fresh DB initialized at schema v6: %s", self._db_path)
+                    logger.info("Fresh DB initialized at schema v%s: %s", SCHEMA_VERSION, self._db_path)
                 elif current_ver == 1:
                     # Migration v1 → v2
                     _migrate_v1_to_v2(conn)
@@ -498,11 +558,13 @@ class Persistence:
                         )
                     except sqlite3.OperationalError:
                         pass  # column already exists (idempotent)
-                    # v3 → v4 → v5 → v6: session_turns + deck_stack_id + budget
+                    # v3 → v4 → v5 → v6 → v7: session_turns + deck_stack_id +
+                    # budget + honest intento statuses
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
-                    logger.info("Migrated DB v1→v6: %s", self._db_path)
+                    _migrate_v6_to_v7(conn)
+                    logger.info("Migrated DB v1→v7: %s", self._db_path)
                 elif current_ver == 2:
                     # Migration v2 → v3: add gates_detail column to intentos
                     try:
@@ -512,28 +574,37 @@ class Persistence:
                         logger.info("Migrated DB v2→v3: added gates_detail to intentos")
                     except sqlite3.OperationalError:
                         pass  # column already exists (idempotent)
-                    # v3 → v4 → v5 → v6: session_turns + deck_stack_id + budget.
-                    # Routing through the chain keeps v2 DBs from being stamped
-                    # v6 while session_turns is still missing.
+                    # v3 → v4 → v5 → v6 → v7: session_turns + deck_stack_id +
+                    # budget + honest intento statuses. Routing through the
+                    # chain keeps v2 DBs from being stamped current while
+                    # session_turns is still missing.
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
-                    logger.info("Migrated DB v2→v6: %s", self._db_path)
+                    _migrate_v6_to_v7(conn)
+                    logger.info("Migrated DB v2→v7: %s", self._db_path)
                 elif current_ver == 3:
-                    # Migration v3 → v4 → v5 → v6: session_turns + deck_stack_id + budget
+                    # Migration v3 → v4 → v5 → v6 → v7
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
-                    logger.info("Migrated DB v3→v6: %s", self._db_path)
+                    _migrate_v6_to_v7(conn)
+                    logger.info("Migrated DB v3→v7: %s", self._db_path)
                 elif current_ver == 4:
-                    # Migration v4 → v5 → v6: deck_stack_id + budget/bitácora
+                    # Migration v4 → v5 → v6 → v7
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
-                    logger.info("Migrated DB v4→v6: %s", self._db_path)
+                    _migrate_v6_to_v7(conn)
+                    logger.info("Migrated DB v4→v7: %s", self._db_path)
                 elif current_ver == 5:
-                    # Migration v5 → v6: attempt budget + append-only bitácora
+                    # Migration v5 → v6 → v7
                     _migrate_v5_to_v6(conn)
-                    logger.info("Migrated DB v5→v6: %s", self._db_path)
+                    _migrate_v6_to_v7(conn)
+                    logger.info("Migrated DB v5→v7: %s", self._db_path)
+                elif current_ver == 6:
+                    # Migration v6 → v7: honest intento statuses
+                    _migrate_v6_to_v7(conn)
+                    logger.info("Migrated DB v6→v7: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
                     # Already current — ensure all tables exist
                     for stmt in DDL_V2:
@@ -555,7 +626,10 @@ class Persistence:
                     except sqlite3.OperationalError:
                         pass  # column already exists
                     # v6 tables are ensured by DDL_V2 above; columns exist on a
-                    # DB stamped v6 (fresh DDL or _migrate_v5_to_v6).
+                    # DB stamped v6 (fresh DDL or _migrate_v5_to_v6). Self-heal
+                    # a v7 stamp whose intentos CHECK is still the v6 one: the
+                    # guard makes this a no-op on an honest table.
+                    _migrate_v6_to_v7(conn)
                     logger.debug("DB schema up to date (v%s)", SCHEMA_VERSION)
 
     # ── session CRUD ───────────────────────────────────────────────────
@@ -1075,7 +1149,7 @@ class Persistence:
 
         Args:
             intento_id:     Numeric intento ID.
-            status:         Final status ('success' or 'fail').
+            status:         Final status ('success', 'fail', 'aborted' or 'partial').
             gates_passed:   Count of gates that passed (PASS + SKIP).
             gates_detail:   Full gate snapshot as list of dicts.
         """
