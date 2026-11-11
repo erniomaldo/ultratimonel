@@ -82,10 +82,10 @@ their immediate parent; a polluted diff is a branching bug → retarget/rebase.
 
 ## Phase 1: Data model & migration
 
-- [ ] 1.1 `persistence.py`: bump `SCHEMA_VERSION` 5→6; `_migrate_v5_to_v6` adding `checklist_items.attempts_authorized/attempts_used`, `intentos.summary/evidence/closed_at` (idempotent). Backfill stays `attempts_authorized=0` = legacy/unbounded until a grant arms it (TCE2). [TCE2]
-- [ ] 1.2 `persistence.py`: `CREATE TABLE IF NOT EXISTS attempt_grants` + `turn_bitacora` (append-only) in fresh DDL and migration. [TCE2, TT2]
-- [ ] 1.3 `persistence.py`: methods `grant_attempts`, `get_attempt_budget`, `increment_attempts_used` (single atomic `UPDATE … WHERE used < authorized`), `append_bitacora` (INSERT-only), `complete_intento_with_summary`. [TT2, TCE2, M1]
-- [ ] 1.4 `tests/test_persistence.py`: v5→v6 migration idempotency, **downgrade test** (open the v6 DB with v5 code, pre-existing data intact — I4), budget round-trip, bitácora append preserves prior rows. [TT2, TCE2]
+- [x] 1.1 `persistence.py`: bump `SCHEMA_VERSION` 5→6; `_migrate_v5_to_v6` adding `checklist_items.attempts_authorized/attempts_used`, `intentos.summary/evidence/closed_at` (idempotent). Backfill stays `attempts_authorized=0` = legacy/unbounded until a grant arms it (TCE2). [TCE2]
+- [x] 1.2 `persistence.py`: `CREATE TABLE IF NOT EXISTS attempt_grants` + `turn_bitacora` (append-only) in fresh DDL and migration. [TCE2, TT2]
+- [x] 1.3 `persistence.py`: methods `grant_attempts`, `get_attempt_budget`, `increment_attempts_used` (single atomic `UPDATE … WHERE used < authorized`), `append_bitacora` (INSERT-only), `complete_intento_with_summary`. [TT2, TCE2, M1]
+- [x] 1.4 `tests/test_persistence.py`: v5→v6 migration idempotency, **downgrade test** (open the v6 DB with v5 code, pre-existing data intact — I4), budget round-trip, bitácora append preserves prior rows. [TT2, TCE2]
 
 ## Phase 2: Turn enforcement & telemetry
 

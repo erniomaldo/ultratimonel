@@ -593,3 +593,149 @@ class TestQuestHelpers:
         db.upsert_checklist_item(mid, item_index=0, text="Q0", done=0)
         assert db.delete_checklist_items_beyond(mid, 5) == 0
         assert len(db.list_checklist_items(mid)) == 1
+
+
+def _cleanup_db(db_path: str) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(db_path + suffix):
+            os.unlink(db_path + suffix)
+
+
+def _build_legacy_v5_db(db_path: str) -> None:
+    """Upgrade the v2 fixture to a REAL v5 DB (gates_detail + deck_stack_id)."""
+    import sqlite3
+    _build_legacy_v2_db(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE checklist_items (
+            id INTEGER PRIMARY KEY, mission_id INTEGER, item_index INTEGER,
+            text TEXT, done INTEGER DEFAULT 0);
+        INSERT INTO checklist_items (id, mission_id, item_index, text)
+        VALUES (1, 1, 0, 'v5 quest');
+        ALTER TABLE intentos ADD COLUMN gates_detail TEXT;
+        ALTER TABLE missions ADD COLUMN deck_stack_id INTEGER;
+        DELETE FROM schema_version;
+        INSERT INTO schema_version (version, description) VALUES (5, 'v5');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+
+class TestDbMigrationV5ToV6:
+    """Tasks 1.1/1.2: additive, idempotent v5→v6 migration (D9)."""
+
+    def test_v5_to_v6_adds_shape_and_survives_replay(self):
+        from ultratimonel.persistence import _migrate_v5_to_v6
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            _build_legacy_v5_db(db_path)
+            Persistence(db_path=db_path).close()  # runs v5→v6
+            p = Persistence(db_path=db_path)
+            try:
+                with p._conn() as conn:
+                    assert conn.execute(
+                        "SELECT MAX(version) FROM schema_version"
+                    ).fetchone()[0] == 6
+                    item_cols = {c[1] for c in conn.execute(
+                        "PRAGMA table_info(checklist_items)").fetchall()}
+                    assert {"attempts_authorized", "attempts_used"} <= item_cols
+                    intento_cols = {c[1] for c in conn.execute(
+                        "PRAGMA table_info(intentos)").fetchall()}
+                    assert {"summary", "evidence", "closed_at"} <= intento_cols
+                    tables = {r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                    assert {"attempt_grants", "turn_bitacora"} <= tables
+
+                    # Replay is a no-op, not a schema_version PK collision.
+                    _migrate_v5_to_v6(conn)
+                    _migrate_v5_to_v6(conn)
+                    assert conn.execute(
+                        "SELECT COUNT(*) FROM schema_version WHERE version = 6"
+                    ).fetchone()[0] == 1
+
+                # Pre-existing rows survive; counters default to 0.
+                assert p.get_mission(1)["title"] == "v2 mission"
+                assert p.get_attempt_budget(1)["unbounded"] is True
+            finally:
+                p.close()
+        finally:
+            _cleanup_db(db_path)
+
+
+class TestAttemptBudget:
+    """Task 1.3: budget round-trip + append-only grant ledger (D1)."""
+
+    @staticmethod
+    def _quest(db):
+        mid = db.upsert_mission(deck_task_id=1, project="p", title="T")
+        return mid, db.upsert_checklist_item(mid, item_index=0, text="Q")
+
+    def test_roundtrip_unbounded_and_ledger(self, db):
+        mid, cid = self._quest(db)
+        assert db.get_attempt_budget(cid)["unbounded"] is True
+
+        assert db.grant_attempts(mid, cid, 2, "pm") == 2
+        assert db.grant_attempts(mid, cid, 1, "pm") == 3
+        budget = db.get_attempt_budget(cid)
+        assert (budget["authorized"], budget["used"], budget["remaining"]) == (3, 0, 3)
+        assert budget["unbounded"] is False
+
+        assert db.increment_attempts_used(cid) is True
+        assert db.increment_attempts_used(cid) is True
+        budget = db.get_attempt_budget(cid)
+        assert (budget["used"], budget["remaining"]) == (2, 1)
+
+        with db._conn() as conn:
+            rows = conn.execute(
+                "SELECT amount, granted_by FROM attempt_grants"
+                " WHERE checklist_item_id = ?", (cid,)).fetchall()
+        assert [r["amount"] for r in rows] == [2, 1]
+        assert all(r["granted_by"] == "pm" for r in rows)
+
+        # Over-use clamps remaining at 0; missing quests fail closed.
+        db.increment_attempts_used(cid)
+        assert db.get_attempt_budget(cid)["remaining"] == 0
+        assert db.grant_attempts(1, 99999, 1, "pm") is None
+        assert db.increment_attempts_used(99999) is False
+        assert db.get_attempt_budget(99999) is None
+
+
+class TestTurnBitacora:
+    """Task 1.3: append-only bitácora preserves prior rows (D8, TT2)."""
+
+    @staticmethod
+    def _append(db, summary):
+        return db.append_bitacora(
+            intento_id=1, session_id="s1", project="p", mission_id=1,
+            checklist_item_id=1, final_status="success", gates_passed=4,
+            summary=summary)
+
+    def test_append_preserves_prior_rows(self, db):
+        first, second = self._append(db, "first"), self._append(db, "second")
+        with db._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, summary, final_status, gates_passed"
+                " FROM turn_bitacora ORDER BY id").fetchall()
+        assert [r["id"] for r in rows] == [first, second]
+        assert [r["summary"] for r in rows] == ["first", "second"]
+        assert all(r["final_status"] == "success" for r in rows)
+
+
+class TestCompleteIntentoWithSummary:
+    """Task 1.3: closure persists summary/evidence/closed_at (D2/D3)."""
+
+    def test_roundtrip(self, db):
+        import json
+        mid = db.upsert_mission(deck_task_id=1, project="p", title="T")
+        cid = db.upsert_checklist_item(mid, item_index=0, text="Q")
+        iid = db.create_intento("s1", "p", mid, cid)
+        db.complete_intento_with_summary(
+            iid, "success", 4, "done", evidence={"summary_source": "caller"})
+        it = db.get_intento(iid)
+        assert (it["status"], it["gates_passed"], it["summary"]) == ("success", 4, "done")
+        assert it["closed_at"] is not None
+        assert json.loads(it["evidence"])["summary_source"] == "caller"

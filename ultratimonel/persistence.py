@@ -39,8 +39,47 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 5
-SCHEMA_DESCRIPTION = "v5: missions.deck_stack_id for deterministic Deck stack writes"
+SCHEMA_VERSION = 6
+SCHEMA_DESCRIPTION = (
+    "v6: attempt budget (attempt_grants + checklist counters) and turn_bitacora"
+)
+
+# v6 tables — shared by the fresh-DB DDL and the v5→v6 migration (additive, D9).
+DDL_V6_TABLES = [
+    # Table 11: attempt_grants — append-only ledger of granted attempts (D1)
+    """CREATE TABLE IF NOT EXISTS attempt_grants (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id        INTEGER NOT NULL,
+        checklist_item_id INTEGER NOT NULL,
+        amount            INTEGER NOT NULL,
+        granted_by        TEXT NOT NULL,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_attempt_grants_item ON attempt_grants(checklist_item_id)",
+    # Table 12: turn_bitacora — append-only turn log (D8)
+    """CREATE TABLE IF NOT EXISTS turn_bitacora (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        intento_id        INTEGER NOT NULL,
+        session_id        TEXT NOT NULL,
+        project           TEXT NOT NULL,
+        mission_id        INTEGER NOT NULL,
+        checklist_item_id INTEGER NOT NULL,
+        final_status      TEXT NOT NULL,
+        gates_passed      INTEGER NOT NULL,
+        summary           TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_turn_bitacora_mission ON turn_bitacora(mission_id)",
+]
+
+# v6 columns — idempotent ALTERs applied by the v5→v6 migration.
+DDL_V6_ALTERS = [
+    "ALTER TABLE checklist_items ADD COLUMN attempts_authorized INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE checklist_items ADD COLUMN attempts_used INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE intentos ADD COLUMN summary TEXT",
+    "ALTER TABLE intentos ADD COLUMN evidence TEXT",
+    "ALTER TABLE intentos ADD COLUMN closed_at TEXT",
+]
 
 DDL_V2 = [
     # Table 1: schema versioning
@@ -133,6 +172,8 @@ DDL_V2 = [
         item_index  INTEGER NOT NULL,
         text        TEXT NOT NULL,
         done        INTEGER NOT NULL DEFAULT 0,
+        attempts_authorized INTEGER NOT NULL DEFAULT 0,
+        attempts_used       INTEGER NOT NULL DEFAULT 0,
         UNIQUE(mission_id, item_index)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_checklist_mission ON checklist_items(mission_id)",
@@ -148,7 +189,10 @@ DDL_V2 = [
         gates_passed      INTEGER NOT NULL DEFAULT 0,
         gates_total       INTEGER NOT NULL DEFAULT 4,
         started_at        TEXT NOT NULL DEFAULT (datetime('now')),
-        completed_at      TEXT
+        completed_at      TEXT,
+        summary           TEXT,
+        evidence          TEXT,
+        closed_at         TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_intentos_checklist ON intentos(checklist_item_id)",
     "CREATE INDEX IF NOT EXISTS idx_intentos_mission ON intentos(mission_id)",
@@ -159,6 +203,8 @@ DDL_V2 = [
         turn_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
+    # Tables 11–12: v6 attempt budget + append-only bitácora
+    *DDL_V6_TABLES,
 ]
 
 
@@ -200,9 +246,27 @@ def _migrate_v4_to_v5(conn) -> None:
         pass  # column already exists (idempotent)
     conn.execute(
         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
+        (5, "v5: missions.deck_stack_id for deterministic Deck stack writes"),
     )
     logger.info("Migrated DB v4→v5: added missions.deck_stack_id")
+
+
+def _migrate_v5_to_v6(conn) -> None:
+    """v5→v6: additive attempt-budget columns/tables; idempotent (D9)."""
+    for stmt in DDL_V6_ALTERS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists (idempotent)
+    for stmt in DDL_V6_TABLES:
+        conn.execute(stmt)
+    # INSERT OR IGNORE keeps the migration replay-safe (a plain INSERT would
+    # raise on the schema_version PK when the v6 row already exists).
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (version, description) VALUES (?, ?)",
+        (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
+    )
+    logger.info("Migrated DB v5→v6: attempt budget + turn_bitacora")
 
 
 def _is_v1_style_missions_table(conn) -> bool:
@@ -423,7 +487,7 @@ class Persistence:
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
                     )
-                    logger.info("Fresh DB initialized at schema v5: %s", self._db_path)
+                    logger.info("Fresh DB initialized at schema v6: %s", self._db_path)
                 elif current_ver == 1:
                     # Migration v1 → v2
                     _migrate_v1_to_v2(conn)
@@ -434,10 +498,11 @@ class Persistence:
                         )
                     except sqlite3.OperationalError:
                         pass  # column already exists (idempotent)
-                    # v3 → v4 → v5: session_turns table + deck_stack_id
+                    # v3 → v4 → v5 → v6: session_turns + deck_stack_id + budget
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
-                    logger.info("Migrated DB v1→v5: %s", self._db_path)
+                    _migrate_v5_to_v6(conn)
+                    logger.info("Migrated DB v1→v6: %s", self._db_path)
                 elif current_ver == 2:
                     # Migration v2 → v3: add gates_detail column to intentos
                     try:
@@ -447,21 +512,28 @@ class Persistence:
                         logger.info("Migrated DB v2→v3: added gates_detail to intentos")
                     except sqlite3.OperationalError:
                         pass  # column already exists (idempotent)
-                    # v3 → v4 → v5: session_turns table + deck_stack_id.
+                    # v3 → v4 → v5 → v6: session_turns + deck_stack_id + budget.
                     # Routing through the chain keeps v2 DBs from being stamped
-                    # v5 while session_turns is still missing.
+                    # v6 while session_turns is still missing.
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
-                    logger.info("Migrated DB v2→v5: %s", self._db_path)
+                    _migrate_v5_to_v6(conn)
+                    logger.info("Migrated DB v2→v6: %s", self._db_path)
                 elif current_ver == 3:
-                    # Migration v3 → v4 → v5: session_turns table + deck_stack_id
+                    # Migration v3 → v4 → v5 → v6: session_turns + deck_stack_id + budget
                     _migrate_v3_to_v4(conn)
                     _migrate_v4_to_v5(conn)
-                    logger.info("Migrated DB v3→v5: %s", self._db_path)
+                    _migrate_v5_to_v6(conn)
+                    logger.info("Migrated DB v3→v6: %s", self._db_path)
                 elif current_ver == 4:
-                    # Migration v4 → v5: add missions.deck_stack_id
+                    # Migration v4 → v5 → v6: deck_stack_id + budget/bitácora
                     _migrate_v4_to_v5(conn)
-                    logger.info("Migrated DB v4→v5: %s", self._db_path)
+                    _migrate_v5_to_v6(conn)
+                    logger.info("Migrated DB v4→v6: %s", self._db_path)
+                elif current_ver == 5:
+                    # Migration v5 → v6: attempt budget + append-only bitácora
+                    _migrate_v5_to_v6(conn)
+                    logger.info("Migrated DB v5→v6: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
                     # Already current — ensure all tables exist
                     for stmt in DDL_V2:
@@ -482,6 +554,8 @@ class Persistence:
                         conn.execute("ALTER TABLE missions ADD COLUMN deck_stack_id INTEGER")
                     except sqlite3.OperationalError:
                         pass  # column already exists
+                    # v6 tables are ensured by DDL_V2 above; columns exist on a
+                    # DB stamped v6 (fresh DDL or _migrate_v5_to_v6).
                     logger.debug("DB schema up to date (v%s)", SCHEMA_VERSION)
 
     # ── session CRUD ───────────────────────────────────────────────────
@@ -1074,6 +1148,125 @@ class Persistence:
             with self._conn() as conn:
                 cursor = conn.execute("DELETE FROM intentos WHERE id = ?", (intento_id,))
                 return cursor.rowcount > 0
+
+    # ── attempt budget & bitácora (v6) ──────────────────────────────────
+
+    def grant_attempts(
+        self,
+        mission_id: int,
+        checklist_item_id: int,
+        amount: int,
+        granted_by: str,
+    ) -> Optional[int]:
+        """Authorize ``amount`` extra attempts (D1): ledger row + counter bump in
+        one transaction. Returns the new authorized total, or None if missing."""
+        with self._lock:
+            with self._conn() as conn:
+                exists = conn.execute(
+                    "SELECT id FROM checklist_items WHERE id = ?",
+                    (checklist_item_id,),
+                ).fetchone()
+                if exists is None:
+                    return None
+                conn.execute(
+                    """INSERT INTO attempt_grants
+                           (mission_id, checklist_item_id, amount, granted_by)
+                       VALUES (?, ?, ?, ?)""",
+                    (mission_id, checklist_item_id, amount, granted_by),
+                )
+                conn.execute(
+                    """UPDATE checklist_items
+                       SET attempts_authorized = attempts_authorized + ?
+                       WHERE id = ?""",
+                    (amount, checklist_item_id),
+                )
+                row = conn.execute(
+                    "SELECT attempts_authorized FROM checklist_items WHERE id = ?",
+                    (checklist_item_id,),
+                ).fetchone()
+                return row["attempts_authorized"] if row else None
+
+    def get_attempt_budget(self, checklist_item_id: int) -> Optional[dict]:
+        """Budget for a quest, or None if it is gone. ``unbounded`` is True
+        while ``attempts_authorized == 0`` (rollout guard); ``remaining`` clamps at 0."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    """SELECT attempts_authorized, attempts_used
+                       FROM checklist_items WHERE id = ?""",
+                    (checklist_item_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                authorized = row["attempts_authorized"]
+                used = row["attempts_used"]
+                return {
+                    "checklist_item_id": checklist_item_id,
+                    "authorized": authorized,
+                    "used": used,
+                    "remaining": max(authorized - used, 0),
+                    "unbounded": authorized == 0,
+                }
+
+    def increment_attempts_used(self, checklist_item_id: int) -> bool:
+        """Consume one attempt for a quest. Returns True when it existed."""
+        with self._lock:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    """UPDATE checklist_items
+                       SET attempts_used = attempts_used + 1
+                       WHERE id = ?""",
+                    (checklist_item_id,),
+                )
+                return cursor.rowcount > 0
+
+    def append_bitacora(
+        self,
+        intento_id: int,
+        session_id: str,
+        project: str,
+        mission_id: int,
+        checklist_item_id: int,
+        final_status: str,
+        gates_passed: int,
+        summary: Optional[str] = None,
+    ) -> int:
+        """Append one immutable turn row to ``turn_bitacora`` (D8). INSERT-only:
+        no UPDATE/DELETE is exposed, so prior rows are always preserved."""
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO turn_bitacora
+                           (intento_id, session_id, project, mission_id,
+                            checklist_item_id, final_status, gates_passed, summary)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (intento_id, session_id, project, mission_id,
+                     checklist_item_id, final_status, gates_passed, summary),
+                )
+                return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def complete_intento_with_summary(
+        self,
+        intento_id: int,
+        status: str,
+        gates_passed: int,
+        summary: str,
+        evidence: Any = None,
+    ) -> None:
+        """Close an intento with summary, evidence and ``closed_at`` (D2/D3).
+        ``evidence`` is stored as JSON when it is not already a string."""
+        if evidence is not None and not isinstance(evidence, str):
+            evidence = json.dumps(evidence, ensure_ascii=False, default=str)
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    """UPDATE intentos
+                       SET status = ?, gates_passed = ?, summary = ?,
+                           evidence = ?, closed_at = datetime('now'),
+                           completed_at = datetime('now')
+                       WHERE id = ?""",
+                    (status, gates_passed, summary, evidence, intento_id),
+                )
 
     # ── backward compat (old upsert_mission name → routes to actions) ───
 
