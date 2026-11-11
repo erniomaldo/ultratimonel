@@ -31,6 +31,8 @@ import pytest
 
 
 class TestTripleMatch:
+    pytestmark = pytest.mark.integration
+
     def test_all_gates_run_in_order(self):
         context = {
             "sender": "user",

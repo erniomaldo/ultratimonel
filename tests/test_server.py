@@ -3063,3 +3063,88 @@ class TestSyncTask:
         assert result["status"] == "completada"
         assert mock_persist.upsert_mission.call_args.kwargs["status"] == "completada"
         mock_persist.set_mission_deck_stack_id.assert_called_once_with(5, 222)
+
+
+class TestQuestList:
+    """quest_list tool — one-call full mission checklist (card #194)."""
+
+    _MISSION = {"id": 12, "title": "Misión de prueba", "status": "pendiente"}
+    _ITEMS = [
+        {"id": 101, "mission_id": 12, "item_index": 0, "text": "Primer paso", "done": 0},
+        {"id": 102, "mission_id": 12, "item_index": 1, "text": "Segundo paso", "done": 1},
+        {"id": 103, "mission_id": 12, "item_index": 2, "text": "Tercer paso", "done": 0},
+    ]
+
+    @patch("ultratimonel.server.persistence")
+    def test_quest_list_returns_full_checklist(self, mock_persistence):
+        """A single call returns every quest {id, text, done} in checklist order."""
+        from ultratimonel.server import quest_list
+
+        mock_persistence.get_mission.return_value = self._MISSION
+        mock_persistence.list_checklist_items.return_value = self._ITEMS
+
+        result = json.loads(quest_list(12))
+
+        assert result["mission_id"] == 12
+        assert result["total"] == 3
+        assert [q["id"] for q in result["quests"]] == [101, 102, 103]
+        assert [q["text"] for q in result["quests"]] == [
+            "Primer paso",
+            "Segundo paso",
+            "Tercer paso",
+        ]
+        assert [q["done"] for q in result["quests"]] == [False, True, False]
+        # done MUST be a JSON boolean, not the SQLite 0/1.
+        assert all(isinstance(q["done"], bool) for q in result["quests"])
+
+    @patch("ultratimonel.server.persistence")
+    def test_quest_list_include_done_true_includes_done(self, mock_persistence):
+        """Default and explicit include_done=True both keep completed quests."""
+        from ultratimonel.server import quest_list
+
+        mock_persistence.get_mission.return_value = self._MISSION
+        mock_persistence.list_checklist_items.return_value = self._ITEMS
+
+        default = json.loads(quest_list(12))
+        explicit = json.loads(quest_list(12, True))
+
+        assert default["total"] == 3
+        assert explicit["total"] == 3
+        assert any(q["done"] is True for q in explicit["quests"])
+
+    @patch("ultratimonel.server.persistence")
+    def test_quest_list_include_done_false_omits_done(self, mock_persistence):
+        """include_done=False returns only pending quests."""
+        from ultratimonel.server import quest_list
+
+        mock_persistence.get_mission.return_value = self._MISSION
+        mock_persistence.list_checklist_items.return_value = self._ITEMS
+
+        result = json.loads(quest_list(12, include_done=False))
+
+        assert [q["id"] for q in result["quests"]] == [101, 103]
+        assert result["total"] == 2
+        assert all(q["done"] is False for q in result["quests"])
+
+    @patch("ultratimonel.server.persistence")
+    def test_quest_list_mission_not_found(self, mock_persistence):
+        """Unknown mission → explicit error, no state mutation."""
+        from ultratimonel.server import quest_list
+
+        mock_persistence.get_mission.return_value = None
+
+        result = json.loads(quest_list(999))
+
+        assert result["error"] == "Mission 999 not found"
+        mock_persistence.list_checklist_items.assert_not_called()
+        mock_persistence.set_quest_done.assert_not_called()
+        mock_persistence.upsert_checklist_item.assert_not_called()
+
+    def test_quest_list_registered_in_catalog(self):
+        """quest_list is exposed in the agent tool catalog."""
+        import asyncio
+
+        from ultratimonel.server import app
+
+        tools = asyncio.run(app.list_tools())
+        assert "quest_list" in {t.name for t in tools}

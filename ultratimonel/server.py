@@ -1320,6 +1320,39 @@ def checklist_item_get(checklist_item_id: int) -> str:
     return json.dumps(compact.compact_quest(item), ensure_ascii=False, default=str)
 
 
+@app.tool()
+def quest_list(mission_id: int, include_done: bool = True) -> str:
+    """Return the complete checklist of a mission in ONE call.
+
+    Answers "where are we?" for a mission without one call per quest
+    (card Deck #194): every quest is returned as ``{id, text, done}`` in
+    checklist order. Pure read from the local replica — never touches Deck,
+    never changes the schema, and never completes a quest.
+
+    Args:
+        mission_id: Mission (Deck task) id.
+        include_done: If False, omit quests already done. Defaults to True.
+
+    Returns:
+        JSON with the mission id, ``quests`` and ``total`` (after filtering),
+        or an error object when the mission does not exist.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps({"error": f"Mission {mission_id} not found"})
+    quests = [
+        compact.compact_quest(ci)
+        for ci in persistence.list_checklist_items(mission_id)
+    ]
+    if not include_done:
+        quests = [q for q in quests if not q["done"]]
+    return json.dumps(
+        {"mission_id": mission_id, "quests": quests, "total": len(quests)},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 # ── Mission / quest write tools (Deck-first, replica refresh) ──────────────
 #
 # Every write goes to Nextcloud Deck (the source of truth) through the internal

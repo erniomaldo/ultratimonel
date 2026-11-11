@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import pytest
+import pytest_asyncio
 from unittest.mock import patch
 
 from mcp import ClientSession, StdioServerParameters
@@ -21,17 +22,18 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MAIN_PY = os.path.join(PROJECT_ROOT, "main.py")
 
 
-@pytest.fixture(scope="function")
-def event_loop():
-    """Create a single event loop for the module scope."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def client_session():
-    """Start Ultratimonel and return an MCP ClientSession."""
+    """Start Ultratimonel once per module and return a connected MCP ClientSession.
+
+    ``stdio_client`` and ``ClientSession`` are anyio task groups whose cancel
+    scopes must be entered and exited in the same task. pytest-asyncio drives an
+    async-generator fixture in two different tasks (one for setup, another for
+    teardown), so keeping those context managers inside the fixture body raises
+    "Attempted to exit cancel scope in a different task than it was entered in".
+    Instead a single background task owns the transport for the whole module and
+    the fixture only signals it to start and stop.
+    """
     env = os.environ.copy()
     env["ULTRATIMONEL_DB_PATH"] = ":memory:"
     env["PYTHONPATH"] = PROJECT_ROOT + ":" + env.get("PYTHONPATH", "")
@@ -43,14 +45,57 @@ async def client_session():
         env=env,
     )
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            result = await session.initialize()
-            assert result.serverInfo.name == "ultratimonel"
-            yield session
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    stop = asyncio.Event()
+
+    async def serve():
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    result = await session.initialize()
+                    ready.set_result((session, result))
+                    await stop.wait()
+        except BaseException as exc:  # noqa: BLE001 - re-raised or forwarded below
+            if not ready.done():
+                ready.set_exception(exc)
+                return
+            if not stop.is_set():
+                raise
+
+    task = loop.create_task(serve())
+    try:
+        session, result = await ready
+        assert result.serverInfo.name == "ultratimonel"
+        yield session
+    finally:
+        stop.set()
+        try:
+            await task
+        except BaseException:
+            # A startup failure was already surfaced through ``ready``; don't
+            # report the same error twice. Any other shutdown failure stands.
+            if ready.done() and ready.exception() is not None:
+                pass
+            else:
+                raise
 
 
+@pytest.mark.asyncio(loop_scope="module")
 class TestIntegration:
+    """Live MCP integration smoke tests.
+
+    These spawn real MCP servers (agentmemory, checkpoint, nextcloud) through
+    the stdio bridge, so they need a working environment and can spend ~30 s
+    per server initialization. They are marked ``integration`` and excluded
+    from the default run (``pytest.ini`` -> ``addopts``). Run them explicitly:
+
+        ULTRATIMONEL_NEXTCLOUD_COMMAND=... ULTRATIMONEL_NEXTCLOUD_ARGS=... \
+            .venv/bin/pytest -m integration
+    """
+
+    pytestmark = pytest.mark.integration
+
     async def test_server_initializes(self, client_session):
         """Server responds to initialize (already done in fixture)."""
         assert client_session is not None
@@ -62,6 +107,7 @@ class TestIntegration:
         assert "assert_gates" in names
         assert "check_gate" in names
         assert "complete_gate" in names
+        assert "quest_list" in names
 
     async def test_assert_gates_returns_expected_shape(self, client_session):
         """assert_gates should return gates, overall, context, timestamp."""
@@ -269,6 +315,7 @@ class TestToolsUsabilityRetroIntegration:
         from ultratimonel.gate_engine import GateResult, PASS, SKIP
 
         p, db_path = self._make_db()
+        quest_id = p.list_checklist_items(1)[0]["id"]
         try:
             orig_persistence = srv.persistence
             srv.persistence = p
@@ -283,17 +330,17 @@ class TestToolsUsabilityRetroIntegration:
                     ]
 
                     result = json.loads(srv.begin_turn(
-                        "sess-int-001", "voy-rojo", 0, 0,
+                        "sess-int-001", "test-proj", 1, quest_id,
                         "talk about unknown topic", "user"
                     ))
                     intento_id = result["intento_id"]
                     assert intento_id is not None
 
-                    # Verify gates were persisted under "voy-rojo", not "unknown"
-                    gate_states = p.list_gate_states("sess-int-001", "voy-rojo")
+                    # Verify gates were persisted under "test-proj", not "unknown"
+                    gate_states = p.list_gate_states("sess-int-001", "test-proj")
                     assert len(gate_states) == 4
 
-                    # end_turn should validate against "voy-rojo"
+                    # end_turn should validate against "test-proj"
                     result = json.loads(srv.end_turn(intento_id))
                     assert result["final_status"] == "success"
             finally:
@@ -315,7 +362,7 @@ class TestToolsUsabilityRetroIntegration:
                 start = time.perf_counter()
                 for _ in range(iterations):
                     srv.mission_get(1)
-                elapsed_ms = (time.perf_counter() - start) / iterations * iterations / 1000
+                elapsed_ms = (time.perf_counter() - start) / iterations * 1000
                 assert elapsed_ms < 5, f"mission_get took {elapsed_ms:.2f} ms"
             finally:
                 srv.persistence = orig_persistence
@@ -335,7 +382,7 @@ class TestToolsUsabilityRetroIntegration:
                 start = time.perf_counter()
                 for _ in range(iterations):
                     srv.checklist_item_get(1)
-                elapsed_ms = (time.perf_counter() - start) / iterations * iterations / 1000
+                elapsed_ms = (time.perf_counter() - start) / iterations * 1000
                 assert elapsed_ms < 5, f"checklist_item_get took {elapsed_ms:.2f} ms"
             finally:
                 srv.persistence = orig_persistence
@@ -391,10 +438,12 @@ class TestEnforcementV3Integration:
         # Set up test context - mock persistence layer instead of global state
         original_last_session_id = plugin._last_session_id
         original_last_gates_parsed = plugin._last_gates_parsed
+        original_turn_count = plugin._turn_count
 
         try:
-            # Mock get_turn_count to return 5 (> GRACE_TURNS default of 3)
+            # Post-grace scenario: turn counter above GRACE_TURNS
             with patch("ultratimonel.ultratimonel_client.get_turn_count", return_value=5):
+                plugin._turn_count = 5
                 plugin._last_session_id = "test-sess"
                 plugin._last_gates_parsed = [
                     {"name": "1a", "state": "BLOCK", "mandatory": True, "message": ""},
@@ -407,9 +456,10 @@ class TestEnforcementV3Integration:
                 result = plugin._gates_bouncer(tool_name="mcp__ultratimonel__complete_intento")
                 assert result is not None
                 assert result["action"] == "block"
-                assert "Tiempo de gracia agotado" in result["message"]
+                assert "Gates obligatorios no pasaron" in result["message"]
 
         finally:
             # Restore original state
             plugin._last_session_id = original_last_session_id
             plugin._last_gates_parsed = original_last_gates_parsed
+            plugin._turn_count = original_turn_count
