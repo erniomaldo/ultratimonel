@@ -194,6 +194,84 @@ class TestUpdateDescription:
         assert new_description == "Only prose"
 
 
+class TestUpdateDescriptionFailClosed:
+    """A suspicious read never deletes a known checklist (card #218, forum #1)."""
+
+    def _prime(self, fake_mcp, description):
+        fake_mcp.responses["deck_get_card"] = (
+            {"title": "Mission 1058", "description": description},
+            None,
+        )
+        fake_mcp.responses["deck_update_card"] = ({"id": 137}, None)
+
+    @staticmethod
+    def _checklist(n=16):
+        return "\n".join(f"- [ ] quest {i}" for i in range(n))
+
+    def test_empty_reread_with_replica_quests_refuses_to_write(self, fake_mcp):
+        original = self._checklist(16)
+        self._prime(fake_mcp, "")
+
+        ok, err = deck_bridge.update_description(
+            21, 111, 137, "New prose", expected_quest_count=16
+        )
+
+        assert ok is None
+        assert err == deck_bridge.ERR_EMPTY_DESCRIPTION
+        # The card is never touched: the 16 lines stay in Deck untouched.
+        assert fake_mcp.calls_for("deck_update_card") == []
+        assert len(deck_bridge.extract_quests(original)) == 16
+
+    def test_nonempty_reread_without_quests_is_a_desync(self, fake_mcp):
+        self._prime(fake_mcp, "Old prose only")
+
+        ok, err = deck_bridge.update_description(
+            21, 111, 137, "New prose", expected_quest_count=16
+        )
+
+        assert ok is None
+        assert err == deck_bridge.ERR_QUESTS_MISSING
+        assert fake_mcp.calls_for("deck_update_card") == []
+
+    def test_card_legitimately_without_quests_still_writes(self, fake_mcp):
+        self._prime(fake_mcp, "Old prose")
+
+        ok, err = deck_bridge.update_description(
+            21, 111, 137, "New prose", expected_quest_count=0
+        )
+
+        assert ok is True
+        assert err is None
+        assert (
+            fake_mcp.calls_for("deck_update_card")[0]["params"]["description"]
+            == "New prose"
+        )
+
+    def test_write_description_returns_written_lines_and_quests(self, fake_mcp):
+        original = self._checklist(16)
+        self._prime(fake_mcp, f"Old prose\n\n{original}")
+
+        result, err = deck_bridge.write_description(
+            21, 111, 137, "New prose\n- [ ] sneaky", expected_quest_count=16
+        )
+
+        assert err is None
+        new_description = fake_mcp.calls_for("deck_update_card")[0]["params"][
+            "description"
+        ]
+        assert result["description"] == new_description
+        # Full-list comparison: byte-identical lines, original order.
+        expected_lines = original.split("\n")
+        assert [
+            new_description.split("\n")[q["line_no"]]
+            for q in deck_bridge.extract_quests(new_description)
+        ] == expected_lines
+        assert [q["text"] for q in result["quests"]] == [
+            f"quest {i}" for i in range(16)
+        ]
+        assert [q["done"] for q in result["quests"]] == [False] * 16
+
+
 class TestAppendQuest:
     def test_returns_position_and_appends_line(self, fake_mcp):
         fake_mcp.responses["deck_get_card"] = (

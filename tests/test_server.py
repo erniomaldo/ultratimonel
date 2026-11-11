@@ -2009,6 +2009,10 @@ class TestMissionUpdateDescription:
 
         mock_call.side_effect = call_side_effect
         mock_persist.upsert_mission.side_effect = upsert_side_effect
+        mock_persist.list_checklist_items.return_value = [
+            {"item_index": 0, "text": "alpha", "done": 0},
+            {"item_index": 1, "text": "beta", "done": 1},
+        ]
 
         result = json.loads(
             mission_update_description(5, "New prose\n- [ ] sneaky")
@@ -2027,8 +2031,18 @@ class TestMissionUpdateDescription:
         assert "- [ ] sneaky" not in new_desc
         assert "Old prose" not in new_desc
         assert "New prose" in new_desc
-        # quest rows themselves are untouched by a description edit
-        mock_persist.upsert_checklist_item.assert_not_called()
+        # the replica is refreshed from what Deck actually holds now
+        replica_desc = mock_persist.upsert_mission.call_args.kwargs["description"]
+        assert replica_desc == new_desc
+        assert mock_persist.upsert_mission.call_args.kwargs["checklist_total"] == 2
+        assert mock_persist.upsert_mission.call_args.kwargs["checklist_done"] == 1
+        synced = [
+            c.kwargs for c in mock_persist.upsert_checklist_item.call_args_list
+        ]
+        assert [(c["item_index"], c["text"], c["done"]) for c in synced] == [
+            (0, "alpha", 0),
+            (1, "beta", 1),
+        ]
 
     @patch("ultratimonel.context_extractor.get_project_maps")
     @patch("ultratimonel.server.persistence")
@@ -2063,12 +2077,165 @@ class TestMissionUpdateDescription:
             return (None, "unavailable")
 
         mock_call.side_effect = call_side_effect
+        mock_persist.list_checklist_items.return_value = []
 
         result = json.loads(mission_update_description(5, "New prose"))
 
         assert "error" in result
         assert "deck_update_card" not in calls
         mock_persist.upsert_mission.assert_not_called()
+
+
+class TestMissionUpdateDescriptionFailClosed:
+    """Card #218, forum #1: a stale/empty read must never delete the checklist.
+
+    The replica's checklist rows are the evidence. When the fresh Deck read
+    shows zero quest lines but the replica knows N > 0 quests, the write is
+    refused and the card keeps its lines.
+    """
+
+    _CHECKLIST = "\n".join(f"- [ ] quest {i}" for i in range(16))
+    _ORIGINAL = f"Old prose\n\n{_CHECKLIST}"
+
+    def _mission(self):
+        return {
+            "id": 5,
+            "deck_task_id": 137,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Mission 1058",
+            "description": self._ORIGINAL,
+            "status": "pendiente",
+            "checklist_total": 16,
+            "checklist_done": 0,
+        }
+
+    def _replica_items(self):
+        return [
+            {"item_index": i, "text": f"quest {i}", "done": 0}
+            for i in range(16)
+        ]
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_empty_reread_refuses_and_leaves_card_intact(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel import deck_bridge
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = self._mission()
+        mock_persist.list_checklist_items.return_value = self._replica_items()
+        calls = []
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            calls.append(tool_name)
+            if tool_name == "deck_get_card":
+                return ({"title": "Mission 1058", "description": ""}, None)
+            if tool_name == "deck_update_card":
+                return ({"id": 137}, None)
+            return (None, "unavailable")
+
+        mock_call.side_effect = call_side_effect
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert "error" in result
+        assert result["reason"] == deck_bridge.ERR_EMPTY_DESCRIPTION
+        assert "deck_update_card" not in calls
+        mock_persist.upsert_mission.assert_not_called()
+        mock_persist.upsert_checklist_item.assert_not_called()
+        # The authoritative checklist is still the full 16 lines.
+        assert len(deck_bridge.extract_quests(self._ORIGINAL)) == 16
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_reread_without_quests_reports_desync(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel import deck_bridge
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = self._mission()
+        mock_persist.list_checklist_items.return_value = self._replica_items()
+        calls = []
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            calls.append(tool_name)
+            if tool_name == "deck_get_card":
+                return ({"title": "Mission 1058", "description": "Old prose"}, None)
+            return (None, "unavailable")
+
+        mock_call.side_effect = call_side_effect
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert "error" in result
+        assert result["reason"] == deck_bridge.ERR_QUESTS_MISSING
+        assert "deck_update_card" not in calls
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_forum_case_keeps_every_line_and_syncs_replica(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """Forum reproduction: mission with checklist, prose write, 0 lines lost."""
+        from ultratimonel import deck_bridge
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = self._mission()
+        mock_persist.list_checklist_items.return_value = self._replica_items()
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission 1058", "description": self._ORIGINAL},
+                None,
+            ),
+            "deck_update_card": ({"id": 137}, None),
+        }
+        mock_call.side_effect = (
+            lambda server_name, tool_name, params=None, timeout=8.0: responses.get(
+                tool_name, (None, "unavailable")
+            )
+        )
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert result == {"mission_id": 5, "status": "ok"}
+
+        written = [
+            c.args[2]
+            for c in mock_call.call_args_list
+            if c.args[1] == "deck_update_card"
+        ][0]
+        written_desc = written["description"]
+        original_lines = self._CHECKLIST.split("\n")
+        written_quest_lines = [
+            written_desc.split("\n")[q["line_no"]]
+            for q in deck_bridge.extract_quests(written_desc)
+        ]
+        # Full-list comparison: nothing disappeared, order and state intact.
+        assert written_quest_lines == original_lines
+        assert "New prose" in written_desc
+        assert "Old prose" not in written_desc
+
+        # The replica mirrors Deck exactly: same description, quests, order.
+        replica_call = mock_persist.upsert_mission.call_args.kwargs
+        assert replica_call["description"] == written_desc
+        assert replica_call["checklist_total"] == 16
+        assert replica_call["checklist_done"] == 0
+        synced = [
+            c.kwargs for c in mock_persist.upsert_checklist_item.call_args_list
+        ]
+        assert [
+            (c["item_index"], c["text"], c["done"]) for c in synced
+        ] == [(i, f"quest {i}", 0) for i in range(16)]
 
 
 class TestQuestWriteTools:

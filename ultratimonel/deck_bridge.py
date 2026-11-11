@@ -18,6 +18,10 @@ Contract (design D1/D2/D3):
 * ``update_description`` never touches quests: quest lines are preserved
   byte-identical and in their original relative order (D3). Checkbox lines in
   the incoming prose are omitted so prose cannot introduce a quest.
+* Description writes fail closed when the replica is the only evidence that a
+  checklist exists: a fresh read that yields no quest lines while the replica
+  knows N > 0 quests is treated as a suspicious read, not as a human decision
+  to delete the checklist (card #218, forum #1). No write happens in that case.
 """
 
 import json
@@ -33,12 +37,16 @@ __all__ = [
     "create_card",
     "update_title",
     "update_description",
+    "write_description",
     "clean_prose",
     "append_quest",
     "update_quest",
     "complete_quest",
     "extract_quests",
     "read_card",
+    "ERR_EMPTY_DESCRIPTION",
+    "ERR_QUESTS_MISSING",
+    "ERR_QUEST_PRESERVATION_MISMATCH",
 ]
 
 _NEXTCLOUD = "nextcloud"
@@ -58,6 +66,15 @@ _CHECKBOX_RE = re.compile(r"^[-*]\s+\[([ xX])\]\s*(.*)$")
 # ``- [  ] x``, ``+ [x] x``) and indented markers. A strict superset of
 # ``_CHECKBOX_RE``.
 _QUEST_LIKE_RE = re.compile(r"^\s*[-*+]\s*\[[^\]]*\]", re.IGNORECASE)
+
+# Fail-closed error codes for a suspicious description read (card #218,
+# forum #1). ``update_description`` refuses to write when the fresh read shows
+# no quest lines while the replica knows quests for the mission: the most
+# likely cause is a stale/empty read, and writing would silently delete the
+# card's checklist.
+ERR_EMPTY_DESCRIPTION = "deck_description_empty_but_replica_has_quests"
+ERR_QUESTS_MISSING = "deck_description_missing_quests_but_replica_has_them"
+ERR_QUEST_PRESERVATION_MISMATCH = "quest_preservation_mismatch"
 
 
 # ── Low-level MCP plumbing ─────────────────────────────────────────────
@@ -300,41 +317,132 @@ def update_title(
     return _write_card(board_id, stack_id, card_id, title, description)
 
 
-def update_description(
-    board_id: int,
-    stack_id: int,
-    card_id: int,
+def _compose_description(
+    card: dict[str, Any],
     prose: str,
-) -> tuple[Optional[bool], Optional[str]]:
-    """Update a card's prose without touching its quests (D3).
+    expected_quest_count: Optional[int],
+) -> tuple[Optional[str], Optional[str]]:
+    """Compose the next description from one freshly read card.
 
-    Every checkbox line in the current description is preserved
-    byte-identically and in its original relative order. Checkbox lines in the
-    incoming ``prose`` are omitted so prose cannot introduce a quest.
+    Returns ``(new_description, err)``. Checkbox lines from the current
+    description are copied byte-identically, in their original relative order;
+    checkbox lines in ``prose`` are dropped. The composed result is validated
+    against the full preserved list (not a count) before returning.
+
+    Fail-closed: when the fresh read shows zero quest lines but the replica
+    knows ``expected_quest_count`` > 0 quests, the read is suspicious and the
+    caller must NOT write. An empty description is reported distinctly from a
+    non-empty description whose checklist vanished, so the error says which.
     """
-    card, err = _read_card(board_id, stack_id, card_id)
-    if card is None:
-        return None, err
-
     title = card.get("title", "") or ""
     if not title:
-        # Baseline guard: never write a card whose title could not be resolved.
+        # Never write a card whose title could not be resolved.
         return None, "unexpected Deck response shape"
+
     current = card.get("description", "") or ""
     original_lines = current.split("\n")
     preserved = [
         original_lines[q["line_no"]] for q in extract_quests(current)
     ]
 
-    cleaned = clean_prose(prose)
+    if expected_quest_count and expected_quest_count > 0 and not preserved:
+        if not current.strip():
+            return None, ERR_EMPTY_DESCRIPTION
+        return None, ERR_QUESTS_MISSING
 
+    cleaned = clean_prose(prose)
     if preserved:
         quest_block = "\n".join(preserved)
         new_description = f"{cleaned}\n\n{quest_block}" if cleaned else quest_block
     else:
         new_description = cleaned
 
-    return _write_card(board_id, stack_id, card_id, title, new_description)
+    composed_lines = new_description.split("\n")
+    after = [
+        composed_lines[q["line_no"]]
+        for q in extract_quests(new_description)
+    ]
+    if after != preserved:
+        # Byte-identity is a full-list invariant, never a count comparison.
+        return None, ERR_QUEST_PRESERVATION_MISMATCH
+
+    return new_description, None
+
+
+def write_description(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    prose: str,
+    *,
+    expected_quest_count: Optional[int] = None,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Fresh read + compose + Deck write of a card description.
+
+    Returns ``({"title", "description", "quests"}, None)`` on success, where
+    ``description`` is exactly what was written to Deck and ``quests`` is the
+    parsed checklist of that written description (same order and state), so the
+    caller can refresh its replica from the authoritative outcome.
+
+    Returns ``(None, err)`` without writing anything when the fresh read fails,
+    the response is not a card, or the read is suspicious (see
+    ``_compose_description``).
+    """
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, err
+
+    new_description, cerr = _compose_description(
+        card, prose, expected_quest_count
+    )
+    if new_description is None:
+        return None, cerr
+
+    title = card.get("title", "") or ""
+    ok, werr = _write_card(
+        board_id, stack_id, card_id, title, new_description
+    )
+    if ok is None:
+        return None, werr
+
+    return {
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
+def update_description(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    prose: str,
+    *,
+    expected_quest_count: Optional[int] = None,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Update a card's prose without touching its quests (D3).
+
+    Every checkbox line in the current description is preserved
+    byte-identically and in its original relative order. Checkbox lines in the
+    incoming ``prose`` are omitted so prose cannot introduce a quest.
+
+    Every write starts from a fresh read of the card. When
+    ``expected_quest_count`` (the replica's quest count for this mission) is
+    N > 0 and the fresh read yields no checkbox lines, the write is refused and
+    ``(None, err)`` is returned: a stale/empty read must never silently delete
+    a checklist. Use ``write_description`` when the caller needs the exact
+    description that was written.
+    """
+    result, err = write_description(
+        board_id,
+        stack_id,
+        card_id,
+        prose,
+        expected_quest_count=expected_quest_count,
+    )
+    if result is None:
+        return None, err
+    return True, None
 
 
 def append_quest(

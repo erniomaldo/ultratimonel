@@ -1569,15 +1569,20 @@ def mission_update_description(mission_id: int, description: str) -> str:
     """Update a mission's prose description without touching its quests (D3).
 
     The bridge preserves every quest line byte-identical and in its original
-    order. An unknown ``mission_id`` fails with a not-found error and performs
-    NO Deck call (Req 1).
+    order. The write starts from a fresh card read; when that read is
+    suspicious (no checkbox lines while the replica knows quests) the write is
+    refused instead of silently deleting the checklist. An unknown
+    ``mission_id`` fails with a not-found error and performs NO Deck call
+    (Req 1).
 
     Args:
         mission_id: Local mission id.
         description: New prose description (quest lines are ignored).
 
     Returns:
-        JSON {mission_id, status}.
+        JSON {mission_id, status}. When the replica refresh fails after a
+        successful Deck write, the response also carries
+        ``replica_refresh_error``.
     """
     mission = persistence.get_mission(mission_id)
     if not mission:
@@ -1599,24 +1604,80 @@ def mission_update_description(mission_id: int, description: str) -> str:
             default=str,
         )
 
-    ok, err = deck_bridge.update_description(
-        board_id, stack_id, mission["deck_task_id"], description
+    # The replica's quest rows are the only evidence that this mission has a
+    # checklist. Use both the row count and the denormalized counter so a stale
+    # read cannot be mistaken for a human deleting every quest.
+    replica_quests = persistence.list_checklist_items(mission_id) or []
+    expected_quests = max(
+        len(replica_quests),
+        int(mission.get("checklist_total") or 0),
     )
-    if not ok:
+
+    result, err = deck_bridge.write_description(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        description,
+        expected_quest_count=expected_quests,
+    )
+    if result is None:
+        if err == deck_bridge.ERR_EMPTY_DESCRIPTION:
+            detail = (
+                f"Deck card {mission['deck_task_id']} read returned an empty "
+                f"description while the replica has {expected_quests} quest(s); "
+                "refusing to overwrite the card. Re-read the card and retry."
+            )
+        elif err == deck_bridge.ERR_QUESTS_MISSING:
+            detail = (
+                f"Deck card {mission['deck_task_id']} read returned no quest "
+                f"lines while the replica has {expected_quests} quest(s); the "
+                "read looks stale. Refusing to overwrite the card."
+            )
+        else:
+            detail = f"Deck bridge unavailable: {err}"
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": detail, "mission_id": mission_id, "reason": err},
             ensure_ascii=False,
             default=str,
         )
 
-    _refresh_mission_replica(
-        mission,
-        mission.get("title", "") or "",
-        description,
-        mission.get("status", "pendiente"),
-    )
+    # Refresh the replica from what Deck actually holds now: same prose, same
+    # quests, same order, same state. Report a refresh failure instead of
+    # hiding it; the Deck write already happened.
+    new_description = result["description"]
+    quests = result["quests"]
+    checklist_total = len(quests)
+    checklist_done = sum(1 for q in quests if q["done"])
+    refresh_error: str | None = None
+    try:
+        persistence.upsert_mission(
+            deck_task_id=mission["deck_task_id"],
+            project=mission.get("project", ""),
+            title=mission.get("title", "") or "",
+            description=new_description,
+            status=mission.get("status", "pendiente"),
+            checklist_total=checklist_total,
+            checklist_done=checklist_done,
+        )
+        persistence.delete_checklist_items_beyond(mission_id, checklist_total)
+        for idx, quest in enumerate(quests):
+            persistence.upsert_checklist_item(
+                mission_id=mission_id,
+                item_index=idx,
+                text=quest["text"],
+                done=1 if quest["done"] else 0,
+            )
+    except Exception as exc:  # pragma: no cover - defensive, reported below
+        logger.warning(
+            "mission_update_description: replica refresh failed: %s", exc
+        )
+        refresh_error = str(exc)
+
+    response = {"mission_id": mission_id, "status": "ok"}
+    if refresh_error is not None:
+        response["replica_refresh_error"] = refresh_error
     return json.dumps(
-        {"mission_id": mission_id, "status": "ok"},
+        response,
         ensure_ascii=False,
         default=str,
     )
