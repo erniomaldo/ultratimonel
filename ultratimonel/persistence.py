@@ -1275,6 +1275,31 @@ class Persistence:
                 )
                 return cursor.rowcount > 0
 
+    def refresh_mission_checklist_counts(self, mission_id: int) -> bool:
+        """Recompute a mission's checklist counters from its quest rows.
+
+        Mission-scoped replica refresh used by write operations that change
+        exactly one quest (``end_turn``): the quest row is already updated, so
+        ``missions.checklist_total``/``checklist_done`` must follow instead of
+        keeping stale counters. Returns True when the mission row exists.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    """UPDATE missions
+                           SET checklist_total = (
+                                   SELECT COUNT(*) FROM checklist_items
+                                   WHERE mission_id = ?
+                               ),
+                               checklist_done = (
+                                   SELECT COUNT(*) FROM checklist_items
+                                   WHERE mission_id = ? AND done = 1
+                               )
+                         WHERE id = ?""",
+                    (mission_id, mission_id, mission_id),
+                )
+                return cursor.rowcount > 0
+
     def delete_checklist_items_beyond(self, mission_id: int, keep_count: int) -> int:
         """Delete replica checklist items whose ``item_index`` >= ``keep_count``.
 

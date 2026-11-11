@@ -36,11 +36,14 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "create_card",
     "update_title",
+    "update_title_record",
     "update_description",
     "write_description",
     "clean_prose",
     "append_quest",
+    "append_quest_record",
     "update_quest",
+    "update_quest_record",
     "complete_quest",
     "extract_quests",
     "read_card",
@@ -303,6 +306,34 @@ def create_card(
     return card_id, None
 
 
+def update_title_record(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    title: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Update a card's title and return the authoritative post-write card.
+
+    Returns ``({"title", "description", "quests"}, None)`` where ``title`` and
+    ``description`` are exactly what was written and ``quests`` is the parsed
+    checklist of that written description, so the caller can refresh its
+    replica from the acknowledged outcome in the same operation (no extra
+    read, no per-quest Deck call).
+    """
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, err
+    description = card.get("description", "") or ""
+    ok, werr = _write_card(board_id, stack_id, card_id, title, description)
+    if ok is None:
+        return None, werr
+    return {
+        "title": title,
+        "description": description,
+        "quests": extract_quests(description),
+    }, None
+
+
 def update_title(
     board_id: int,
     stack_id: int,
@@ -310,11 +341,10 @@ def update_title(
     title: str,
 ) -> tuple[Optional[bool], Optional[str]]:
     """Update a card's title while preserving its description byte-identically."""
-    card, err = _read_card(board_id, stack_id, card_id)
-    if card is None:
+    record, err = update_title_record(board_id, stack_id, card_id, title)
+    if record is None:
         return None, err
-    description = card.get("description", "") or ""
-    return _write_card(board_id, stack_id, card_id, title, description)
+    return True, None
 
 
 def _compose_description(
@@ -445,17 +475,17 @@ def update_description(
     return True, None
 
 
-def append_quest(
+def append_quest_record(
     board_id: int,
     stack_id: int,
     card_id: int,
     text: str,
-) -> tuple[Optional[int], Optional[str]]:
-    """Append ``- [ ] text`` to the card. Returns ``(position, err)``.
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Append ``- [ ] text`` and return the authoritative post-write card.
 
-    ``position`` is the 0-based index of the new quest among the card's
-    quests. The quest is written with ``done=false``. Multi-line ``text`` is
-    rejected (``quest_text_multiline``) so it cannot compose extra checkboxes.
+    Returns ``({"position", "title", "description", "quests"}, None)``. The
+    description is exactly what was written to Deck, so the caller refreshes
+    its replica from the acknowledged outcome without a second read.
     """
     card, err = _read_card(board_id, stack_id, card_id)
     if card is None:
@@ -478,21 +508,44 @@ def append_quest(
     ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
     if ok is None:
         return None, werr
-    return position, None
+    return {
+        "position": position,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
 
 
-def update_quest(
+def append_quest(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    text: str,
+) -> tuple[Optional[int], Optional[str]]:
+    """Append ``- [ ] text`` to the card. Returns ``(position, err)``.
+
+    ``position`` is the 0-based index of the new quest among the card's
+    quests. The quest is written with ``done=false``. Multi-line ``text`` is
+    rejected (``quest_text_multiline``) so it cannot compose extra checkboxes.
+    """
+    record, err = append_quest_record(board_id, stack_id, card_id, text)
+    if record is None:
+        return None, err
+    return record["position"], None
+
+
+def update_quest_record(
     board_id: int,
     stack_id: int,
     card_id: int,
     position: int,
     text: str,
-) -> tuple[Optional[bool], Optional[str]]:
-    """Surgically rewrite one quest line, keeping ``done=false``.
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Rewrite one quest line and return the authoritative post-write card.
 
-    Only the targeted quest line changes; every other line stays
-    byte-identical. Multi-line ``text`` is rejected
-    (``quest_text_multiline``) so it cannot compose extra checkboxes.
+    Returns ``({"position", "title", "description", "quests"}, None)``. The
+    description is exactly what was written to Deck, so the caller refreshes
+    its replica from the acknowledged outcome without a second read.
     """
     title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
     if lines is None:
@@ -509,7 +562,35 @@ def update_quest(
     raw = lines[target["line_no"]]
     bullet = "*" if raw.strip().startswith("*") else "-"
     lines[target["line_no"]] = f"{bullet} [ ] {clean}"
-    return _write_card(board_id, stack_id, card_id, title, "\n".join(lines))
+    new_description = "\n".join(lines)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "position": position,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
+def update_quest(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    position: int,
+    text: str,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Surgically rewrite one quest line, keeping ``done=false``.
+
+    Only the targeted quest line changes; every other line stays
+    byte-identical. Multi-line ``text`` is rejected
+    (``quest_text_multiline``) so it cannot compose extra checkboxes.
+    """
+    record, err = update_quest_record(board_id, stack_id, card_id, position, text)
+    if record is None:
+        return None, err
+    return True, None
 
 
 def complete_quest(

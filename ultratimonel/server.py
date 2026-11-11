@@ -1603,22 +1603,105 @@ def _resolve_stack_id(
     return int(stacks[0]["id"]), None
 
 
-def _refresh_mission_replica(
+def _refresh_mission_replica_from_card(
     mission: dict,
-    title: str,
-    description: str,
-    status: str,
-) -> int:
-    """Refresh a mission row without disturbing its quest rows (replica only)."""
-    return persistence.upsert_mission(
-        deck_task_id=mission["deck_task_id"],
-        project=mission.get("project", ""),
-        title=title,
-        description=description,
-        status=status,
-        checklist_total=mission.get("checklist_total", 0) or 0,
-        checklist_done=mission.get("checklist_done", 0) or 0,
-    )
+    card: dict,
+    status: str | None = None,
+) -> tuple[int, dict[int, int], str | None]:
+    """Refresh ONE mission's replica from an authoritative post-write card.
+
+    ``card`` is the payload the bridge produced from the single card read it
+    already performs for the write (``{"title", "description", "quests"}``):
+    exactly what Deck holds after the acknowledged write. That is the
+    mission-scoped refresh this operation needs — no project-wide sweep, no
+    second read and no per-quest Deck call (no N+1).
+
+    The mission row (title, description, quest counters) and every quest row
+    are refreshed from that payload, and replica quests Deck no longer has are
+    pruned.
+
+    Returns ``(mission_id, {item_index: replica_quest_id}, err)``. On success
+    ``err`` is ``None``; when the local refresh fails it returns the error
+    string so the caller can report "Deck written, replica stale" instead of a
+    clean success.
+    """
+    quests = card.get("quests") or []
+    title = card.get("title") or mission.get("title", "") or ""
+    description = card.get("description", "") or ""
+    checklist_total = len(quests)
+    checklist_done = sum(1 for quest in quests if quest.get("done"))
+    replicated_status = status or mission.get("status", "pendiente") or "pendiente"
+
+    try:
+        mission_id = int(mission.get("id") or 0)
+    except (TypeError, ValueError):
+        mission_id = 0
+
+    quest_ids: dict[int, int] = {}
+    try:
+        stored_id = persistence.upsert_mission(
+            deck_task_id=mission["deck_task_id"],
+            project=mission.get("project", ""),
+            title=title,
+            description=description,
+            status=replicated_status,
+            checklist_total=checklist_total,
+            checklist_done=checklist_done,
+        )
+        if not mission_id:
+            try:
+                mission_id = int(stored_id or 0)
+            except (TypeError, ValueError):
+                mission_id = 0
+        if not mission_id:
+            return 0, {}, "mission row not found after upsert"
+
+        persistence.delete_checklist_items_beyond(mission_id, checklist_total)
+        for idx, quest in enumerate(quests):
+            quest_id = persistence.upsert_checklist_item(
+                mission_id=mission_id,
+                item_index=idx,
+                text=quest["text"],
+                done=1 if quest["done"] else 0,
+            )
+            quest_ids[idx] = quest_id
+    except Exception as exc:  # reported to the caller, never hidden
+        logger.warning("replica refresh from Deck card failed: %s", exc)
+        return mission_id, quest_ids, str(exc)
+
+    return mission_id, quest_ids, None
+
+
+def _deck_write_refresh_failure(
+    *,
+    deck_written_what: str,
+    mission_id: int,
+    refresh_error: str,
+    extra: dict | None = None,
+) -> str:
+    """Build the explicit fail-closed response for a stale replica.
+
+    The Deck write already happened, so this can never be reported as a clean
+    success: the payload says WHAT Deck holds and that the replica is behind,
+    so the caller can reconcile with ``sync_task``.
+    """
+    response = {
+        "status": "error",
+        "code": "replica_refresh_failed",
+        "deck_written": True,
+        "deck_written_what": deck_written_what,
+        "replica_refresh_error": refresh_error,
+        "replica_stale": True,
+        "reconcile_with": f"sync_task({mission_id})",
+        "error": (
+            f"{deck_written_what}. The local replica could not be refreshed "
+            f"({refresh_error}), so it is now stale; run "
+            f"sync_task({mission_id}) to reconcile."
+        ),
+    }
+    if extra:
+        response.update(extra)
+    return json.dumps(response, ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -1657,7 +1740,7 @@ def mission_create(project: str, title: str, description: str = "") -> str:
     )
     if card_id is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
@@ -1671,7 +1754,21 @@ def mission_create(project: str, title: str, description: str = "") -> str:
     )
     if not mission_id:
         return json.dumps(
-            {"error": "Failed to refresh local replica"},
+            {
+                "status": "error",
+                "code": "replica_refresh_failed",
+                "deck_written": True,
+                "deck_task_id": card_id,
+                "deck_written_what": f"Deck card {card_id} created",
+                "replica_refresh_error": "mission row not stored",
+                "replica_stale": True,
+                "reconcile_with": "sync_task(<mission_id>)",
+                "error": (
+                    f"Deck card {card_id} was created, but the local replica "
+                    "was not refreshed (mission row not stored). The replica "
+                    "is now stale; sync the mission before using its id."
+                ),
+            },
             ensure_ascii=False,
             default=str,
         )
@@ -1700,7 +1797,9 @@ def mission_update_title(mission_id: int, title: str) -> str:
         title: New mission title (Deck card title).
 
     Returns:
-        JSON {mission_id, title, status}.
+        JSON {mission_id, title, status}. When Deck accepted the title but the
+        replica refresh failed, returns an explicit error (``code:
+        replica_refresh_failed``, ``deck_written: true``).
     """
     mission = persistence.get_mission(mission_id)
     if not mission:
@@ -1722,20 +1821,29 @@ def mission_update_title(mission_id: int, title: str) -> str:
             default=str,
         )
 
-    ok, err = deck_bridge.update_title(
+    record, err = deck_bridge.update_title_record(
         board_id, stack_id, mission["deck_task_id"], title
     )
-    if not ok:
+    if record is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
 
     status = mission.get("status", "pendiente")
-    _refresh_mission_replica(
-        mission, title, mission.get("description", "") or "", status
+    _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record, status
     )
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} title updated to {title!r}"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={"mission_id": mission_id, "title": title},
+        )
     return json.dumps(
         {"mission_id": mission_id, "title": title, "status": status},
         ensure_ascii=False,
@@ -1759,9 +1867,10 @@ def mission_update_description(mission_id: int, description: str) -> str:
         description: New prose description (quest lines are ignored).
 
     Returns:
-        JSON {mission_id, status}. When the replica refresh fails after a
-        successful Deck write, the response also carries
-        ``replica_refresh_error``.
+        JSON {mission_id, status}. When the Deck write succeeds but the replica
+        refresh fails, returns an explicit error (``code:
+        replica_refresh_failed``, ``deck_written: true``) naming what Deck holds
+        and how to reconcile — never a clean success with a stale replica.
     """
     mission = persistence.get_mission(mission_id)
     if not mission:
@@ -1815,7 +1924,12 @@ def mission_update_description(mission_id: int, description: str) -> str:
         else:
             detail = f"Deck bridge unavailable: {err}"
         return json.dumps(
-            {"error": detail, "mission_id": mission_id, "reason": err},
+            {
+                "error": detail,
+                "mission_id": mission_id,
+                "reason": err,
+                "deck_written": False,
+            },
             ensure_ascii=False,
             default=str,
         )
@@ -1823,40 +1937,21 @@ def mission_update_description(mission_id: int, description: str) -> str:
     # Refresh the replica from what Deck actually holds now: same prose, same
     # quests, same order, same state. Report a refresh failure instead of
     # hiding it; the Deck write already happened.
-    new_description = result["description"]
-    quests = result["quests"]
-    checklist_total = len(quests)
-    checklist_done = sum(1 for q in quests if q["done"])
-    refresh_error: str | None = None
-    try:
-        persistence.upsert_mission(
-            deck_task_id=mission["deck_task_id"],
-            project=mission.get("project", ""),
-            title=mission.get("title", "") or "",
-            description=new_description,
-            status=mission.get("status", "pendiente"),
-            checklist_total=checklist_total,
-            checklist_done=checklist_done,
-        )
-        persistence.delete_checklist_items_beyond(mission_id, checklist_total)
-        for idx, quest in enumerate(quests):
-            persistence.upsert_checklist_item(
-                mission_id=mission_id,
-                item_index=idx,
-                text=quest["text"],
-                done=1 if quest["done"] else 0,
-            )
-    except Exception as exc:  # pragma: no cover - defensive, reported below
-        logger.warning(
-            "mission_update_description: replica refresh failed: %s", exc
-        )
-        refresh_error = str(exc)
-
-    response = {"mission_id": mission_id, "status": "ok"}
+    _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, result, mission.get("status", "pendiente")
+    )
     if refresh_error is not None:
-        response["replica_refresh_error"] = refresh_error
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} description updated"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={"mission_id": mission_id},
+        )
+
     return json.dumps(
-        response,
+        {"mission_id": mission_id, "status": "ok"},
         ensure_ascii=False,
         default=str,
     )
@@ -1966,7 +2061,10 @@ def quest_add(mission_id: int, title: str) -> str:
         title: Quest text.
 
     Returns:
-        JSON {quest_id, mission_id, title, done}.
+        JSON {quest_id, mission_id, title, done}. When Deck accepted the append
+        but the replica refresh failed, returns an explicit error
+        (``code: replica_refresh_failed``, ``deck_written: true``) instead of a
+        clean success.
     """
     mission = persistence.get_mission(mission_id)
     if not mission:
@@ -1988,29 +2086,34 @@ def quest_add(mission_id: int, title: str) -> str:
             default=str,
         )
 
-    position, err = deck_bridge.append_quest(
+    record, err = deck_bridge.append_quest_record(
         board_id, stack_id, mission["deck_task_id"], title
     )
-    if position is None:
+    if record is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
 
-    quest_id = persistence.upsert_checklist_item(
-        mission_id=mission_id,
-        item_index=position,
-        text=title,
-        done=0,
+    position = record["position"]
+    _replica_id, quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record
     )
-    if not quest_id:
-        return json.dumps(
-            {"error": "Failed to refresh local replica"},
-            ensure_ascii=False,
-            default=str,
+    if refresh_error is None and not quest_ids.get(position):
+        refresh_error = "appended quest row not found in the replica"
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest appended at "
+                f"position {position}"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={"mission_id": mission_id, "title": title, "position": position},
         )
 
+    quest_id = quest_ids[position]
     return json.dumps(
         {
             "quest_id": quest_id,
@@ -2042,7 +2145,9 @@ def quest_update(
         position: Optional Deck checkbox position override.
 
     Returns:
-        JSON {quest_id, title, done}.
+        JSON {quest_id, title, done}. When Deck accepted the rewrite but the
+        replica refresh failed, returns an explicit error (``code:
+        replica_refresh_failed``, ``deck_written: true``).
     """
     quest = persistence.get_checklist_item_by_id(quest_id)
     if not quest:
@@ -2075,22 +2180,34 @@ def quest_update(
     deck_position = position if position is not None else quest["item_index"]
     new_text = title if title is not None else quest["text"]
 
-    ok, err = deck_bridge.update_quest(
+    record, err = deck_bridge.update_quest_record(
         board_id, stack_id, mission["deck_task_id"], deck_position, new_text
     )
-    if not ok:
+    if record is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
 
-    persistence.upsert_checklist_item(
-        mission_id=mission["id"],
-        item_index=deck_position,
-        text=new_text,
-        done=0,
+    _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record
     )
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} rewritten"
+            ),
+            mission_id=mission["id"],
+            refresh_error=refresh_error,
+            extra={
+                "quest_id": quest_id,
+                "title": new_text,
+                "position": deck_position,
+            },
+        )
+
     return json.dumps(
         {"quest_id": quest_id, "title": new_text, "done": False},
         ensure_ascii=False,
@@ -2333,24 +2450,42 @@ def begin_turn(
     )
 
 
-def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
+def _complete_quest_for_intento(intento: dict) -> dict:
     """Flip the intento's quest to done in Deck, then refresh the replica (D6).
 
     Closes the intento's quest in Deck (``done=true``) and refreshes the local
-    replica. ``end_turn`` calls this ONLY when the turn's ``final_status`` is
-    ``success``; an aborted, failed or partial turn leaves the quest open. Deck
-    stays the source of truth, so the local replica is refreshed only after
-    ``deck_bridge.complete_quest`` acknowledges the write (D1). Failures are
-    logged and never raise — closing a turn must not be blocked by a bridge or
-    resolution problem (a later ``sync_task`` can recover).
+    replica in the SAME operation. ``end_turn`` calls this ONLY when the turn's
+    ``final_status`` is ``success``; an aborted, failed or partial turn leaves
+    the quest open. Deck stays the source of truth, so the local replica is
+    refreshed only after ``deck_bridge.complete_quest`` acknowledges the write
+    (D1).
 
-    Returns ``(quest_id, done)``; ``done`` is True only when both the Deck write
-    and the replica refresh succeeded.
+    The replica refresh is mission-scoped and never per-quest: the quest flag
+    is set and the mission's checklist counters are recomputed from the replica
+    rows.
+
+    Returns a dict with the resolution honestly separated:
+
+    * ``quest_id`` / ``done``: the quest and whether it is now closed.
+    * ``deck_written``: True only after Deck acknowledged the write.
+    * ``reason``: ``refreshed`` (both sides done), ``deck_write_failed`` /
+      ``stack_unresolved`` / ``board_unresolved`` / ``not_found`` /
+      ``lookup_failed`` / ``mission_mismatch`` / ``not_resolved`` (nothing was
+      written to Deck), or ``replica_refresh_failed`` (Deck WAS written and the
+      replica is now stale — a real failure of the operation).
+    * ``refresh_error``: the replica failure detail, else ``None``.
     """
+    result = {
+        "quest_id": intento.get("checklist_item_id") or None,
+        "done": False,
+        "deck_written": False,
+        "reason": "not_resolved",
+        "refresh_error": None,
+    }
     mission_id = intento.get("mission_id") or 0
     quest_id = intento.get("checklist_item_id") or 0
     if not (mission_id and quest_id):
-        return None, False
+        return result
 
     try:
         mission = persistence.get_mission(mission_id)
@@ -2359,7 +2494,8 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
         logger.warning(
             "Quest closure lookup failed (intento=%s): %s", intento.get("id"), exc
         )
-        return quest_id, False
+        result["reason"] = "lookup_failed"
+        return result
 
     if not isinstance(mission, dict) or not isinstance(quest, dict):
         logger.warning(
@@ -2367,7 +2503,8 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
             mission_id,
             quest_id,
         )
-        return quest_id, False
+        result["reason"] = "not_found"
+        return result
 
     # Membership parity (W2): revalidate here too. begin_turn rejects a crossed
     # quest, but the deprecated record_intento tool can still create an intento
@@ -2379,12 +2516,14 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
             quest_id,
             mission_id,
         )
-        return quest_id, False
+        result["reason"] = "mission_mismatch"
+        return result
 
     board_id, err = _resolve_board_id(mission.get("project", ""))
     if err:
         logger.warning("Quest closure skipped (board): %s", err)
-        return quest_id, False
+        result["reason"] = "board_unresolved"
+        return result
 
     # W-g parity: resolve the stack that ACTUALLY holds the card (fail closed),
     # never guess the pending/first stack. When the card cannot be located the
@@ -2392,24 +2531,36 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
     stack_id, _stack_title, err = _resolve_stack_for_card(board_id, mission)
     if err:
         logger.warning("Quest closure skipped (stack): %s", err)
-        return quest_id, False
+        result["reason"] = "stack_unresolved"
+        return result
 
     ok, err = deck_bridge.complete_quest(
         board_id, stack_id, mission["deck_task_id"], quest["item_index"]
     )
     if not ok:
         logger.warning("Quest closure: Deck write failed for quest #%s: %s", quest_id, err)
-        return quest_id, False
+        result["reason"] = "deck_write_failed"
+        return result
 
+    # Deck acknowledged the write: from here on any local failure means the
+    # replica is behind Deck and the operation failed even though Deck changed.
+    result["deck_written"] = True
     try:
-        persistence.set_quest_done(quest_id, True)
+        if persistence.set_quest_done(quest_id, True) is False:
+            raise RuntimeError("quest row not found in the replica")
+        if persistence.refresh_mission_checklist_counts(mission_id) is False:
+            raise RuntimeError("mission row not found in the replica")
     except Exception as exc:
         logger.warning(
             "Quest closure: replica refresh failed for quest #%s: %s", quest_id, exc
         )
-        return quest_id, False
+        result["reason"] = "replica_refresh_failed"
+        result["refresh_error"] = str(exc)
+        return result
 
-    return quest_id, True
+    result["done"] = True
+    result["reason"] = "refreshed"
+    return result
 
 
 @app.tool()
@@ -2462,6 +2613,11 @@ def end_turn(
     Returns:
         JSON string with completion status, gates_passed count, compact gate
         detail, and the quest_id/quest_done that reflect what actually happened.
+        ``quest_done_reason`` explains why the quest was (not) consumed:
+        ``refreshed``, ``vetoed``, ``not_success``, ``deck_write_failed``, etc.
+        When Deck accepted the closure but the replica refresh failed, the
+        response is an explicit error (``code: replica_refresh_failed``,
+        ``deck_written: true``) — never a clean closure over a stale replica.
     """
     global _active_intento
 
@@ -2609,10 +2765,22 @@ def end_turn(
     #     success. Aborted/failed/partial (and gate-fail) leave it open so the
     #     dashboard can distinguish "quest done" from "turn abandoned".
     if final_status == "success" and quest_done is not False:
-        quest_id_closed, quest_is_done = _complete_quest_for_intento(intento)
+        closure = _complete_quest_for_intento(intento)
     else:
-        quest_id_closed = intento.get("checklist_item_id") or None
-        quest_is_done = False
+        closure = {
+            "quest_id": intento.get("checklist_item_id") or None,
+            "done": False,
+            "deck_written": False,
+            "reason": (
+                "vetoed"
+                if final_status == "success" and quest_done is False
+                else "not_success"
+            ),
+            "refresh_error": None,
+        }
+
+    quest_id_closed = closure["quest_id"]
+    quest_is_done = closure["done"]
 
     # 6. Completar intento con detalle completo (NEVER blocks — always completes)
     #    v7 widens intentos.status to the honest terminal vocabulary, so the
@@ -2641,17 +2809,44 @@ def end_turn(
     # 7. Limpiar estado de turno activo
     _clear_active_intento()
 
+    response = {
+        "status": "ok",
+        "intento_id": intento_id,
+        "final_status": final_status,
+        "gates_passed": gates_passed,
+        "gates_total": len(final_gates) if final_gates else 4,
+        "gates": compact.compact_gates(final_gates),
+        "quest_id": quest_id_closed,
+        "quest_done": quest_is_done,
+        "quest_done_reason": closure["reason"],
+        "deck_written": closure["deck_written"],
+    }
+
+    # Fail-closed (card #218, forum #1): when Deck WAS written but the replica
+    # refresh failed, the turn cannot be reported as a clean closure. The
+    # intento is still finalized above (never left running) and the response
+    # says exactly what Deck holds and that the replica is behind.
+    if closure["refresh_error"] is not None:
+        response.update(
+            {
+                "status": "error",
+                "code": "replica_refresh_failed",
+                "quest_done": False,
+                "replica_refresh_error": closure["refresh_error"],
+                "replica_stale": True,
+                "reconcile_with": f"sync_task({intento.get('mission_id')})",
+                "error": (
+                    "The quest was marked done in Deck, but the local replica "
+                    f"could not be refreshed ({closure['refresh_error']}). The "
+                    "turn is recorded, the replica is stale; run "
+                    f"sync_task({intento.get('mission_id')}) to reconcile."
+                ),
+            }
+        )
+        return json.dumps(response, ensure_ascii=False, default=str)
+
     return json.dumps(
-        {
-            "status": "ok",
-            "intento_id": intento_id,
-            "final_status": final_status,
-            "gates_passed": gates_passed,
-            "gates_total": len(final_gates) if final_gates else 4,
-            "gates": compact.compact_gates(final_gates),
-            "quest_id": quest_id_closed,
-            "quest_done": quest_is_done,
-        },
+        response,
         ensure_ascii=False,
         default=str,
     )
@@ -2943,10 +3138,15 @@ def card_update_description(
         mission_id: Optional local mission id used to resolve the Deck target.
 
     Returns:
-        JSON string confirming update.
+        JSON string confirming update. When ``mission_id`` is supplied the
+        mission's replica is refreshed from the acknowledged write, so a stale
+        checklist can never survive the update; if that refresh fails the reply
+        is an explicit error (``code: replica_refresh_failed``,
+        ``deck_written: true``).
     """
     from .mcp_client import call_mcp_tool, TOOL_NAMES
 
+    mission = None
     if mission_id is not None:
         mission = persistence.get_mission(mission_id)
         if not mission:
@@ -3037,14 +3237,42 @@ def card_update_description(
         timeout=8.0,
     )
     if result is None:
-        return json.dumps({"error": f"Failed to update card: {update_err}"})
+        return json.dumps(
+            {"error": f"Failed to update card: {update_err}", "deck_written": False}
+        )
+
+    response = {
+        "status": "ok",
+        "card_id": card_id,
+        "title_preserved": current_title,
+    }
+
+    # The Deck write already happened: refresh THIS mission's replica from the
+    # acknowledged description so it can never keep a checklist Deck no longer
+    # has (or a stale prose). Only an explicitly resolved mission is refreshed;
+    # a raw card id carries no mission to refresh.
+    if mission is not None:
+        response["mission_id"] = mission_id
+        payload = {
+            "title": current_title,
+            "description": cleaned_description,
+            "quests": deck_bridge.extract_quests(cleaned_description),
+        }
+        _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+            mission, payload, mission.get("status", "pendiente")
+        )
+        if refresh_error is not None:
+            return _deck_write_refresh_failure(
+                deck_written_what=(
+                    f"Deck card {card_id} description updated"
+                ),
+                mission_id=mission_id,
+                refresh_error=refresh_error,
+                extra={"mission_id": mission_id},
+            )
 
     return json.dumps(
-        {
-            "status": "ok",
-            "card_id": card_id,
-            "title_preserved": current_title,
-        },
+        response,
         ensure_ascii=False,
         default=str,
     )
