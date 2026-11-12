@@ -138,6 +138,28 @@ DDL_V8_TABLES = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_mission_deletions_mission"
     " ON mission_deletions(mission_id)",
+    # ``mission_deletions`` is mission-scoped and cannot describe a single
+    # quest; ``quest_delete`` needs its own append-only ledger so the deleted
+    # quest ids and their dependent rows survive the quest itself.
+    """CREATE TABLE IF NOT EXISTS quest_deletions (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id        INTEGER NOT NULL,
+        deck_task_id      INTEGER,
+        quest_id          INTEGER NOT NULL,
+        project           TEXT,
+        text              TEXT,
+        item_index        INTEGER,
+        reason            TEXT NOT NULL,
+        requested_by      TEXT NOT NULL,
+        forced            INTEGER NOT NULL DEFAULT 0,
+        intentos_deleted  INTEGER NOT NULL DEFAULT 0,
+        grants_deleted    INTEGER NOT NULL DEFAULT 0,
+        bitacora_deleted  INTEGER NOT NULL DEFAULT 0,
+        deleted_ids       TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_quest_deletions_mission"
+    " ON quest_deletions(mission_id)",
 ]
 
 DDL_V2 = [
@@ -358,11 +380,12 @@ def _migrate_v6_to_v7(conn) -> None:
 
 
 def _migrate_v7_to_v8(conn) -> None:
-    """v7→v8: add the ``mission_deletions`` audit ledger.
+    """v7→v8: add the deletion audit ledgers.
 
-    Additive only: one table plus its index, no data rewrite and no destructive
-    DDL. ``CREATE TABLE IF NOT EXISTS`` plus ``INSERT OR IGNORE`` make replay a
-    no-op, and older code keeps working against the extra table (SCHEMA_AHEAD).
+    Additive only: ``mission_deletions`` and ``quest_deletions`` plus their
+    indexes, no data rewrite and no destructive DDL. ``CREATE TABLE IF NOT
+    EXISTS`` plus ``INSERT OR IGNORE`` make replay a no-op, and older code
+    keeps working against the extra tables (SCHEMA_AHEAD).
     """
     for stmt in DDL_V8_TABLES:
         conn.execute(stmt)
@@ -1315,6 +1338,327 @@ class Persistence:
                     (mission_id, keep_count),
                 )
                 return cursor.rowcount
+
+    # ── quest delete / reorder (identity-preserving) ────────────────────
+    #
+    # Quest ids are the replica's stable handle even though Deck lines carry no
+    # id. These operations therefore never go through the positional upsert
+    # (``ON CONFLICT(mission_id, item_index)``): they move ``item_index`` on the
+    # existing rows, so every surviving quest keeps its id and its text.
+
+    def quest_history_counts(self, quest_id: int) -> Optional[dict]:
+        """Count the traceability rows attached to one quest.
+
+        Returns ``None`` when the quest does not exist. ``has_history`` is True
+        when the quest has any intento, attempt grant or turn bitacora row.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM checklist_items WHERE id = ?", (quest_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                intentos = conn.execute(
+                    "SELECT COUNT(*) FROM intentos WHERE checklist_item_id = ?",
+                    (quest_id,),
+                ).fetchone()[0]
+                grants = conn.execute(
+                    "SELECT COUNT(*) FROM attempt_grants"
+                    " WHERE checklist_item_id = ?",
+                    (quest_id,),
+                ).fetchone()[0]
+                bitacora = conn.execute(
+                    "SELECT COUNT(*) FROM turn_bitacora"
+                    " WHERE checklist_item_id = ?",
+                    (quest_id,),
+                ).fetchone()[0]
+                return {
+                    "quest_id": quest_id,
+                    "mission_id": row["mission_id"],
+                    "item_index": row["item_index"],
+                    "text": row["text"],
+                    "intentos": intentos,
+                    "grants": grants,
+                    "bitacora": bitacora,
+                    "has_history": bool(intentos or grants or bitacora),
+                }
+
+    def delete_checklist_item(
+        self,
+        quest_id: int,
+        *,
+        force: bool = False,
+        reason: str = "",
+        requested_by: str = "hermes",
+        description: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Delete ONE quest row without renaming any survivor.
+
+        The surviving quests keep their ids, texts and states; only their
+        ``item_index`` is recomputed so the checklist stays contiguous, and the
+        mission counters and (when ``description`` is supplied) the replicated
+        description follow in the same transaction.
+
+        A quest that carries traceability rows (intentos, attempt grants, turn
+        bitacora) is refused unless ``force=True``; with ``force`` those rows
+        are deleted in the same transaction and their ids are recorded in the
+        ``quest_deletions`` audit ledger, together with the deleted quest id.
+
+        Returns a summary dict, a ``{"refused": True, ...}`` dict when history
+        exists and ``force`` is False, or ``None`` when the quest is unknown.
+        Raises ``ValueError`` when ``reason`` is empty.
+        """
+        if not (reason or "").strip():
+            raise ValueError("quest_delete requires a non-empty reason")
+        actor = (requested_by or "").strip() or "unknown"
+
+        with self._lock:
+            with self._conn() as conn:
+                quest = conn.execute(
+                    "SELECT * FROM checklist_items WHERE id = ?", (quest_id,)
+                ).fetchone()
+                if quest is None:
+                    return None
+                mission_id = quest["mission_id"]
+                mission = conn.execute(
+                    "SELECT * FROM missions WHERE id = ?", (mission_id,)
+                ).fetchone()
+
+                intento_rows = conn.execute(
+                    "SELECT id FROM intentos WHERE checklist_item_id = ?",
+                    (quest_id,),
+                ).fetchall()
+                grant_rows = conn.execute(
+                    "SELECT id FROM attempt_grants WHERE checklist_item_id = ?",
+                    (quest_id,),
+                ).fetchall()
+                bitacora_rows = conn.execute(
+                    "SELECT id FROM turn_bitacora WHERE checklist_item_id = ?",
+                    (quest_id,),
+                ).fetchall()
+
+                intento_ids = [r["id"] for r in intento_rows]
+                grant_ids = [r["id"] for r in grant_rows]
+                bitacora_ids = [r["id"] for r in bitacora_rows]
+                has_history = bool(intento_ids or grant_ids or bitacora_ids)
+
+                if has_history and not force:
+                    return {
+                        "refused": True,
+                        "quest_id": quest_id,
+                        "mission_id": mission_id,
+                        "text": quest["text"],
+                        "item_index": quest["item_index"],
+                        "intentos": len(intento_ids),
+                        "grants": len(grant_ids),
+                        "bitacora": len(bitacora_ids),
+                        "has_history": True,
+                    }
+
+                deleted_ids = json.dumps(
+                    {
+                        "quest_ids": [quest_id],
+                        "intento_ids": intento_ids,
+                        "attempt_grant_ids": grant_ids,
+                        "turn_bitacora_ids": bitacora_ids,
+                    },
+                    ensure_ascii=False,
+                )
+
+                cursor = conn.execute(
+                    """INSERT INTO quest_deletions
+                           (mission_id, deck_task_id, quest_id, project, text,
+                            item_index, reason, requested_by, forced,
+                            intentos_deleted, grants_deleted,
+                            bitacora_deleted, deleted_ids)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        mission_id,
+                        mission["deck_task_id"] if mission else None,
+                        quest_id,
+                        mission["project"] if mission else None,
+                        quest["text"],
+                        quest["item_index"],
+                        reason.strip(),
+                        actor,
+                        1 if force else 0,
+                        len(intento_ids),
+                        len(grant_ids),
+                        len(bitacora_ids),
+                        deleted_ids,
+                    ),
+                )
+                audit_id = cursor.lastrowid
+
+                if force:
+                    conn.execute(
+                        "DELETE FROM turn_bitacora WHERE checklist_item_id = ?",
+                        (quest_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM attempt_grants WHERE checklist_item_id = ?",
+                        (quest_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM intentos WHERE checklist_item_id = ?",
+                        (quest_id,),
+                    )
+
+                conn.execute(
+                    "DELETE FROM checklist_items WHERE id = ?", (quest_id,)
+                )
+
+                # Two-phase shift: move every survivor far away first, then
+                # settle it at its final index. A single decrementing UPDATE
+                # can collide with the UNIQUE(mission_id, item_index) constraint
+                # mid-statement depending on row order.
+                survivors = conn.execute(
+                    "SELECT id, item_index FROM checklist_items"
+                    " WHERE mission_id = ? AND item_index > ?"
+                    " ORDER BY item_index",
+                    (mission_id, quest["item_index"]),
+                ).fetchall()
+                offset = 1_000_000
+                for row in survivors:
+                    conn.execute(
+                        "UPDATE checklist_items SET item_index = item_index + ?"
+                        " WHERE id = ?",
+                        (offset, row["id"]),
+                    )
+                for row in survivors:
+                    conn.execute(
+                        "UPDATE checklist_items SET item_index = ? WHERE id = ?",
+                        (row["item_index"] - 1, row["id"]),
+                    )
+
+                self._refresh_mission_row(conn, mission_id, description)
+
+                return {
+                    "quest_id": quest_id,
+                    "mission_id": mission_id,
+                    "text": quest["text"],
+                    "item_index": quest["item_index"],
+                    "audit_id": audit_id,
+                    "forced": bool(force),
+                    "intentos_deleted": len(intento_ids),
+                    "grants_deleted": len(grant_ids),
+                    "bitacora_deleted": len(bitacora_ids),
+                    "deleted_ids": {
+                        "quest_ids": [quest_id],
+                        "intento_ids": intento_ids,
+                        "attempt_grant_ids": grant_ids,
+                        "turn_bitacora_ids": bitacora_ids,
+                    },
+                }
+
+    def reorder_checklist_items(
+        self,
+        mission_id: int,
+        ordered_ids: list[int],
+        *,
+        description: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Rewrite ``item_index`` so the mission's quests follow ``ordered_ids``.
+
+        Ids and texts are invariants: only ``item_index`` changes, and the
+        update happens in one transaction. ``ordered_ids`` must be exactly the
+        mission's quest set — no duplicates, nothing missing, nothing extra —
+        otherwise ``ValueError`` is raised before any row is touched.
+
+        Returns ``{"mission_id", "ordered_ids", "quests"}`` or ``None`` when the
+        mission does not exist.
+        """
+        ids = list(ordered_ids or [])
+        if len(ids) != len(set(ids)):
+            raise ValueError("quest_reorder ordered_ids contains duplicate ids")
+
+        with self._lock:
+            with self._conn() as conn:
+                mission = conn.execute(
+                    "SELECT id FROM missions WHERE id = ?", (mission_id,)
+                ).fetchone()
+                if mission is None:
+                    return None
+
+                rows = conn.execute(
+                    "SELECT id, item_index, text FROM checklist_items"
+                    " WHERE mission_id = ? ORDER BY item_index",
+                    (mission_id,),
+                ).fetchall()
+                current_ids = [r["id"] for r in rows]
+                missing = sorted(set(current_ids) - set(ids))
+                extra = sorted(set(ids) - set(current_ids))
+                if missing or extra:
+                    raise ValueError(
+                        "quest_reorder ordered_ids must match the mission's "
+                        f"quests exactly (missing={missing}, extra={extra})"
+                    )
+
+                # Two-phase move through negative temporary indexes so the
+                # UNIQUE(mission_id, item_index) constraint never collides.
+                for position, quest_id in enumerate(ids):
+                    conn.execute(
+                        "UPDATE checklist_items SET item_index = ?"
+                        " WHERE id = ? AND mission_id = ?",
+                        (-(position + 1), quest_id, mission_id),
+                    )
+                for position, quest_id in enumerate(ids):
+                    conn.execute(
+                        "UPDATE checklist_items SET item_index = ?"
+                        " WHERE id = ? AND mission_id = ?",
+                        (position, quest_id, mission_id),
+                    )
+
+                self._refresh_mission_row(conn, mission_id, description)
+
+                quests = conn.execute(
+                    "SELECT id, item_index, text, done FROM checklist_items"
+                    " WHERE mission_id = ? ORDER BY item_index",
+                    (mission_id,),
+                ).fetchall()
+                return {
+                    "mission_id": mission_id,
+                    "ordered_ids": ids,
+                    "quests": [dict(q) for q in quests],
+                }
+
+    def _refresh_mission_row(
+        self,
+        conn,
+        mission_id: int,
+        description: Optional[str],
+    ) -> None:
+        """Recompute a mission's checklist counters (and description) in place."""
+        if description is None:
+            conn.execute(
+                """UPDATE missions
+                       SET checklist_total = (
+                               SELECT COUNT(*) FROM checklist_items
+                               WHERE mission_id = ?
+                           ),
+                           checklist_done = (
+                               SELECT COUNT(*) FROM checklist_items
+                               WHERE mission_id = ? AND done = 1
+                           )
+                     WHERE id = ?""",
+                (mission_id, mission_id, mission_id),
+            )
+            return
+        conn.execute(
+            """UPDATE missions
+                   SET description = ?,
+                       checklist_total = (
+                           SELECT COUNT(*) FROM checklist_items
+                           WHERE mission_id = ?
+                       ),
+                       checklist_done = (
+                           SELECT COUNT(*) FROM checklist_items
+                           WHERE mission_id = ? AND done = 1
+                       )
+                 WHERE id = ?""",
+            (description, mission_id, mission_id, mission_id),
+        )
 
     # ── intentos ────────────────────────────────────────────────────────
 

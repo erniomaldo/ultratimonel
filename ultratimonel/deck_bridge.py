@@ -44,6 +44,8 @@ __all__ = [
     "append_quest_record",
     "update_quest",
     "update_quest_record",
+    "delete_quest_record",
+    "reorder_quests_record",
     "complete_quest",
     "extract_quests",
     "read_card",
@@ -568,6 +570,84 @@ def update_quest_record(
         return None, werr
     return {
         "position": position,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
+def delete_quest_record(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    position: int,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Remove exactly one quest line and return the authoritative card.
+
+    Only the targeted quest's line is removed; every other line (prose and the
+    remaining quests, with their state) stays byte-identical and in order.
+
+    Returns ``({"position", "title", "description", "quests"}, None)``. The
+    description is exactly what was written to Deck, so the caller refreshes
+    its replica from the acknowledged outcome without a second read.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    if position < 0 or position >= len(quests):
+        return None, "quest_position_out_of_range"
+
+    del lines[quests[position]["line_no"]]
+    new_description = "\n".join(lines)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "position": position,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
+def reorder_quests_record(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    ordered_positions: list[int],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Reorder the card's quest lines into ``ordered_positions``.
+
+    Each element is the CURRENT 0-based quest position whose raw line takes the
+    next quest slot. The list must be a permutation of the card's quest
+    positions; anything else is rejected without a write.
+
+    The raw lines move verbatim, so text and ``[x]``/``[ ]`` state are
+    preserved. Non-quest lines keep their slots. One Deck read and one Deck
+    description write.
+
+    Returns ``({"order", "title", "description", "quests"}, None)``.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    positions = list(ordered_positions or [])
+    if sorted(positions) != list(range(len(quests))):
+        return None, "quest_reorder_invalid_order"
+
+    slot_line_nos = [q["line_no"] for q in quests]
+    ordered_raw = [lines[quests[p]["line_no"]] for p in positions]
+    for slot, raw in zip(slot_line_nos, ordered_raw):
+        lines[slot] = raw
+
+    new_description = "\n".join(lines)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "order": positions,
         "title": title,
         "description": new_description,
         "quests": extract_quests(new_description),

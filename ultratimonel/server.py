@@ -2215,6 +2215,338 @@ def quest_update(
     )
 
 
+def _quest_pair(quest: dict) -> tuple[str, int]:
+    """The identity-sensitive pair used to prove quests are not renamed."""
+    return (quest["text"], 1 if quest.get("done") else 0)
+
+
+@app.tool()
+def quest_delete(
+    quest_id: int,
+    confirm: bool = False,
+    reason: str = "",
+    force: bool = False,
+    requested_by: str = "hermes",
+) -> str:
+    """Delete ONE quest from the Deck card and the replica, preserving ids.
+
+    The targeted quest line is removed from Deck and its replica row is
+    deleted; every surviving quest keeps its id, text and state and only its
+    ``item_index`` is recomputed. This never goes through the positional
+    upsert, which would rename the quests after the deleted one.
+
+    Both ``confirm=True`` and a non-empty ``reason`` are required and are
+    validated before any Deck read or write. A quest with traceability rows
+    (intentos, attempt grants, turn bitacora) is refused unless ``force=True``;
+    with ``force`` those rows are deleted in the same transaction and the audit
+    event in ``quest_deletions`` records the deleted ids.
+
+    Args:
+        quest_id: Local checklist-item (quest) id.
+        confirm: Must be True; guards against accidental deletion.
+        reason: Non-empty justification, stored in the audit ledger.
+        force: Delete even when the quest has traceability rows.
+        requested_by: Who requested the deletion (audit ``who``).
+
+    Returns:
+        JSON {status, quest_id, mission_id, text, deleted, deleted_ids,
+        audit_id} or an explicit error. When Deck was written but the replica
+        could not be refreshed, returns ``replica_refresh_failed`` with
+        ``deck_written: true``.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to delete",
+                "code": "confirmation_required",
+                "quest_id": quest_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": "reason required: quest_delete needs a non-empty reason",
+                "code": "reason_required",
+                "quest_id": quest_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    quest = persistence.get_checklist_item_by_id(quest_id)
+    if not quest:
+        return json.dumps(
+            {"error": f"Quest {quest_id} not found", "quest_id": quest_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    mission = persistence.get_mission(quest["mission_id"])
+    if not mission:
+        return json.dumps(
+            {
+                "error": f"Mission {quest['mission_id']} not found",
+                "quest_id": quest_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    history = persistence.quest_history_counts(quest_id)
+    if history and history.get("has_history") and not force:
+        return json.dumps(
+            {
+                "error": (
+                    "quest has traceability rows (intentos/grants/bitacora); "
+                    "pass force=true to delete it and its history"
+                ),
+                "code": "quest_has_history",
+                "quest_id": quest_id,
+                "mission_id": mission["id"],
+                "history": {
+                    "intentos": history["intentos"],
+                    "attempt_grants": history["grants"],
+                    "turn_bitacora": history["bitacora"],
+                },
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err, "deck_written": False}, ensure_ascii=False)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    deck_position = quest["item_index"]
+    record, err = deck_bridge.delete_quest_record(
+        board_id, stack_id, mission["deck_task_id"], deck_position
+    )
+    if record is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Prove the identity invariant against the acknowledged card BEFORE touching
+    # the replica: the survivors, in order, must be exactly the quests Deck kept.
+    replica_before = persistence.list_checklist_items(mission["id"])
+    expected_pairs = [
+        _quest_pair(q) for q in replica_before if q["id"] != quest_id
+    ]
+    deck_pairs = [_quest_pair(q) for q in record.get("quests") or []]
+    if expected_pairs != deck_pairs:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} deleted"
+            ),
+            mission_id=mission["id"],
+            refresh_error=(
+                "replica and Deck disagree about the surviving quests; "
+                "the replica was not modified"
+            ),
+            extra={"quest_id": quest_id},
+        )
+
+    try:
+        result = persistence.delete_checklist_item(
+            quest_id,
+            force=force,
+            reason=reason,
+            requested_by=requested_by,
+            description=record.get("description"),
+        )
+    except Exception as exc:  # reported, never hidden
+        logger.warning("quest_delete replica update failed: %s", exc)
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} deleted"
+            ),
+            mission_id=mission["id"],
+            refresh_error=str(exc),
+            extra={"quest_id": quest_id},
+        )
+
+    if result is None or result.get("refused"):
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} deleted"
+            ),
+            mission_id=mission["id"],
+            refresh_error="replica quest row not found after the Deck write",
+            extra={"quest_id": quest_id},
+        )
+
+    return json.dumps(
+        {
+            "status": "deleted",
+            "quest_id": result["quest_id"],
+            "mission_id": result["mission_id"],
+            "text": result["text"],
+            "deleted": {
+                "intentos": result["intentos_deleted"],
+                "attempt_grants": result["grants_deleted"],
+                "turn_bitacora": result["bitacora_deleted"],
+            },
+            "deleted_ids": result["deleted_ids"],
+            "audit_id": result["audit_id"],
+            "forced": result["forced"],
+            "deck_written": True,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_reorder(mission_id: int, ordered_ids: list[int]) -> str:
+    """Reorder a mission's whole checklist to exactly ``ordered_ids``.
+
+    ``ordered_ids`` must be exactly the mission's quest set: no duplicates,
+    nothing missing, nothing from another mission. Any difference fails before
+    any Deck or replica mutation. Ids move with their text and state — the pair
+    ``(id, text)`` is invariant; only the order changes.
+
+    One Deck read and one description write, then one replica transaction.
+
+    Args:
+        mission_id: Local mission id.
+        ordered_ids: Quest ids in the exact desired order.
+
+    Returns:
+        JSON {status, mission_id, ordered_ids, quests} or an explicit error.
+        When Deck was written but the replica could not be refreshed, returns
+        ``replica_refresh_failed`` with ``deck_written: true``.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found", "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    quests = persistence.list_checklist_items(mission_id)
+    current_ids = [q["id"] for q in quests]
+    requested = list(ordered_ids or [])
+
+    duplicates = sorted({i for i in requested if requested.count(i) > 1})
+    missing = sorted(set(current_ids) - set(requested))
+    extra = sorted(set(requested) - set(current_ids))
+    if duplicates or missing or extra or len(requested) != len(current_ids):
+        return json.dumps(
+            {
+                "error": (
+                    "ordered_ids must be exactly the mission's quest set: "
+                    f"missing={missing}, extra={extra}, duplicates={duplicates}"
+                ),
+                "code": "quest_reorder_mismatch",
+                "mission_id": mission_id,
+                "missing": missing,
+                "extra": extra,
+                "duplicates": duplicates,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err, "deck_written": False}, ensure_ascii=False)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    by_id = {q["id"]: q for q in quests}
+    positions = [by_id[quest_id]["item_index"] for quest_id in requested]
+
+    record, err = deck_bridge.reorder_quests_record(
+        board_id, stack_id, mission["deck_task_id"], positions
+    )
+    if record is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Same invariant as delete: the requested order must be the order Deck kept,
+    # otherwise the replica is stale and must not be rewritten over it.
+    expected_pairs = [_quest_pair(by_id[quest_id]) for quest_id in requested]
+    deck_pairs = [_quest_pair(q) for q in record.get("quests") or []]
+    if expected_pairs != deck_pairs:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests reordered"
+            ),
+            mission_id=mission_id,
+            refresh_error=(
+                "replica and Deck disagree about the reordered quests; "
+                "the replica was not modified"
+            ),
+            extra={"ordered_ids": requested},
+        )
+
+    try:
+        result = persistence.reorder_checklist_items(
+            mission_id, requested, description=record.get("description")
+        )
+    except Exception as exc:  # reported, never hidden
+        logger.warning("quest_reorder replica update failed: %s", exc)
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests reordered"
+            ),
+            mission_id=mission_id,
+            refresh_error=str(exc),
+            extra={"ordered_ids": requested},
+        )
+
+    if result is None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests reordered"
+            ),
+            mission_id=mission_id,
+            refresh_error="mission row not found after the Deck write",
+            extra={"ordered_ids": requested},
+        )
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "mission_id": mission_id,
+            "ordered_ids": result["ordered_ids"],
+            "quests": result["quests"],
+            "deck_written": True,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 @app.tool()
 def begin_turn(
     session_id: str,
