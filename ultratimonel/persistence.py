@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 SCHEMA_DESCRIPTION = (
-    "v8: mission_deletions audit ledger (replica-only mission_delete)"
+    "v9: quest_identity_migrations audit ledger (marker identity migration)"
 )
 
 # v6 tables — shared by the fresh-DB DDL and the v5→v6 migration (additive, D9).
@@ -160,6 +160,29 @@ DDL_V8_TABLES = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_quest_deletions_mission"
     " ON quest_deletions(mission_id)",
+]
+
+# v9 table — append-only audit of quest identity migrations (card #218, quest 4).
+#
+# ``quest_deletions`` describes removals and ``mission_deletions`` whole
+# missions; neither can record "this mission's quest lines gained their stable
+# ids". The migration ledger therefore follows the same pattern: its own table,
+# written in the same transaction as the mission description refresh.
+DDL_V9_TABLES = [
+    """CREATE TABLE IF NOT EXISTS quest_identity_migrations (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id        INTEGER NOT NULL,
+        deck_task_id      INTEGER,
+        project           TEXT,
+        reason            TEXT NOT NULL,
+        requested_by      TEXT NOT NULL,
+        quests_migrated   INTEGER NOT NULL DEFAULT 0,
+        quest_ids         TEXT,
+        migrated_ids      TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_quest_identity_migrations_mission"
+    " ON quest_identity_migrations(mission_id)",
 ]
 
 DDL_V2 = [
@@ -396,6 +419,27 @@ def _migrate_v7_to_v8(conn) -> None:
     logger.info("Migrated DB v7→v8: added mission_deletions audit ledger")
 
 
+def _migrate_v8_to_v9(conn) -> None:
+    """v8→v9: add the quest identity migration audit ledger.
+
+    Additive only: ``quest_identity_migrations`` plus its index, no data
+    rewrite and no destructive DDL. ``CREATE TABLE IF NOT EXISTS`` plus
+    ``INSERT OR IGNORE`` make replay a no-op, and older code keeps working
+    against the extra table (SCHEMA_AHEAD).
+    """
+    for stmt in DDL_V9_TABLES:
+        conn.execute(stmt)
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (version, description) VALUES (?, ?)",
+        (
+            9,
+            "v9: quest_identity_migrations audit ledger "
+            "(marker identity migration)",
+        ),
+    )
+    logger.info("Migrated DB v8→v9: added quest identity migration ledger")
+
+
 def _is_v1_style_missions_table(conn) -> bool:
     """Check if the missions table has the old schema (session_id column)."""
     cursor = conn.execute("PRAGMA table_info(missions)")
@@ -613,6 +657,9 @@ class Persistence:
                     # v8 audit ledger (additive)
                     for stmt in DDL_V8_TABLES:
                         conn.execute(stmt)
+                    # v9 quest identity migration ledger (additive)
+                    for stmt in DDL_V9_TABLES:
+                        conn.execute(stmt)
                     conn.execute(
                         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                         (SCHEMA_VERSION, SCHEMA_DESCRIPTION),
@@ -635,7 +682,8 @@ class Persistence:
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v1→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v1→v9: %s", self._db_path)
                 elif current_ver == 2:
                     # Migration v2 → v3: add gates_detail column to intentos
                     try:
@@ -654,7 +702,8 @@ class Persistence:
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v2→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v2→v9: %s", self._db_path)
                 elif current_ver == 3:
                     # Migration v3 → v4 → v5 → v6 → v7
                     _migrate_v3_to_v4(conn)
@@ -662,29 +711,38 @@ class Persistence:
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v3→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v3→v9: %s", self._db_path)
                 elif current_ver == 4:
                     # Migration v4 → v5 → v6 → v7
                     _migrate_v4_to_v5(conn)
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v4→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v4→v9: %s", self._db_path)
                 elif current_ver == 5:
                     # Migration v5 → v6 → v7
                     _migrate_v5_to_v6(conn)
                     _migrate_v6_to_v7(conn)
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v5→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v5→v9: %s", self._db_path)
                 elif current_ver == 6:
                     # Migration v6 → v7 → v8: honest intento statuses + ledger
                     _migrate_v6_to_v7(conn)
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v6→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v6→v9: %s", self._db_path)
                 elif current_ver == 7:
-                    # Migration v7 → v8: mission_deletions audit ledger
+                    # Migration v7 → v8 → v9: deletion + migration ledgers
                     _migrate_v7_to_v8(conn)
-                    logger.info("Migrated DB v7→v8: %s", self._db_path)
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v7→v9: %s", self._db_path)
+                elif current_ver == 8:
+                    # Migration v8 → v9: quest identity migration ledger
+                    _migrate_v8_to_v9(conn)
+                    logger.info("Migrated DB v8→v9: %s", self._db_path)
                 elif current_ver == SCHEMA_VERSION:
                     # Already current — ensure all tables exist
                     for stmt in DDL_V2:
@@ -712,6 +770,9 @@ class Persistence:
                     _migrate_v6_to_v7(conn)
                     # Ensure the v8 audit ledger exists on a current DB.
                     for stmt in DDL_V8_TABLES:
+                        conn.execute(stmt)
+                    # Ensure the v9 quest identity migration ledger exists.
+                    for stmt in DDL_V9_TABLES:
                         conn.execute(stmt)
                     logger.debug("DB schema up to date (v%s)", SCHEMA_VERSION)
 
@@ -1262,6 +1323,62 @@ class Persistence:
                 ).fetchone()
                 return row["id"] if row else 0
 
+    def next_checklist_item_id(self) -> int:
+        """Return the next AUTOINCREMENT id without inserting a row.
+
+        Used by ``quest_add`` to compose the marker *before* the Deck write, so
+        the operation stays Deck-first and no phantom replica row can be left
+        behind by a failed write. Reading ``sqlite_sequence`` (plus the current
+        max id as a safety net) keeps the id unique even after deletions.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'checklist_items'"
+                ).fetchone()
+                seq = int(row["seq"]) if row and row["seq"] is not None else 0
+                max_row = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM checklist_items"
+                ).fetchone()
+                current_max = int(max_row[0]) if max_row else 0
+                return max(seq, current_max) + 1
+
+    def upsert_checklist_item_with_id(
+        self,
+        item_id: int,
+        mission_id: int,
+        item_index: int,
+        text: str,
+        done: int = 0,
+    ) -> int:
+        """Insert/update a checklist item at an explicit id (marker adoption).
+
+        ``quest_add`` composes the marker id before writing Deck; the replica
+        row is then created with that exact id so the marker and the replica
+        handle stay identical. Any stale row occupying the same
+        ``(mission_id, item_index)`` slot under a different id is dropped first
+        so the UNIQUE constraint cannot turn the adoption into a rename.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM checklist_items"
+                    " WHERE mission_id = ? AND item_index = ? AND id <> ?",
+                    (mission_id, item_index, item_id),
+                )
+                conn.execute(
+                    """INSERT INTO checklist_items
+                           (id, mission_id, item_index, text, done)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           mission_id = excluded.mission_id,
+                           item_index = excluded.item_index,
+                           text = excluded.text,
+                           done = excluded.done""",
+                    (item_id, mission_id, item_index, text, done),
+                )
+                return item_id
+
     def list_checklist_items(self, mission_id: int) -> list[dict]:
         with self._lock:
             with self._conn() as conn:
@@ -1621,6 +1738,69 @@ class Persistence:
                     "mission_id": mission_id,
                     "ordered_ids": ids,
                     "quests": [dict(q) for q in quests],
+                }
+
+    def migrate_quest_markers(
+        self,
+        mission_id: int,
+        *,
+        description: str,
+        reason: str,
+        requested_by: str = "hermes",
+        quest_ids: Optional[list[int]] = None,
+        migrated_ids: Optional[list[int]] = None,
+    ) -> Optional[dict]:
+        """Refresh the replicated description and audit a marker migration.
+
+        The Deck write already happened (the caller owns the bridge). This
+        single transaction stores the exact description that Deck acknowledged
+        and appends one ``quest_identity_migrations`` audit row, so a migration
+        can never be recorded without its replica refresh or vice versa.
+
+        Returns ``{"mission_id", "audit_id", "quests_migrated",
+        "migrated_ids", "quest_ids"}`` or ``None`` when the mission is unknown.
+        Raises ``ValueError`` when ``reason`` is empty.
+        """
+        if not (reason or "").strip():
+            raise ValueError("quest_migrate_identity requires a non-empty reason")
+        actor = (requested_by or "").strip() or "unknown"
+        ids = [int(i) for i in (quest_ids or [])]
+        added = [int(i) for i in (migrated_ids or [])]
+
+        with self._lock:
+            with self._conn() as conn:
+                mission = conn.execute(
+                    "SELECT * FROM missions WHERE id = ?", (mission_id,)
+                ).fetchone()
+                if mission is None:
+                    return None
+
+                cursor = conn.execute(
+                    """INSERT INTO quest_identity_migrations
+                           (mission_id, deck_task_id, project, reason,
+                            requested_by, quests_migrated, quest_ids,
+                            migrated_ids)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        mission_id,
+                        mission["deck_task_id"],
+                        mission["project"],
+                        reason.strip(),
+                        actor,
+                        len(added),
+                        json.dumps(ids, ensure_ascii=False),
+                        json.dumps(added, ensure_ascii=False),
+                    ),
+                )
+                audit_id = cursor.lastrowid
+                self._refresh_mission_row(conn, mission_id, description)
+
+                return {
+                    "mission_id": mission_id,
+                    "audit_id": audit_id,
+                    "quests_migrated": len(added),
+                    "migrated_ids": added,
+                    "quest_ids": ids,
                 }
 
     def _refresh_mission_row(

@@ -180,7 +180,7 @@ class TestUpdateDescription:
         assert "- [ ] sneaky" not in new_description
         assert "* [x] also sneaky" not in new_description
         assert deck_bridge.extract_quests(new_description) == [
-            {"line_no": 2, "done": False, "text": "alpha"}
+            {"line_no": 2, "done": False, "text": "alpha", "quest_id": None}
         ]
 
     def test_no_quests_writes_clean_prose(self, fake_mcp):

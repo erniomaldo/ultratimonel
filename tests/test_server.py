@@ -2280,21 +2280,24 @@ class TestQuestWriteTools:
 
         mock_call.side_effect = call_side_effect
         mock_persist.upsert_checklist_item.side_effect = upsert_side_effect
+        mock_persist.next_checklist_item_id.return_value = 88
+        mock_persist.upsert_checklist_item_with_id.return_value = 88
 
         result = json.loads(quest_add(5, "two"))
 
         assert result == {
-            "quest_id": 77,
+            "quest_id": 88,
             "mission_id": 5,
             "title": "two",
             "done": False,
+            "identity": "marker",
         }
         assert events.index(("deck", "deck_update_card")) < events.index(
             ("replica", "upsert_checklist_item")
         )
-        # Deck line appended with done=false
+        # Deck line appended with done=false and the server-owned marker.
         update_params = mock_call.call_args_list[-1].args[2]
-        assert update_params["description"] == "- [ ] one\n- [ ] two"
+        assert update_params["description"] == "- [ ] one\n- [ ] two [](#q:88)"
         # replica row written with done=0
         assert mock_persist.upsert_checklist_item.call_args.kwargs["done"] == 0
 
@@ -2568,11 +2571,14 @@ class TestBeginTurnQuestGuard:
         deck_writes = []
         monkeypatch.setattr(
             srv.deck_bridge,
-            "complete_quest",
-            lambda board_id, stack_id, card_id, position: deck_writes.append(
-                (board_id, stack_id, card_id, position)
+            "complete_quest_identity",
+            lambda board_id, stack_id, card_id, quest_id, item_index: deck_writes.append(
+                (board_id, stack_id, card_id, quest_id, item_index)
             )
-            or (True, None),
+            or (
+                {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+                None,
+            ),
         )
 
         # Crossed: mission A + a quest that belongs to mission B.
@@ -2626,11 +2632,14 @@ class TestBeginTurnQuestGuard:
         deck_writes = []
         monkeypatch.setattr(
             srv.deck_bridge,
-            "complete_quest",
-            lambda board_id, stack_id, card_id, position: deck_writes.append(
-                (board_id, stack_id, card_id, position)
+            "complete_quest_identity",
+            lambda board_id, stack_id, card_id, quest_id, item_index: deck_writes.append(
+                (board_id, stack_id, card_id, quest_id, item_index)
             )
-            or (True, None),
+            or (
+                {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+                None,
+            ),
         )
 
         # Bypass: mission A + the quest that actually belongs to mission B.
@@ -2703,11 +2712,14 @@ class TestBeginTurnQuestGuard:
         )
         complete_calls = []
 
-        def fake_complete(board_id, stack_id, card_id, position):
-            complete_calls.append((board_id, stack_id, card_id, position))
-            return True, None
+        def fake_complete(board_id, stack_id, card_id, quest_id, item_index):
+            complete_calls.append((board_id, stack_id, card_id, quest_id, item_index))
+            return (
+                {"identity": "positional", "line_no": item_index, "quest_id": quest_id},
+                None,
+            )
 
-        monkeypatch.setattr(srv.deck_bridge, "complete_quest", fake_complete)
+        monkeypatch.setattr(srv.deck_bridge, "complete_quest_identity", fake_complete)
 
         begin = json.loads(
             srv.begin_turn("sess-1", "voy-rojo", mission_id, quest_id=quest_id)
@@ -2721,7 +2733,7 @@ class TestBeginTurnQuestGuard:
 
         # (b) end_turn drives the Deck write for the matching item_index.
         end = json.loads(srv.end_turn(intento_id))
-        assert complete_calls == [(21, 111, 189, 0)]
+        assert complete_calls == [(21, 111, 189, quest_id, 0)]
         assert end["quest_id"] == quest_id
         assert end["quest_done"] is True
 
@@ -2749,7 +2761,7 @@ class TestEndTurnQuestTransition:
             "status": "running",
         }
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2789,7 +2801,10 @@ class TestEndTurnQuestTransition:
         }
         mock_board.return_value = (21, None)
         mock_stack.return_value = (111, None)
-        mock_complete.return_value = (True, None)
+        mock_complete.return_value = (
+            {"identity": "positional", "line_no": 0, "quest_id": 10},
+            None,
+        )
 
         raw = end_turn(42)
         result = json.loads(raw)
@@ -2799,7 +2814,9 @@ class TestEndTurnQuestTransition:
         assert result["quest_id"] == 10
         assert result["quest_done"] is True
         # Deck write first, then replica refresh.
-        mock_complete.assert_called_once_with(21, 111, 189, 0)
+        mock_complete.assert_called_once_with(
+            21, 111, 189, quest_id=10, item_index=0
+        )
         mock_persistence.set_quest_done.assert_called_once_with(10, True)
         # Compact: raw result_data never leaks into the payload.
         assert "result_data" not in raw
@@ -2810,7 +2827,7 @@ class TestEndTurnQuestTransition:
             {"name": "1e", "state": "PASS", "mandatory": True},
         ]
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2850,7 +2867,7 @@ class TestEndTurnQuestTransition:
         # The intento is still finalized (never left running).
         mock_persistence.complete_intento_with_gates.assert_called_once()
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2887,7 +2904,7 @@ class TestEndTurnQuestTransition:
         mock_persistence.set_quest_done.assert_not_called()
         mock_persistence.complete_intento_with_gates.assert_called_once()
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.mcp_client.call_mcp_tool")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2992,11 +3009,14 @@ class TestEndTurnStatusVocabulary:
         writes = []
         monkeypatch.setattr(
             srv.deck_bridge,
-            "complete_quest",
-            lambda board_id, stack_id, card_id, position: writes.append(
-                (board_id, stack_id, card_id, position)
+            "complete_quest_identity",
+            lambda board_id, stack_id, card_id, quest_id, item_index: writes.append(
+                (board_id, stack_id, card_id, quest_id, item_index)
             )
-            or (True, None),
+            or (
+                {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+                None,
+            ),
         )
         return db, mission_id, quest_id, intento_id, writes
 
@@ -3144,11 +3164,14 @@ def _build_real_turn(tmp_path, monkeypatch, gates=None, db_name="card-218.db"):
     writes = []
     monkeypatch.setattr(
         srv.deck_bridge,
-        "complete_quest",
-        lambda board_id, stack_id, card_id, position: writes.append(
-            (board_id, stack_id, card_id, position)
+        "complete_quest_identity",
+        lambda board_id, stack_id, card_id, quest_id, item_index: writes.append(
+            (board_id, stack_id, card_id, quest_id, item_index)
         )
-        or (True, None),
+        or (
+            {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+            None,
+        ),
     )
     return db, mission_id, quest_id, intento_id, writes
 

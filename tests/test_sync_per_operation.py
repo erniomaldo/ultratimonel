@@ -122,7 +122,8 @@ def test_quest_add_refreshes_replica_from_the_acknowledged_card(
 
     # Replica read back from the DB, never trusted from the response payload.
     mission = db.get_mission(mission_id)
-    assert mission["description"] == deck.description == "- [ ] one\n- [ ] two"
+    assert mission["description"] == deck.description
+    assert mission["description"].endswith("[](#q:%d)" % result["quest_id"])
     assert mission["checklist_total"] == 2
     assert mission["checklist_done"] == 0
     replica = db.list_checklist_items(mission_id)
@@ -210,7 +211,7 @@ def test_quest_add_reports_deck_written_and_replica_stale(
     assert "sync_task" in result["error"]
 
     # Deck really changed; the replica really did not.
-    assert deck.description == "- [ ] one\n- [ ] two"
+    assert deck.description.startswith("- [ ] one\n- [ ] two [](#q:")
     assert db.get_mission(mission_id)["description"] == "- [ ] one"
 
 
@@ -239,11 +240,14 @@ def _build_turn(tmp_path, monkeypatch, db_name="end-turn-per-op.db"):
     writes = []
     monkeypatch.setattr(
         srv.deck_bridge,
-        "complete_quest",
-        lambda board_id, stack_id, card_id, position: writes.append(
-            (board_id, stack_id, card_id, position)
+        "complete_quest_identity",
+        lambda board_id, stack_id, card_id, quest_id, item_index: writes.append(
+            (board_id, stack_id, card_id, quest_id, item_index)
         )
-        or (True, None),
+        or (
+            {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+            None,
+        ),
     )
     return srv, db, mission_id, quest_id, intento_id, writes
 
@@ -261,7 +265,7 @@ def test_end_turn_replica_failure_is_not_a_clean_closure(tmp_path, monkeypatch):
     result = json.loads(srv.end_turn(intento_id))
 
     # Deck accepted the closure; the operation must NOT read as a clean close.
-    assert writes == [(21, 111, 189, 0)]
+    assert writes == [(21, 111, 189, quest_id, 0)]
     assert result["status"] == "error"
     assert result["code"] == "replica_refresh_failed"
     assert result["deck_written"] is True

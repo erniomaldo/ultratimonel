@@ -1607,6 +1607,8 @@ def _refresh_mission_replica_from_card(
     mission: dict,
     card: dict,
     status: str | None = None,
+    *,
+    adopt_ids: dict[int, int] | None = None,
 ) -> tuple[int, dict[int, int], str | None]:
     """Refresh ONE mission's replica from an authoritative post-write card.
 
@@ -1620,6 +1622,10 @@ def _refresh_mission_replica_from_card(
     are refreshed from that payload, and replica quests Deck no longer has are
     pruned.
 
+    ``adopt_ids`` maps an ``item_index`` to the id the server already composed
+    into that line's marker (``quest_add``). Those rows are written at the
+    exact id so the marker and the replica handle can never diverge.
+
     Returns ``(mission_id, {item_index: replica_quest_id}, err)``. On success
     ``err`` is ``None``; when the local refresh fails it returns the error
     string so the caller can report "Deck written, replica stale" instead of a
@@ -1631,6 +1637,7 @@ def _refresh_mission_replica_from_card(
     checklist_total = len(quests)
     checklist_done = sum(1 for quest in quests if quest.get("done"))
     replicated_status = status or mission.get("status", "pendiente") or "pendiente"
+    forced_ids = adopt_ids or {}
 
     try:
         mission_id = int(mission.get("id") or 0)
@@ -1658,12 +1665,22 @@ def _refresh_mission_replica_from_card(
 
         persistence.delete_checklist_items_beyond(mission_id, checklist_total)
         for idx, quest in enumerate(quests):
-            quest_id = persistence.upsert_checklist_item(
-                mission_id=mission_id,
-                item_index=idx,
-                text=quest["text"],
-                done=1 if quest["done"] else 0,
-            )
+            forced_id = forced_ids.get(idx)
+            if forced_id is not None:
+                quest_id = persistence.upsert_checklist_item_with_id(
+                    item_id=forced_id,
+                    mission_id=mission_id,
+                    item_index=idx,
+                    text=quest["text"],
+                    done=1 if quest["done"] else 0,
+                )
+            else:
+                quest_id = persistence.upsert_checklist_item(
+                    mission_id=mission_id,
+                    item_index=idx,
+                    text=quest["text"],
+                    done=1 if quest["done"] else 0,
+                )
             quest_ids[idx] = quest_id
     except Exception as exc:  # reported to the caller, never hidden
         logger.warning("replica refresh from Deck card failed: %s", exc)
@@ -2086,8 +2103,42 @@ def quest_add(mission_id: int, title: str) -> str:
             default=str,
         )
 
+    # The marker id is composed by the server (never by the model) and must be
+    # the same id the replica row will use. The id is allocated read-only, so
+    # a failed Deck write leaves the replica untouched.
+    clean_title = deck_bridge.sanitize_quest_text(title)
+    if clean_title is None:
+        raw_title = title or ""
+        code = (
+            "quest_text_multiline"
+            if ("\n" in raw_title or "\r" in raw_title)
+            else "quest_text_empty"
+        )
+        return json.dumps(
+            {
+                "error": "Quest text must be a single non-empty line",
+                "code": code,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    try:
+        new_quest_id = persistence.next_checklist_item_id()
+    except Exception as exc:
+        return json.dumps(
+            {"error": f"Cannot allocate quest id: {exc}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
     record, err = deck_bridge.append_quest_record(
-        board_id, stack_id, mission["deck_task_id"], title
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        clean_title,
+        quest_id=new_quest_id,
     )
     if record is None:
         return json.dumps(
@@ -2098,10 +2149,10 @@ def quest_add(mission_id: int, title: str) -> str:
 
     position = record["position"]
     _replica_id, quest_ids, refresh_error = _refresh_mission_replica_from_card(
-        mission, record
+        mission, record, adopt_ids={position: new_quest_id}
     )
-    if refresh_error is None and not quest_ids.get(position):
-        refresh_error = "appended quest row not found in the replica"
+    if refresh_error is None and quest_ids.get(position) != new_quest_id:
+        refresh_error = "appended quest row does not use the composed marker id"
     if refresh_error is not None:
         return _deck_write_refresh_failure(
             deck_written_what=(
@@ -2110,16 +2161,17 @@ def quest_add(mission_id: int, title: str) -> str:
             ),
             mission_id=mission_id,
             refresh_error=refresh_error,
-            extra={"mission_id": mission_id, "title": title, "position": position},
+            extra={"mission_id": mission_id, "title": clean_title, "position": position},
         )
 
-    quest_id = quest_ids[position]
+    quest_id = new_quest_id
     return json.dumps(
         {
             "quest_id": quest_id,
             "mission_id": mission_id,
-            "title": title,
+            "title": clean_title,
             "done": False,
+            "identity": "marker",
         },
         ensure_ascii=False,
         default=str,
@@ -2331,10 +2383,26 @@ def quest_delete(
         )
 
     deck_position = quest["item_index"]
-    record, err = deck_bridge.delete_quest_record(
-        board_id, stack_id, mission["deck_task_id"], deck_position
+    record, err = deck_bridge.delete_quest_record_by_marker(
+        board_id, stack_id, mission["deck_task_id"], quest_id
     )
     if record is None:
+        if err == deck_bridge.ERR_LEGACY_IDENTITY:
+            return json.dumps(
+                {
+                    "error": (
+                        "Mission has no stable quest markers (legacy or mixed "
+                        "checklist); quest_delete requires marker identity. "
+                        "Run quest_migrate_identity(mission_id) first."
+                    ),
+                    "code": "legacy_identity",
+                    "quest_id": quest_id,
+                    "mission_id": mission["id"],
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
         return json.dumps(
             {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
@@ -2407,6 +2475,7 @@ def quest_delete(
             "deleted_ids": result["deleted_ids"],
             "audit_id": result["audit_id"],
             "forced": result["forced"],
+            "identity": "marker",
             "deck_written": True,
         },
         ensure_ascii=False,
@@ -2480,12 +2549,26 @@ def quest_reorder(mission_id: int, ordered_ids: list[int]) -> str:
         )
 
     by_id = {q["id"]: q for q in quests}
-    positions = [by_id[quest_id]["item_index"] for quest_id in requested]
 
-    record, err = deck_bridge.reorder_quests_record(
-        board_id, stack_id, mission["deck_task_id"], positions
+    record, err = deck_bridge.reorder_quests_record_by_marker(
+        board_id, stack_id, mission["deck_task_id"], requested
     )
     if record is None:
+        if err == deck_bridge.ERR_LEGACY_IDENTITY:
+            return json.dumps(
+                {
+                    "error": (
+                        "Mission has no stable quest markers (legacy or mixed "
+                        "checklist); quest_reorder requires marker identity. "
+                        "Run quest_migrate_identity(mission_id) first."
+                    ),
+                    "code": "legacy_identity",
+                    "mission_id": mission_id,
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
         return json.dumps(
             {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
@@ -2540,7 +2623,187 @@ def quest_reorder(mission_id: int, ordered_ids: list[int]) -> str:
             "mission_id": mission_id,
             "ordered_ids": result["ordered_ids"],
             "quests": result["quests"],
+            "identity": "marker",
             "deck_written": True,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_migrate_identity(
+    mission_id: int,
+    confirm: bool = False,
+    reason: str = "",
+    requested_by: str = "hermes",
+) -> str:
+    """Migrate ONE mission's existing quests to stable marker identity.
+
+    Explicit and versioned: it rewrites only the requested mission's Deck
+    description, adding a ``[](#q:{id})`` marker to each quest line while
+    preserving the id, text, order, bullet and done state of every quest. It
+    never generates new ids (that would rename exactly what it protects) and is
+    idempotent: a second run adds no marker and changes no id.
+
+    Both ``confirm=True`` and a non-empty ``reason`` are required and are
+    validated before any Deck read or write. The audit row is written to the
+    ``quest_identity_migrations`` ledger in the same transaction as the replica
+    description refresh.
+
+    Args:
+        mission_id: Local mission id (one mission, never a project sweep).
+        confirm: Must be True; guards against accidental rewrites.
+        reason: Non-empty justification, stored in the audit ledger.
+        requested_by: Who requested the migration (audit ``who``).
+
+    Returns:
+        JSON {status, mission_id, deck_written, migrated_ids, quest_ids,
+        audit_id, quests} or an explicit error. When Deck was written but the
+        replica could not be refreshed, returns ``replica_refresh_failed`` with
+        ``deck_written: true``.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to migrate",
+                "code": "confirmation_required",
+                "mission_id": mission_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": (
+                    "reason required: quest_migrate_identity needs a "
+                    "non-empty reason"
+                ),
+                "code": "reason_required",
+                "mission_id": mission_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found", "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps(
+            {"error": err, "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {
+                "error": f"Cannot resolve Deck stack: {err}",
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    replica_quests = persistence.list_checklist_items(mission_id)
+    ids_by_position = [int(quest["id"]) for quest in replica_quests]
+
+    record, err = deck_bridge.migrate_description_to_markers(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        ids_by_position,
+    )
+    if record is None:
+        return json.dumps(
+            {
+                "error": f"Cannot migrate quest identity: {err}",
+                "code": err if isinstance(err, str) else "migration_failed",
+                "mission_id": mission_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if record["status"] == "already_migrated":
+        return json.dumps(
+            {
+                "status": "already_migrated",
+                "mission_id": mission_id,
+                "deck_written": False,
+                "migrated_ids": [],
+                "quest_ids": record["quest_ids"],
+                "quests": [
+                    {
+                        "quest_id": quest["quest_id"],
+                        "text": quest["text"],
+                        "done": quest["done"],
+                    }
+                    for quest in record["quests"]
+                ],
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    try:
+        result = persistence.migrate_quest_markers(
+            mission_id,
+            description=record["description"],
+            reason=reason,
+            requested_by=requested_by,
+            quest_ids=record["quest_ids"],
+            migrated_ids=record["migrated_ids"],
+        )
+    except Exception as exc:  # reported, never hidden
+        logger.warning("quest_migrate_identity replica update failed: %s", exc)
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests migrated to markers"
+            ),
+            mission_id=mission_id,
+            refresh_error=str(exc),
+            extra={"migrated_ids": record["migrated_ids"]},
+        )
+
+    if result is None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests migrated to markers"
+            ),
+            mission_id=mission_id,
+            refresh_error="mission row not found after the Deck write",
+            extra={"migrated_ids": record["migrated_ids"]},
+        )
+
+    return json.dumps(
+        {
+            "status": "migrated",
+            "mission_id": mission_id,
+            "deck_written": True,
+            "migrated_ids": result["migrated_ids"],
+            "quest_ids": result["quest_ids"],
+            "audit_id": result["audit_id"],
+            "quests": [
+                {
+                    "quest_id": quest["quest_id"],
+                    "text": quest["text"],
+                    "done": quest["done"],
+                }
+                for quest in record["quests"]
+            ],
         },
         ensure_ascii=False,
         default=str,
@@ -2813,6 +3076,7 @@ def _complete_quest_for_intento(intento: dict) -> dict:
         "deck_written": False,
         "reason": "not_resolved",
         "refresh_error": None,
+        "identity": None,
     }
     mission_id = intento.get("mission_id") or 0
     quest_id = intento.get("checklist_item_id") or 0
@@ -2866,17 +3130,29 @@ def _complete_quest_for_intento(intento: dict) -> dict:
         result["reason"] = "stack_unresolved"
         return result
 
-    ok, err = deck_bridge.complete_quest(
-        board_id, stack_id, mission["deck_task_id"], quest["item_index"]
+    closure, err = deck_bridge.complete_quest_identity(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        quest_id=quest_id,
+        item_index=quest["item_index"],
     )
-    if not ok:
-        logger.warning("Quest closure: Deck write failed for quest #%s: %s", quest_id, err)
-        result["reason"] = "deck_write_failed"
+    if closure is None:
+        if err == deck_bridge.ERR_MARKER_NOT_FOUND:
+            result["reason"] = "marker_not_found"
+        elif err == deck_bridge.ERR_MARKER_DUPLICATE:
+            result["reason"] = "identity_mismatch"
+        else:
+            result["reason"] = "deck_write_failed"
+        logger.warning(
+            "Quest closure: Deck write failed for quest #%s: %s", quest_id, err
+        )
         return result
 
     # Deck acknowledged the write: from here on any local failure means the
     # replica is behind Deck and the operation failed even though Deck changed.
     result["deck_written"] = True
+    result["identity"] = closure["identity"]
     try:
         if persistence.set_quest_done(quest_id, True) is False:
             raise RuntimeError("quest row not found in the replica")
@@ -3109,6 +3385,7 @@ def end_turn(
                 else "not_success"
             ),
             "refresh_error": None,
+            "identity": None,
         }
 
     quest_id_closed = closure["quest_id"]
@@ -3151,6 +3428,7 @@ def end_turn(
         "quest_id": quest_id_closed,
         "quest_done": quest_is_done,
         "quest_done_reason": closure["reason"],
+        "identity": closure.get("identity"),
         "deck_written": closure["deck_written"],
     }
 

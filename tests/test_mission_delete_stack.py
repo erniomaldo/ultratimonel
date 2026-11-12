@@ -284,7 +284,7 @@ class TestMissionDeletionsMigration:
             persistence.close()
 
     def test_downgrade_v8_db_opens_under_v7_code(self):
-        """A v8 file stays readable/usable by v7-era code (SCHEMA_AHEAD).
+        """A newer file stays readable/usable by v7-era code (SCHEMA_AHEAD).
 
         The v7 runtime is simulated by pinning ``SCHEMA_VERSION`` back to 7, so
         the unknown newer version falls through every migration branch exactly
@@ -312,7 +312,7 @@ class TestMissionDeletionsMigration:
                     with v7_runtime._conn() as conn:
                         assert conn.execute(
                             "SELECT MAX(version) FROM schema_version"
-                        ).fetchone()[0] == 8
+                        ).fetchone()[0] >= 8
                 finally:
                     v7_runtime.close()
         finally:

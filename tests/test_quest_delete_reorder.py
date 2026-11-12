@@ -3,9 +3,10 @@
 The tests use a real temporary SQLite replica and a simulated Deck bridge: no
 live MCP call, no real card is written.
 
-The central invariant is the ``(id, text)`` pair: deleting or reordering must
-never rename a surviving quest, even though Deck quest lines carry no id and the
-replica's upsert key is positional.
+Quest identity now lives in the line's marker (``- [ ] text [](#q:{id})``).
+Delete and reorder operate by that marker and refuse a legacy or mixed
+checklist (``legacy_identity``) instead of falling back to a position that
+would silently rename the survivors.
 """
 
 import json
@@ -72,6 +73,15 @@ def _make_replica(tmp_path, monkeypatch, description, quests):
     return srv, db, mission_id
 
 
+def _marked(db, mission_id):
+    """Build the marked Deck description for the replica's current quests."""
+    lines = []
+    for quest in db.list_checklist_items(mission_id):
+        state = "x" if quest["done"] else " "
+        lines.append(f"- [{state}] {quest['text']} [](#q:{quest['id']})")
+    return "\n".join(lines)
+
+
 @pytest.fixture
 def project_maps():
     with patch("ultratimonel.context_extractor.get_project_maps") as mock_maps:
@@ -91,12 +101,13 @@ def _pairs(db, mission_id):
 
 def test_delete_requires_confirm_and_reason(tmp_path, monkeypatch, project_maps):
     srv, db, mission_id = _make_replica(
-        tmp_path, monkeypatch, "- [ ] one\n- [ ] two", [("one", 0), ("two", 0)]
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
     )
-    deck = FakeDeck(description="- [ ] one\n- [ ] two")
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     quest = db.list_checklist_items(mission_id)[0]
     before = _pairs(db, mission_id)
+    original_description = deck.description
 
     no_confirm = json.loads(srv.quest_delete(quest["id"], reason="cleanup"))
     no_reason = json.loads(srv.quest_delete(quest["id"], confirm=True))
@@ -105,7 +116,7 @@ def test_delete_requires_confirm_and_reason(tmp_path, monkeypatch, project_maps)
         assert "error" in result
         assert result["deck_written"] is False
     assert deck.calls == []
-    assert deck.description == "- [ ] one\n- [ ] two"
+    assert deck.description == original_description
     assert _pairs(db, mission_id) == before
 
 
@@ -115,18 +126,15 @@ def test_delete_requires_confirm_and_reason(tmp_path, monkeypatch, project_maps)
 def test_delete_removes_only_target_and_keeps_surviving_ids(
     tmp_path, monkeypatch, project_maps
 ):
-    description = "- [ ] one\n- [ ] two\n- [x] three"
     srv, db, mission_id = _make_replica(
-        tmp_path,
-        monkeypatch,
-        description,
-        [("one", 0), ("two", 0), ("three", 1)],
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0), ("three", 1)]
     )
-    deck = FakeDeck(description=description)
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     quests = db.list_checklist_items(mission_id)
     target = quests[1]
     before = _pairs(db, mission_id)
+    by_text = {q["text"]: q["id"] for q in quests}
 
     result = json.loads(
         srv.quest_delete(target["id"], confirm=True, reason="recompose checklist")
@@ -134,8 +142,12 @@ def test_delete_removes_only_target_and_keeps_surviving_ids(
 
     assert result["status"] == "deleted"
     assert result["quest_id"] == target["id"]
+    assert result["identity"] == "marker"
     assert result["deck_written"] is True
-    assert deck.description == "- [ ] one\n- [x] three"
+    assert deck.description == (
+        f"- [ ] one [](#q:{by_text['one']})\n"
+        f"- [x] three [](#q:{by_text['three']})"
+    )
     after = _pairs(db, mission_id)
     # Same ids and texts for every survivor, only item_index shifts.
     assert [(p["id"], p["text"]) for p in after] == [
@@ -147,9 +159,9 @@ def test_delete_removes_only_target_and_keeps_surviving_ids(
 
 def test_delete_last_quest_keeps_mission_alive(tmp_path, monkeypatch, project_maps):
     srv, db, mission_id = _make_replica(
-        tmp_path, monkeypatch, "- [ ] only", [("only", 0)]
+        tmp_path, monkeypatch, "", [("only", 0)]
     )
-    deck = FakeDeck(description="- [ ] only")
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     target = db.list_checklist_items(mission_id)[0]
 
@@ -172,9 +184,9 @@ def test_delete_with_history_is_refused_then_forced_with_audit(
     tmp_path, monkeypatch, project_maps
 ):
     srv, db, mission_id = _make_replica(
-        tmp_path, monkeypatch, "- [ ] one\n- [ ] two", [("one", 0), ("two", 0)]
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
     )
-    deck = FakeDeck(description="- [ ] one\n- [ ] two")
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     target = db.list_checklist_items(mission_id)[0]
     intento_id = db.create_intento("sess-1", "testproj", mission_id, target["id"])
@@ -241,27 +253,31 @@ def test_delete_with_history_is_refused_then_forced_with_audit(
 def test_reorder_applies_exact_order_with_same_pairs(
     tmp_path, monkeypatch, project_maps
 ):
-    description = "- [ ] one\n- [x] two\n- [ ] three"
     srv, db, mission_id = _make_replica(
-        tmp_path,
-        monkeypatch,
-        description,
-        [("one", 0), ("two", 1), ("three", 0)],
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 1), ("three", 0)]
     )
-    deck = FakeDeck(description=description)
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     quests = db.list_checklist_items(mission_id)
     before = {(q["id"], q["text"]) for q in quests}
+    by_id = {q["id"]: q for q in quests}
     ordered = [quests[2]["id"], quests[0]["id"], quests[1]["id"]]
 
     result = json.loads(srv.quest_reorder(mission_id, ordered))
 
     assert result["status"] == "ok"
     assert result["ordered_ids"] == ordered
+    assert result["identity"] == "marker"
     after = db.list_checklist_items(mission_id)
     assert [q["id"] for q in after] == ordered
     assert {(q["id"], q["text"]) for q in after} == before
-    assert deck.description == "- [ ] three\n- [ ] one\n- [x] two"
+    assert deck.description == "\n".join(
+        [
+            f"- [ ] three [](#q:{by_id[ordered[0]]['id']})",
+            f"- [ ] one [](#q:{by_id[ordered[1]]['id']})",
+            f"- [x] two [](#q:{by_id[ordered[2]]['id']})",
+        ]
+    )
     # One read + one write, never N calls.
     assert deck.tool_names() == ["deck_get_card", "deck_update_card"]
 
@@ -269,11 +285,10 @@ def test_reorder_applies_exact_order_with_same_pairs(
 def test_reorder_rejects_foreign_missing_and_duplicate_ids(
     tmp_path, monkeypatch, project_maps
 ):
-    description = "- [ ] one\n- [ ] two"
     srv, db, mission_id = _make_replica(
-        tmp_path, monkeypatch, description, [("one", 0), ("two", 0)]
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
     )
-    deck = FakeDeck(description=description)
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     quests = db.list_checklist_items(mission_id)
     before = _pairs(db, mission_id)
@@ -293,17 +308,113 @@ def test_reorder_rejects_foreign_missing_and_duplicate_ids(
     assert _pairs(db, mission_id) == before
 
 
+# ── legacy / mixed identity refusal ─────────────────────────────────────
+
+
+def test_delete_legacy_mission_refuses_with_legacy_identity(
+    tmp_path, monkeypatch, project_maps
+):
+    srv, db, mission_id = _make_replica(
+        tmp_path, monkeypatch, "- [ ] one\n- [ ] two", [("one", 0), ("two", 0)]
+    )
+    deck = FakeDeck(description="- [ ] one\n- [ ] two")
+    monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
+    target = db.list_checklist_items(mission_id)[0]
+    before = _pairs(db, mission_id)
+
+    result = json.loads(
+        srv.quest_delete(target["id"], confirm=True, reason="cleanup")
+    )
+
+    assert result["code"] == "legacy_identity"
+    assert result["deck_written"] is False
+    assert "quest_migrate_identity" in result["error"]
+    # The bridge reads to classify identity, but never writes.
+    assert "deck_update_card" not in deck.tool_names()
+    assert _pairs(db, mission_id) == before
+
+
+def test_reorder_legacy_mission_refuses_with_legacy_identity(
+    tmp_path, monkeypatch, project_maps
+):
+    srv, db, mission_id = _make_replica(
+        tmp_path, monkeypatch, "- [ ] one\n- [ ] two", [("one", 0), ("two", 0)]
+    )
+    deck = FakeDeck(description="- [ ] one\n- [ ] two")
+    monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
+    quests = db.list_checklist_items(mission_id)
+    ordered = [quests[1]["id"], quests[0]["id"]]
+    before = _pairs(db, mission_id)
+
+    result = json.loads(srv.quest_reorder(mission_id, ordered))
+
+    assert result["code"] == "legacy_identity"
+    assert result["deck_written"] is False
+    assert "quest_migrate_identity" in result["error"]
+    # The bridge reads to classify identity, but never writes.
+    assert "deck_update_card" not in deck.tool_names()
+    assert _pairs(db, mission_id) == before
+
+
+def test_delete_mixed_mission_refuses_with_legacy_identity(
+    tmp_path, monkeypatch, project_maps
+):
+    srv, db, mission_id = _make_replica(
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
+    )
+    quests = db.list_checklist_items(mission_id)
+    mixed = (
+        f"- [ ] one [](#q:{quests[0]['id']})\n"
+        "- [ ] two\n"
+    )
+    deck = FakeDeck(description=mixed)
+    monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
+    before = _pairs(db, mission_id)
+
+    result = json.loads(
+        srv.quest_delete(quests[0]["id"], confirm=True, reason="cleanup")
+    )
+
+    assert result["code"] == "legacy_identity"
+    assert result["deck_written"] is False
+    assert "deck_update_card" not in deck.tool_names()
+    assert _pairs(db, mission_id) == before
+
+
+def test_reorder_mixed_mission_refuses_with_legacy_identity(
+    tmp_path, monkeypatch, project_maps
+):
+    srv, db, mission_id = _make_replica(
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
+    )
+    quests = db.list_checklist_items(mission_id)
+    mixed = (
+        f"- [ ] one [](#q:{quests[0]['id']})\n"
+        "- [ ] two\n"
+    )
+    deck = FakeDeck(description=mixed)
+    monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
+    ordered = [quests[1]["id"], quests[0]["id"]]
+    before = _pairs(db, mission_id)
+
+    result = json.loads(srv.quest_reorder(mission_id, ordered))
+
+    assert result["code"] == "legacy_identity"
+    assert result["deck_written"] is False
+    assert "deck_update_card" not in deck.tool_names()
+    assert _pairs(db, mission_id) == before
+
+
 # ── fail-closed replica refresh ─────────────────────────────────────────
 
 
 def test_delete_refresh_failure_reports_deck_written(
     tmp_path, monkeypatch, project_maps
 ):
-    description = "- [ ] one\n- [ ] two"
     srv, db, mission_id = _make_replica(
-        tmp_path, monkeypatch, description, [("one", 0), ("two", 0)]
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
     )
-    deck = FakeDeck(description=description)
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     target = db.list_checklist_items(mission_id)[0]
 
@@ -321,18 +432,18 @@ def test_delete_refresh_failure_reports_deck_written(
     assert result["deck_written"] is True
     assert "disk full" in result["replica_refresh_error"]
     # Deck really changed; the replica really did not.
-    assert deck.description == "- [ ] two"
+    assert "two" in deck.description
+    assert "one" not in deck.description
     assert len(db.list_checklist_items(mission_id)) == 2
 
 
 def test_reorder_refresh_failure_reports_deck_written(
     tmp_path, monkeypatch, project_maps
 ):
-    description = "- [ ] one\n- [ ] two"
     srv, db, mission_id = _make_replica(
-        tmp_path, monkeypatch, description, [("one", 0), ("two", 0)]
+        tmp_path, monkeypatch, "", [("one", 0), ("two", 0)]
     )
-    deck = FakeDeck(description=description)
+    deck = FakeDeck(description=_marked(db, mission_id))
     monkeypatch.setattr("ultratimonel.mcp_client.call_mcp_tool", deck)
     quests = db.list_checklist_items(mission_id)
     ordered = [quests[1]["id"], quests[0]["id"]]
@@ -348,5 +459,5 @@ def test_reorder_refresh_failure_reports_deck_written(
     assert result["code"] == "replica_refresh_failed"
     assert result["deck_written"] is True
     assert "disk full" in result["replica_refresh_error"]
-    assert deck.description == "- [ ] two\n- [ ] one"
+    assert deck.description.split("\n")[0].startswith("- [ ] two")
     assert [q["text"] for q in db.list_checklist_items(mission_id)] == ["one", "two"]

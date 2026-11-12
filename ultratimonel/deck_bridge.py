@@ -45,13 +45,27 @@ __all__ = [
     "update_quest",
     "update_quest_record",
     "delete_quest_record",
+    "delete_quest_record_by_marker",
     "reorder_quests_record",
+    "reorder_quests_record_by_marker",
     "complete_quest",
+    "complete_quest_identity",
+    "migrate_description_to_markers",
+    "compose_quest_line",
+    "sanitize_quest_text",
+    "classify_identity",
     "extract_quests",
     "read_card",
     "ERR_EMPTY_DESCRIPTION",
     "ERR_QUESTS_MISSING",
     "ERR_QUEST_PRESERVATION_MISMATCH",
+    "ERR_LEGACY_IDENTITY",
+    "ERR_MARKER_NOT_FOUND",
+    "ERR_MARKER_DUPLICATE",
+    "IDENTITY_MARKER",
+    "IDENTITY_LEGACY",
+    "IDENTITY_MIXED",
+    "IDENTITY_EMPTY",
 ]
 
 _NEXTCLOUD = "nextcloud"
@@ -71,6 +85,27 @@ _CHECKBOX_RE = re.compile(r"^[-*]\s+\[([ xX])\]\s*(.*)$")
 # ``- [  ] x``, ``+ [x] x``) and indented markers. A strict superset of
 # ``_CHECKBOX_RE``.
 _QUEST_LIKE_RE = re.compile(r"^\s*[-*+]\s*\[[^\]]*\]", re.IGNORECASE)
+
+# Quest identity marker (card #218, quest 4). Deck renders markdown with
+# ``html: false``, so an HTML comment would be escaped and shown as text. An
+# empty link with a fragment is invisible in the rendered UI, survives the
+# ``href`` and does not navigate:
+#
+#     - [ ] text [](#q:11403)
+#
+# The marker is composed by the server, never by the model/agent, and it is
+# not part of the quest text returned to the user.
+_MARKER_RE = re.compile(r"\s*\[\]\(#q:(\d+)\)\s*$")
+_MARKER_TOKEN_RE = re.compile(r"\s*\[\]\(#q:\d+\)\s*")
+
+IDENTITY_MARKER = "marker"
+IDENTITY_LEGACY = "legacy"
+IDENTITY_MIXED = "mixed"
+IDENTITY_EMPTY = "empty"
+
+ERR_LEGACY_IDENTITY = "legacy_identity"
+ERR_MARKER_NOT_FOUND = "marker_not_found"
+ERR_MARKER_DUPLICATE = "marker_duplicate"
 
 # Fail-closed error codes for a suspicious description read (card #218,
 # forum #1). ``update_description`` refuses to write when the fresh read shows
@@ -232,26 +267,100 @@ def _single_line_quest_text(text: str) -> Optional[str]:
     return text.strip()
 
 
+def _split_marker(body: str) -> tuple[str, Optional[int]]:
+    """Split a trailing ``[](#q:{id})`` marker off a quest body.
+
+    ``body`` is the checkbox payload after the ``[ ]``/``[x]`` state. The
+    marker is only recognized at the very end of the line, so ordinary text
+    that happens to contain a marker-like fragment is left untouched.
+    """
+    match = _MARKER_RE.search(body)
+    if match is None:
+        return body, None
+    return body[: match.start()].rstrip(), int(match.group(1))
+
+
+def sanitize_quest_text(text: str) -> Optional[str]:
+    """Return server-safe single-line quest text, or ``None`` when invalid.
+
+    Rejects ``\\n``/``\\r`` (they could compose extra checkbox lines) and
+    strips any marker the caller tried to inject: the id is server-owned and
+    must never be forged by the model.
+    """
+    clean = _single_line_quest_text(text)
+    if clean is None:
+        return None
+    clean = _MARKER_TOKEN_RE.sub(" ", clean).strip()
+    clean = re.sub(r"[ \t]{2,}", " ", clean)
+    return clean or None
+
+
+def compose_quest_line(
+    text: str,
+    quest_id: int,
+    *,
+    done: bool = False,
+    bullet: str = "-",
+) -> str:
+    """Compose the canonical marked quest line.
+
+    Format: ``- [ ] text [](#q:{id})`` — the marker always trails the line,
+    separated by one space. Any marker already present in ``text`` is removed
+    so the server-owned id can never be forged or duplicated.
+    """
+    clean = sanitize_quest_text(text)
+    if clean is None:
+        raise ValueError("quest_text_invalid")
+    if bullet not in ("-", "*"):
+        bullet = "-"
+    state = "x" if done else " "
+    return f"{bullet} [{state}] {clean} [](#q:{int(quest_id)})"
+
+
 def extract_quests(description: str) -> list[dict[str, Any]]:
     """Parse markdown checkbox lines from a card description.
 
-    Returns ``[{"line_no", "done", "text"}, ...]`` in document order.
-    ``line_no`` is the 0-based index into ``description.split("\\n")`` so
+    Returns ``[{"line_no", "done", "text", "quest_id"}, ...]`` in document
+    order. ``line_no`` is the 0-based index into ``description.split("\\n")`` so
     callers can preserve the raw line byte-identically. ``done`` is a bool.
+    ``quest_id`` is the id carried by a trailing ``[](#q:{id})`` marker, or
+    ``None`` for a legacy line (which is never assigned an invented id).
+    ``text`` never includes the marker.
     """
     quests: list[dict[str, Any]] = []
     for line_no, raw in enumerate(description.split("\n")):
         match = _CHECKBOX_RE.match(raw.strip())
         if match is None:
             continue
+        text, quest_id = _split_marker(match.group(2).strip())
         quests.append(
             {
                 "line_no": line_no,
                 "done": match.group(1).lower() == "x",
-                "text": match.group(2).strip(),
+                "text": text,
+                "quest_id": quest_id,
             }
         )
     return quests
+
+
+def classify_identity(description: str) -> str:
+    """Classify a description's quest identity.
+
+    * ``marker``: at least one quest and every quest carries a marker.
+    * ``legacy``: quests exist and none carry a marker.
+    * ``mixed``: some quests carry a marker and some do not.
+    * ``empty``: the description has no quests.
+    """
+    quests = extract_quests(description)
+    if not quests:
+        return IDENTITY_EMPTY
+    marked = sum(1 for quest in quests if quest.get("quest_id") is not None)
+    if marked == len(quests):
+        return IDENTITY_MARKER
+    if marked == 0:
+        return IDENTITY_LEGACY
+    return IDENTITY_MIXED
 
 
 def clean_prose(prose: str) -> str:
@@ -482,8 +591,14 @@ def append_quest_record(
     stack_id: int,
     card_id: int,
     text: str,
+    *,
+    quest_id: Optional[int] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Append ``- [ ] text`` and return the authoritative post-write card.
+    """Append ``- [ ] text [](#q:{quest_id})`` and return the written card.
+
+    When ``quest_id`` is supplied (the normal server path) the new line carries
+    its stable identity marker. ``None`` keeps the unmarked form for internal
+    callers that explicitly want a legacy line.
 
     Returns ``({"position", "title", "description", "quests"}, None)``. The
     description is exactly what was written to Deck, so the caller refreshes
@@ -493,14 +608,19 @@ def append_quest_record(
     if card is None:
         return None, err
 
-    clean = _single_line_quest_text(text)
+    clean = sanitize_quest_text(text)
     if clean is None:
-        return None, "quest_text_multiline"
+        raw = text or ""
+        code = "quest_text_multiline" if ("\n" in raw or "\r" in raw) else "quest_text_empty"
+        return None, code
 
     title = card.get("title", "") or ""
     current = card.get("description", "") or ""
     position = len(extract_quests(current))
-    new_line = f"- [ ] {clean}"
+    if quest_id is None:
+        new_line = f"- [ ] {clean}"
+    else:
+        new_line = compose_quest_line(clean, quest_id)
 
     if current.strip():
         new_description = current.rstrip("\n") + "\n" + new_line
@@ -553,9 +673,11 @@ def update_quest_record(
     if lines is None:
         return None, err
 
-    clean = _single_line_quest_text(text)
+    clean = sanitize_quest_text(text)
     if clean is None:
-        return None, "quest_text_multiline"
+        raw = text or ""
+        code = "quest_text_multiline" if ("\n" in raw or "\r" in raw) else "quest_text_empty"
+        return None, code
 
     if position < 0 or position >= len(quests):
         return None, "quest_position_out_of_range"
@@ -563,7 +685,14 @@ def update_quest_record(
     target = quests[position]
     raw = lines[target["line_no"]]
     bullet = "*" if raw.strip().startswith("*") else "-"
-    lines[target["line_no"]] = f"{bullet} [ ] {clean}"
+    if target.get("quest_id") is not None:
+        # Keep the existing identity marker: a text edit must never rename the
+        # quest or turn a marked mission into a mixed one.
+        lines[target["line_no"]] = compose_quest_line(
+            clean, target["quest_id"], bullet=bullet
+        )
+    else:
+        lines[target["line_no"]] = f"{bullet} [ ] {clean}"
     new_description = "\n".join(lines)
     ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
     if ok is None:
@@ -605,6 +734,51 @@ def delete_quest_record(
         return None, werr
     return {
         "position": position,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
+def delete_quest_record_by_marker(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    quest_id: int,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Remove the one quest line whose marker is ``quest_id``.
+
+    Refuses (``legacy_identity``) unless EVERY quest on the card carries a
+    marker: a legacy or mixed mission has no stable identity to delete by, and
+    falling back to a position would silently rename the survivors. The read
+    happens before any write, so a refusal mutates nothing.
+
+    Returns ``({"position", "quest_id", "identity", "title", "description",
+    "quests"}, None)`` on success.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    if classify_identity("\n".join(lines)) != IDENTITY_MARKER:
+        return None, ERR_LEGACY_IDENTITY
+
+    matches = [q for q in quests if q.get("quest_id") == int(quest_id)]
+    if not matches:
+        return None, ERR_MARKER_NOT_FOUND
+    if len(matches) > 1:
+        return None, ERR_MARKER_DUPLICATE
+
+    position = quests.index(matches[0])
+    del lines[matches[0]["line_no"]]
+    new_description = "\n".join(lines)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "position": position,
+        "quest_id": int(quest_id),
+        "identity": IDENTITY_MARKER,
         "title": title,
         "description": new_description,
         "quests": extract_quests(new_description),
@@ -654,6 +828,52 @@ def reorder_quests_record(
     }, None
 
 
+def reorder_quests_record_by_marker(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    ordered_ids: list[int],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Reorder the card's quest lines by their markers.
+
+    ``ordered_ids`` are the marker ids (which equal the replica quest ids) in
+    the desired order. Refuses (``legacy_identity``) unless every quest carries
+    a marker. Each raw line moves verbatim, so ids, text and ``[x]``/``[ ]``
+    state are preserved with zero positional identity.
+
+    Returns ``({"order", "identity", "title", "description", "quests"}, None)``.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    if classify_identity("\n".join(lines)) != IDENTITY_MARKER:
+        return None, ERR_LEGACY_IDENTITY
+
+    current_ids = [q["quest_id"] for q in quests]
+    ordered = [int(quest_id) for quest_id in (ordered_ids or [])]
+    if len(ordered) != len(set(ordered)) or sorted(ordered) != sorted(current_ids):
+        return None, "quest_reorder_mismatch"
+
+    by_marker = {q["quest_id"]: q for q in quests}
+    slot_line_nos = [q["line_no"] for q in quests]
+    ordered_raw = [lines[by_marker[quest_id]["line_no"]] for quest_id in ordered]
+    for slot, raw in zip(slot_line_nos, ordered_raw):
+        lines[slot] = raw
+
+    new_description = "\n".join(lines)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "order": ordered,
+        "identity": IDENTITY_MARKER,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
 def update_quest(
     board_id: int,
     stack_id: int,
@@ -694,6 +914,145 @@ def complete_quest(
     line_no = quests[position]["line_no"]
     lines[line_no] = re.sub(r"\[ \]", "[x]", lines[line_no], count=1)
     return _write_card(board_id, stack_id, card_id, title, "\n".join(lines))
+
+
+def complete_quest_identity(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    *,
+    quest_id: int,
+    item_index: int,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Close one quest, locating it by marker first and by position only if safe.
+
+    * Fully marked mission: the line MUST carry ``#q:{quest_id}``; a missing
+      marker fails closed (``marker_not_found``) instead of guessing a position.
+    * Legacy mission (no markers): the existing positional behaviour is kept.
+    * Mixed mission: the marker wins when the target line has one; otherwise the
+      positional fallback is used because that line has no identity yet.
+
+    Returns ``({"identity": "marker"|"positional", "line_no", "quest_id"},
+    None)``. Only the target line changes; every other line stays
+    byte-identical.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    identity = classify_identity("\n".join(lines))
+    if identity == IDENTITY_EMPTY:
+        return None, "quest_not_found"
+
+    matches = [q for q in quests if q.get("quest_id") == int(quest_id)]
+    if len(matches) > 1:
+        return None, ERR_MARKER_DUPLICATE
+    if matches:
+        target = matches[0]
+        used = IDENTITY_MARKER
+    else:
+        if identity == IDENTITY_MARKER:
+            return None, ERR_MARKER_NOT_FOUND
+        if item_index < 0 or item_index >= len(quests):
+            return None, "quest_position_out_of_range"
+        target = quests[item_index]
+        used = "positional"
+
+    line_no = target["line_no"]
+    lines[line_no] = re.sub(r"\[ \]", "[x]", lines[line_no], count=1)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, "\n".join(lines))
+    if ok is None:
+        return None, werr
+    return {
+        "identity": used,
+        "line_no": line_no,
+        "quest_id": int(quest_id),
+    }, None
+
+
+def migrate_description_to_markers(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    ids_by_position: list[int],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Add a ``[](#q:{id})`` marker to every quest line of one card.
+
+    ``ids_by_position`` is the replica's quest id for each quest line in
+    document order. Existing markers are preserved verbatim; only unmarked
+    lines gain one, so the operation is idempotent and never renames a quest.
+
+    A fully marked card returns ``status="already_migrated"`` with no write.
+    A mixed or legacy card is rewritten in one description write, preserving
+    line order, bullet char, text and ``[x]``/``[ ]`` state.
+
+    Returns ``({"status", "migrated_ids", "quest_ids", "title", "description",
+    "quests"}, None)``. Every failure happens before the write.
+    """
+    title, lines, quests, err = _read_lines_and_quests(board_id, stack_id, card_id)
+    if lines is None:
+        return None, err
+
+    if not quests:
+        return None, "quest_migration_empty"
+
+    identity = classify_identity("\n".join(lines))
+    if identity == IDENTITY_MARKER:
+        return {
+            "status": "already_migrated",
+            "migrated_ids": [],
+            "quest_ids": [q["quest_id"] for q in quests],
+            "title": title,
+            "description": "\n".join(lines),
+            "quests": quests,
+        }, None
+
+    if len(ids_by_position) != len(quests):
+        return None, "quest_migration_replica_mismatch"
+
+    new_lines = list(lines)
+    migrated_ids: list[int] = []
+    quest_ids: list[int] = []
+    for idx, quest in enumerate(quests):
+        existing = quest.get("quest_id")
+        if existing is not None:
+            quest_ids.append(int(existing))
+            continue
+        candidate = ids_by_position[idx]
+        if candidate is None:
+            return None, "quest_migration_missing_id"
+        marker_id = int(candidate)
+        raw = new_lines[quest["line_no"]]
+        stripped = raw.strip()
+        bullet = "*" if stripped.startswith("*") else "-"
+        state = "x" if quest["done"] else " "
+        new_lines[quest["line_no"]] = (
+            f"{bullet} [{state}] {quest['text']} [](#q:{marker_id})"
+        )
+        migrated_ids.append(marker_id)
+        quest_ids.append(marker_id)
+
+    if len(set(quest_ids)) != len(quest_ids):
+        return None, "quest_migration_identity_collision"
+
+    # The markers that will exist after the rewrite must be exactly the
+    # replica's ids, otherwise delete/reorder would address ids the card does
+    # not carry. Fail closed instead of half-migrating.
+    if sorted(quest_ids) != sorted(int(i) for i in ids_by_position):
+        return None, "quest_migration_replica_mismatch"
+
+    new_description = "\n".join(new_lines)
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "status": "migrated",
+        "migrated_ids": migrated_ids,
+        "quest_ids": quest_ids,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
 
 
 def _read_lines_and_quests(
