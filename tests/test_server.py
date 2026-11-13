@@ -1425,11 +1425,11 @@ class TestMissionListLightMode:
     def test_default_is_compact(self, mock_persistence):
         """WU4/D4: default (no param) returns compact {id,title,status} only."""
         from ultratimonel.server import mission_list
-        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "deck_stack_id": 7, "checklist_items": [{"id": 10}]}
         mock_persistence.list_missions.return_value = [full_mission]
 
         result = json.loads(mission_list("testproj"))
-        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente", "deck_stack_id": 7}
         assert "description" not in result["missions"][0]
         assert "checklist_items" not in result["missions"][0]
         assert result["total"] == 1
@@ -1450,11 +1450,11 @@ class TestMissionListLightMode:
     def test_include_description_false_returns_light_mode(self, mock_persistence):
         """F-TU-03: opt-in light mode omits description and checklist_items."""
         from ultratimonel.server import mission_list
-        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "checklist_items": [{"id": 10}]}
+        full_mission = {"id": 1, "title": "A", "description": "desc", "status": "pendiente", "deck_stack_id": 7, "checklist_items": [{"id": 10}]}
         mock_persistence.list_missions.return_value = [full_mission]
 
         result = json.loads(mission_list("testproj", include_description=False))
-        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente"}
+        assert result["missions"][0] == {"id": 1, "title": "A", "status": "pendiente", "deck_stack_id": 7}
         assert "description" not in result["missions"][0]
         assert "checklist_items" not in result["missions"][0]
 
@@ -1464,11 +1464,11 @@ class TestMissionGet:
     def test_mission_get_returns_minimal_fields(self, mock_persistence):
         """F-TU-01: mission_get returns id, title, checklist_item_ids only."""
         from ultratimonel.server import mission_get
-        mock_persistence.get_mission.return_value = {"id": 123, "title": "Sprint Planning", "description": "..."}
+        mock_persistence.get_mission.return_value = {"id": 123, "title": "Sprint Planning", "description": "...", "deck_stack_id": 9}
         mock_persistence.list_checklist_items.return_value = [{"id": 456}, {"id": 457}]
 
         result = json.loads(mission_get(123))
-        assert result == {"id": 123, "title": "Sprint Planning", "checklist_item_ids": [456, 457]}
+        assert result == {"id": 123, "title": "Sprint Planning", "checklist_item_ids": [456, 457], "deck_stack_id": 9}
         assert "description" not in result
         assert "checklist_items" not in result
 
@@ -2009,6 +2009,10 @@ class TestMissionUpdateDescription:
 
         mock_call.side_effect = call_side_effect
         mock_persist.upsert_mission.side_effect = upsert_side_effect
+        mock_persist.list_checklist_items.return_value = [
+            {"item_index": 0, "text": "alpha", "done": 0},
+            {"item_index": 1, "text": "beta", "done": 1},
+        ]
 
         result = json.loads(
             mission_update_description(5, "New prose\n- [ ] sneaky")
@@ -2027,8 +2031,18 @@ class TestMissionUpdateDescription:
         assert "- [ ] sneaky" not in new_desc
         assert "Old prose" not in new_desc
         assert "New prose" in new_desc
-        # quest rows themselves are untouched by a description edit
-        mock_persist.upsert_checklist_item.assert_not_called()
+        # the replica is refreshed from what Deck actually holds now
+        replica_desc = mock_persist.upsert_mission.call_args.kwargs["description"]
+        assert replica_desc == new_desc
+        assert mock_persist.upsert_mission.call_args.kwargs["checklist_total"] == 2
+        assert mock_persist.upsert_mission.call_args.kwargs["checklist_done"] == 1
+        synced = [
+            c.kwargs for c in mock_persist.upsert_checklist_item.call_args_list
+        ]
+        assert [(c["item_index"], c["text"], c["done"]) for c in synced] == [
+            (0, "alpha", 0),
+            (1, "beta", 1),
+        ]
 
     @patch("ultratimonel.context_extractor.get_project_maps")
     @patch("ultratimonel.server.persistence")
@@ -2063,12 +2077,165 @@ class TestMissionUpdateDescription:
             return (None, "unavailable")
 
         mock_call.side_effect = call_side_effect
+        mock_persist.list_checklist_items.return_value = []
 
         result = json.loads(mission_update_description(5, "New prose"))
 
         assert "error" in result
         assert "deck_update_card" not in calls
         mock_persist.upsert_mission.assert_not_called()
+
+
+class TestMissionUpdateDescriptionFailClosed:
+    """Card #218, forum #1: a stale/empty read must never delete the checklist.
+
+    The replica's checklist rows are the evidence. When the fresh Deck read
+    shows zero quest lines but the replica knows N > 0 quests, the write is
+    refused and the card keeps its lines.
+    """
+
+    _CHECKLIST = "\n".join(f"- [ ] quest {i}" for i in range(16))
+    _ORIGINAL = f"Old prose\n\n{_CHECKLIST}"
+
+    def _mission(self):
+        return {
+            "id": 5,
+            "deck_task_id": 137,
+            "deck_stack_id": 111,
+            "project": "testproj",
+            "title": "Mission 1058",
+            "description": self._ORIGINAL,
+            "status": "pendiente",
+            "checklist_total": 16,
+            "checklist_done": 0,
+        }
+
+    def _replica_items(self):
+        return [
+            {"item_index": i, "text": f"quest {i}", "done": 0}
+            for i in range(16)
+        ]
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_empty_reread_refuses_and_leaves_card_intact(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel import deck_bridge
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = self._mission()
+        mock_persist.list_checklist_items.return_value = self._replica_items()
+        calls = []
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            calls.append(tool_name)
+            if tool_name == "deck_get_card":
+                return ({"title": "Mission 1058", "description": ""}, None)
+            if tool_name == "deck_update_card":
+                return ({"id": 137}, None)
+            return (None, "unavailable")
+
+        mock_call.side_effect = call_side_effect
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert "error" in result
+        assert result["reason"] == deck_bridge.ERR_EMPTY_DESCRIPTION
+        assert "deck_update_card" not in calls
+        mock_persist.upsert_mission.assert_not_called()
+        mock_persist.upsert_checklist_item.assert_not_called()
+        # The authoritative checklist is still the full 16 lines.
+        assert len(deck_bridge.extract_quests(self._ORIGINAL)) == 16
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_reread_without_quests_reports_desync(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        from ultratimonel import deck_bridge
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = self._mission()
+        mock_persist.list_checklist_items.return_value = self._replica_items()
+        calls = []
+
+        def call_side_effect(server_name, tool_name, params=None, timeout=8.0):
+            calls.append(tool_name)
+            if tool_name == "deck_get_card":
+                return ({"title": "Mission 1058", "description": "Old prose"}, None)
+            return (None, "unavailable")
+
+        mock_call.side_effect = call_side_effect
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert "error" in result
+        assert result["reason"] == deck_bridge.ERR_QUESTS_MISSING
+        assert "deck_update_card" not in calls
+        mock_persist.upsert_mission.assert_not_called()
+
+    @patch("ultratimonel.context_extractor.get_project_maps")
+    @patch("ultratimonel.server.persistence")
+    @patch("ultratimonel.mcp_client.call_mcp_tool")
+    def test_forum_case_keeps_every_line_and_syncs_replica(
+        self, mock_call, mock_persist, mock_maps
+    ):
+        """Forum reproduction: mission with checklist, prose write, 0 lines lost."""
+        from ultratimonel import deck_bridge
+        from ultratimonel.server import mission_update_description
+
+        mock_maps.return_value = {"testproj": {"deck_board_id": 21}}
+        mock_persist.get_mission.return_value = self._mission()
+        mock_persist.list_checklist_items.return_value = self._replica_items()
+        responses = {
+            "deck_get_card": (
+                {"title": "Mission 1058", "description": self._ORIGINAL},
+                None,
+            ),
+            "deck_update_card": ({"id": 137}, None),
+        }
+        mock_call.side_effect = (
+            lambda server_name, tool_name, params=None, timeout=8.0: responses.get(
+                tool_name, (None, "unavailable")
+            )
+        )
+
+        result = json.loads(mission_update_description(5, "New prose"))
+
+        assert result == {"mission_id": 5, "status": "ok"}
+
+        written = [
+            c.args[2]
+            for c in mock_call.call_args_list
+            if c.args[1] == "deck_update_card"
+        ][0]
+        written_desc = written["description"]
+        original_lines = self._CHECKLIST.split("\n")
+        written_quest_lines = [
+            written_desc.split("\n")[q["line_no"]]
+            for q in deck_bridge.extract_quests(written_desc)
+        ]
+        # Full-list comparison: nothing disappeared, order and state intact.
+        assert written_quest_lines == original_lines
+        assert "New prose" in written_desc
+        assert "Old prose" not in written_desc
+
+        # The replica mirrors Deck exactly: same description, quests, order.
+        replica_call = mock_persist.upsert_mission.call_args.kwargs
+        assert replica_call["description"] == written_desc
+        assert replica_call["checklist_total"] == 16
+        assert replica_call["checklist_done"] == 0
+        synced = [
+            c.kwargs for c in mock_persist.upsert_checklist_item.call_args_list
+        ]
+        assert [
+            (c["item_index"], c["text"], c["done"]) for c in synced
+        ] == [(i, f"quest {i}", 0) for i in range(16)]
 
 
 class TestQuestWriteTools:
@@ -2113,21 +2280,24 @@ class TestQuestWriteTools:
 
         mock_call.side_effect = call_side_effect
         mock_persist.upsert_checklist_item.side_effect = upsert_side_effect
+        mock_persist.next_checklist_item_id.return_value = 88
+        mock_persist.upsert_checklist_item_with_id.return_value = 88
 
         result = json.loads(quest_add(5, "two"))
 
         assert result == {
-            "quest_id": 77,
+            "quest_id": 88,
             "mission_id": 5,
             "title": "two",
             "done": False,
+            "identity": "marker",
         }
         assert events.index(("deck", "deck_update_card")) < events.index(
             ("replica", "upsert_checklist_item")
         )
-        # Deck line appended with done=false
+        # Deck line appended with done=false and the server-owned marker.
         update_params = mock_call.call_args_list[-1].args[2]
-        assert update_params["description"] == "- [ ] one\n- [ ] two"
+        assert update_params["description"] == "- [ ] one\n- [ ] two [](#q:88)"
         # replica row written with done=0
         assert mock_persist.upsert_checklist_item.call_args.kwargs["done"] == 0
 
@@ -2401,11 +2571,14 @@ class TestBeginTurnQuestGuard:
         deck_writes = []
         monkeypatch.setattr(
             srv.deck_bridge,
-            "complete_quest",
-            lambda board_id, stack_id, card_id, position: deck_writes.append(
-                (board_id, stack_id, card_id, position)
+            "complete_quest_identity",
+            lambda board_id, stack_id, card_id, quest_id, item_index: deck_writes.append(
+                (board_id, stack_id, card_id, quest_id, item_index)
             )
-            or (True, None),
+            or (
+                {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+                None,
+            ),
         )
 
         # Crossed: mission A + a quest that belongs to mission B.
@@ -2459,11 +2632,14 @@ class TestBeginTurnQuestGuard:
         deck_writes = []
         monkeypatch.setattr(
             srv.deck_bridge,
-            "complete_quest",
-            lambda board_id, stack_id, card_id, position: deck_writes.append(
-                (board_id, stack_id, card_id, position)
+            "complete_quest_identity",
+            lambda board_id, stack_id, card_id, quest_id, item_index: deck_writes.append(
+                (board_id, stack_id, card_id, quest_id, item_index)
             )
-            or (True, None),
+            or (
+                {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+                None,
+            ),
         )
 
         # Bypass: mission A + the quest that actually belongs to mission B.
@@ -2536,11 +2712,14 @@ class TestBeginTurnQuestGuard:
         )
         complete_calls = []
 
-        def fake_complete(board_id, stack_id, card_id, position):
-            complete_calls.append((board_id, stack_id, card_id, position))
-            return True, None
+        def fake_complete(board_id, stack_id, card_id, quest_id, item_index):
+            complete_calls.append((board_id, stack_id, card_id, quest_id, item_index))
+            return (
+                {"identity": "positional", "line_no": item_index, "quest_id": quest_id},
+                None,
+            )
 
-        monkeypatch.setattr(srv.deck_bridge, "complete_quest", fake_complete)
+        monkeypatch.setattr(srv.deck_bridge, "complete_quest_identity", fake_complete)
 
         begin = json.loads(
             srv.begin_turn("sess-1", "voy-rojo", mission_id, quest_id=quest_id)
@@ -2554,7 +2733,7 @@ class TestBeginTurnQuestGuard:
 
         # (b) end_turn drives the Deck write for the matching item_index.
         end = json.loads(srv.end_turn(intento_id))
-        assert complete_calls == [(21, 111, 189, 0)]
+        assert complete_calls == [(21, 111, 189, quest_id, 0)]
         assert end["quest_id"] == quest_id
         assert end["quest_done"] is True
 
@@ -2582,7 +2761,7 @@ class TestEndTurnQuestTransition:
             "status": "running",
         }
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2622,7 +2801,10 @@ class TestEndTurnQuestTransition:
         }
         mock_board.return_value = (21, None)
         mock_stack.return_value = (111, None)
-        mock_complete.return_value = (True, None)
+        mock_complete.return_value = (
+            {"identity": "positional", "line_no": 0, "quest_id": 10},
+            None,
+        )
 
         raw = end_turn(42)
         result = json.loads(raw)
@@ -2632,7 +2814,9 @@ class TestEndTurnQuestTransition:
         assert result["quest_id"] == 10
         assert result["quest_done"] is True
         # Deck write first, then replica refresh.
-        mock_complete.assert_called_once_with(21, 111, 189, 0)
+        mock_complete.assert_called_once_with(
+            21, 111, 189, quest_id=10, item_index=0
+        )
         mock_persistence.set_quest_done.assert_called_once_with(10, True)
         # Compact: raw result_data never leaks into the payload.
         assert "result_data" not in raw
@@ -2643,11 +2827,11 @@ class TestEndTurnQuestTransition:
             {"name": "1e", "state": "PASS", "mandatory": True},
         ]
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
-    def test_end_turn_transition_is_unconditional_on_fail(
+    def test_end_turn_fail_leaves_quest_open(
         self, mock_persistence, mock_board, mock_stack, mock_complete
     ):
         from ultratimonel.server import end_turn
@@ -2675,12 +2859,15 @@ class TestEndTurnQuestTransition:
         result = json.loads(end_turn(42))
 
         assert result["final_status"] == "fail"
-        # The quest is consumed anyway (PM: unconditional transition).
-        assert result["quest_done"] is True
-        mock_complete.assert_called_once_with(21, 111, 189, 2)
-        mock_persistence.set_quest_done.assert_called_once_with(10, True)
+        # Card #218: only a successful turn consumes the quest.
+        assert result["quest_id"] == 10
+        assert result["quest_done"] is False
+        mock_complete.assert_not_called()
+        mock_persistence.set_quest_done.assert_not_called()
+        # The intento is still finalized (never left running).
+        mock_persistence.complete_intento_with_gates.assert_called_once()
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.server._resolve_stack_id")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2717,7 +2904,7 @@ class TestEndTurnQuestTransition:
         mock_persistence.set_quest_done.assert_not_called()
         mock_persistence.complete_intento_with_gates.assert_called_once()
 
-    @patch("ultratimonel.server.deck_bridge.complete_quest")
+    @patch("ultratimonel.server.deck_bridge.complete_quest_identity")
     @patch("ultratimonel.mcp_client.call_mcp_tool")
     @patch("ultratimonel.server._resolve_board_id")
     @patch("ultratimonel.server.persistence")
@@ -2770,6 +2957,436 @@ class TestEndTurnQuestTransition:
         mock_complete.assert_not_called()
         mock_persistence.set_quest_done.assert_not_called()
         srv._clear_active_intento()
+
+
+class TestEndTurnStatusVocabulary:
+    """Card #218: end_turn honours the requested ``status``.
+
+    Real temp SQLite DB so the quest replica state is observable, with the Deck
+    bridge, board and stack resolution mocked.
+    """
+
+    _GATES_ALL_PASS = [
+        {"name": "1a", "state": "PASS", "mandatory": 1},
+        {"name": "1b", "state": "PASS", "mandatory": 1},
+        {"name": "1c", "state": "PASS", "mandatory": 1},
+        {"name": "1e", "state": "PASS", "mandatory": 1},
+    ]
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def teardown_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def _make_turn(self, tmp_path, monkeypatch, gates=None):
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        db = Persistence(db_path=str(tmp_path / "status-vocab.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+
+        mission_id = db.upsert_mission(
+            deck_task_id=807, project="voy-rojo", title="Card #218", status="pendiente"
+        )
+        quest_id = db.upsert_checklist_item(
+            mission_id=mission_id, item_index=0, text="open", done=0
+        )
+        intento_id = db.create_intento("sess-1", "voy-rojo", mission_id, quest_id)
+        db.capture_gates_for_intento(
+            intento_id, gates if gates is not None else self._GATES_ALL_PASS
+        )
+        srv._set_active_intento(intento_id, "sess-1", "voy-rojo")
+
+        monkeypatch.setattr(srv, "_resolve_board_id", lambda project: (21, None))
+        monkeypatch.setattr(
+            srv, "_resolve_stack_for_card", lambda board_id, mission=None: (111, None, None)
+        )
+        writes = []
+        monkeypatch.setattr(
+            srv.deck_bridge,
+            "complete_quest_identity",
+            lambda board_id, stack_id, card_id, quest_id, item_index: writes.append(
+                (board_id, stack_id, card_id, quest_id, item_index)
+            )
+            or (
+                {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+                None,
+            ),
+        )
+        return db, mission_id, quest_id, intento_id, writes
+
+    @pytest.mark.parametrize("requested", ["success", "aborted", "failed", "partial"])
+    def test_end_turn_status_each_valid_sets_final_status_and_quest_state(
+        self, requested, tmp_path, monkeypatch
+    ):
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, requested))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == requested
+        expected_done = requested == "success"
+        assert result["quest_done"] is expected_done
+        assert result["quest_id"] == quest_id
+        # The intento is ALWAYS finalized — never left running.
+        stored = db.get_intento(intento_id)
+        assert stored["status"] != "running"
+        assert stored["completed_at"] is not None
+        # The quest replica is consumed only on success.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == int(expected_done)
+        assert len(writes) == (1 if expected_done else 0)
+
+    def test_end_turn_status_unknown_is_rejected_with_zero_mutation(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, "bogus"))
+
+        assert result["status"] == "error"
+        assert "Invalid status" in result["error"]
+        # No completion: the intento is still running and open.
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "running"
+        assert stored["completed_at"] is None
+        # Quest untouched, no Deck write, active turn still recoverable.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+        assert srv._get_active_intento() is not None
+
+    def test_end_turn_status_is_case_insensitive_and_normalized(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        _db, _mission_id, _quest_id, intento_id, _writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, "ABORTED"))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "aborted"
+        assert result["quest_done"] is False
+
+    def test_end_turn_status_forum_regression_abandoned_turn_stays_open(self, tmp_path, monkeypatch):
+        """Reported case: turn opened and abandoned, closed with status=aborted.
+
+        Must NOT report success and must NOT consume the quest.
+        """
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, "aborted"))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "aborted"
+        assert result["quest_done"] is False
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+        assert db.get_intento(intento_id)["status"] != "running"
+
+    def test_end_turn_status_missing_still_closes_as_success(self, tmp_path, monkeypatch):
+        """Compatibility: no ``status`` behaves exactly as before (success)."""
+        from ultratimonel.server import end_turn
+
+        db, _mission_id, quest_id, intento_id, writes = self._make_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "success"
+        assert result["gates_passed"] == 4
+        assert result["gates_total"] == 4
+        assert result["quest_done"] is True
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 1
+        assert len(writes) == 1
+
+
+_CARD_218_GATES_PASS = [
+    {"name": "1a", "state": "PASS", "mandatory": 1},
+    {"name": "1b", "state": "PASS", "mandatory": 1},
+    {"name": "1c", "state": "PASS", "mandatory": 1},
+    {"name": "1e", "state": "PASS", "mandatory": 1},
+]
+
+_CARD_218_GATES_BLOCKED = [
+    {"name": "1a", "state": "PASS", "mandatory": 1},
+    {"name": "1b", "state": "BLOCK", "mandatory": 1},
+    {"name": "1c", "state": "PASS", "mandatory": 1},
+    {"name": "1e", "state": "PASS", "mandatory": 1},
+]
+
+
+def _build_real_turn(tmp_path, monkeypatch, gates=None, db_name="card-218.db"):
+    """Real temp SQLite turn with the Deck bridge/board/stack mocked.
+
+    Returns (db, mission_id, quest_id, intento_id, writes) so the tests can read
+    the persisted state back instead of trusting the payload.
+    """
+    from ultratimonel import server as srv
+    from ultratimonel.persistence import Persistence
+
+    db = Persistence(db_path=str(tmp_path / db_name))
+    monkeypatch.setattr(srv, "persistence", db)
+
+    mission_id = db.upsert_mission(
+        deck_task_id=907, project="voy-rojo", title="Card #218", status="pendiente"
+    )
+    quest_id = db.upsert_checklist_item(
+        mission_id=mission_id, item_index=0, text="open", done=0
+    )
+    intento_id = db.create_intento("sess-1", "voy-rojo", mission_id, quest_id)
+    db.capture_gates_for_intento(
+        intento_id, gates if gates is not None else _CARD_218_GATES_PASS
+    )
+    srv._set_active_intento(intento_id, "sess-1", "voy-rojo")
+
+    monkeypatch.setattr(srv, "_resolve_board_id", lambda project: (21, None))
+    monkeypatch.setattr(
+        srv, "_resolve_stack_for_card", lambda board_id, mission=None: (111, None, None)
+    )
+    writes = []
+    monkeypatch.setattr(
+        srv.deck_bridge,
+        "complete_quest_identity",
+        lambda board_id, stack_id, card_id, quest_id, item_index: writes.append(
+            (board_id, stack_id, card_id, quest_id, item_index)
+        )
+        or (
+            {"identity": "positional", "line_no": 0, "quest_id": quest_id},
+            None,
+        ),
+    )
+    return db, mission_id, quest_id, intento_id, writes
+
+
+class TestEndTurnQuestDoneExplicit:
+    """Card #218 Q3: ``quest_done`` is explicit and never lies."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def teardown_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def test_quest_done_false_on_success_leaves_quest_open(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, quest_done=False))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "success"
+        assert result["quest_done"] is False
+        # The intento really succeeded; only the quest closure was vetoed.
+        assert db.get_intento(intento_id)["status"] == "success"
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+
+    def test_quest_done_none_keeps_legacy_closure(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, quest_done=None))
+
+        assert result["quest_done"] is True
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 1
+        assert len(writes) == 1
+
+    def test_quest_done_true_with_aborted_is_rejected_with_zero_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        from ultratimonel import server as srv
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, status="aborted", quest_done=True))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_quest_done"
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "running"
+        assert stored["completed_at"] is None
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+        assert srv._get_active_intento() is not None
+
+    def test_quest_done_true_with_gate_failure_is_rejected(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(
+            tmp_path, monkeypatch, gates=_CARD_218_GATES_BLOCKED
+        )
+
+        result = json.loads(end_turn(intento_id, quest_done=True))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_quest_done"
+        assert db.get_intento(intento_id)["status"] == "running"
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+
+    def test_quest_done_non_bool_is_rejected(self, tmp_path, monkeypatch):
+        from ultratimonel.server import end_turn
+
+        db, _mid, _quest_id, intento_id, _writes = _build_real_turn(
+            tmp_path, monkeypatch
+        )
+
+        result = json.loads(end_turn(intento_id, quest_done="yes"))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_quest_done"
+        assert db.get_intento(intento_id)["status"] == "running"
+
+    @pytest.mark.parametrize(
+        "requested,persisted",
+        [("aborted", "aborted"), ("partial", "partial"), ("failed", "fail")],
+    )
+    def test_end_turn_persists_the_real_terminal_status(
+        self, requested, persisted, tmp_path, monkeypatch
+    ):
+        from ultratimonel.server import end_turn
+
+        db, _mid, quest_id, intento_id, writes = _build_real_turn(tmp_path, monkeypatch)
+
+        result = json.loads(end_turn(intento_id, status=requested))
+
+        assert result["final_status"] == requested
+        # Read from the DB, not the payload: v7 keeps the honest state.
+        assert db.get_intento(intento_id)["status"] == persisted
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert writes == []
+
+
+class TestAbortTurn:
+    """Card #218 Q3: ``abort_turn`` finalises an interrupted turn honestly."""
+
+    def setup_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def teardown_method(self):
+        import ultratimonel.server as srv
+
+        srv._clear_active_intento()
+
+    def _make_running(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+
+        db = Persistence(db_path=str(tmp_path / "abort-turn.db"))
+        monkeypatch.setattr(srv, "persistence", db)
+        mission_id = db.upsert_mission(
+            deck_task_id=808, project="voy-rojo", title="Card #218", status="pendiente"
+        )
+        quest_id = db.upsert_checklist_item(
+            mission_id=mission_id, item_index=0, text="open", done=0
+        )
+        intento_id = db.create_intento("sess-1", "voy-rojo", mission_id, quest_id)
+        srv._set_active_intento(intento_id, "sess-1", "voy-rojo")
+        return db, mission_id, quest_id, intento_id
+
+    def test_abort_turn_persists_aborted_and_reason(self, tmp_path, monkeypatch):
+        from ultratimonel.server import abort_turn
+
+        db, _mid, quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+
+        result = json.loads(abort_turn(intento_id, "network died mid-turn"))
+
+        assert result["status"] == "ok"
+        assert result["final_status"] == "aborted"
+        assert result["persisted_status"] == "aborted"
+        assert result["quest_done"] is False
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "aborted"
+        assert stored["summary"] == "network died mid-turn"
+        assert stored["closed_at"] is not None
+        assert stored["completed_at"] is not None
+        # Quest, gates and budget are untouched.
+        assert db.get_checklist_item_by_id(quest_id)["done"] == 0
+        assert db.list_gate_states("sess-1", "voy-rojo") == []
+        assert db.get_attempt_budget(quest_id)["used"] == 0
+
+    def test_abort_turn_clears_the_active_turn(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.server import abort_turn
+
+        _db, _mid, _quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+
+        abort_turn(intento_id, "interrupted")
+
+        assert srv._get_active_intento() is None
+
+    @pytest.mark.parametrize("prior", ["success", "fail", "aborted", "partial"])
+    def test_abort_turn_on_closed_intento_is_rejected(
+        self, prior, tmp_path, monkeypatch
+    ):
+        from ultratimonel.server import abort_turn
+
+        db, _mid, _quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+        db.complete_intento_with_summary(intento_id, prior, 4, "already closed")
+
+        result = json.loads(abort_turn(intento_id, "too late"))
+
+        assert result["status"] == "error"
+        assert result["code"] == "intento_not_running"
+        assert result["current_status"] == prior
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == prior
+        assert stored["summary"] == "already closed"
+
+    @pytest.mark.parametrize("reason", ["", "   ", "\n\t "])
+    def test_abort_turn_empty_reason_is_rejected(self, reason, tmp_path, monkeypatch):
+        from ultratimonel.server import abort_turn
+
+        db, _mid, _quest_id, intento_id = self._make_running(tmp_path, monkeypatch)
+
+        result = json.loads(abort_turn(intento_id, reason))
+
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_reason"
+        stored = db.get_intento(intento_id)
+        assert stored["status"] == "running"
+        assert stored["summary"] is None
+
+    def test_abort_turn_missing_intento_is_rejected(self, tmp_path, monkeypatch):
+        from ultratimonel import server as srv
+        from ultratimonel.persistence import Persistence
+        from ultratimonel.server import abort_turn
+
+        monkeypatch.setattr(
+            srv, "persistence", Persistence(db_path=str(tmp_path / "missing.db"))
+        )
+
+        result = json.loads(abort_turn(9999, "nope"))
+
+        assert result["status"] == "error"
+        assert result["code"] == "intento_not_found"
 
 
 class TestCompactReadAndNoVerbose:

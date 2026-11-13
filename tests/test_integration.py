@@ -298,7 +298,9 @@ class TestToolsUsabilityRetroIntegration:
                 assert result["project"] == "test-proj"
                 assert result["total"] == 1
                 mission = result["missions"][0]
-                assert set(mission.keys()) == {"id", "title", "status"}
+                assert set(mission.keys()) == {
+                    "id", "title", "status", "deck_stack_id"
+                }
                 assert mission["id"] == 1
                 assert mission["title"] == "Sprint Planning"
                 assert "description" not in mission

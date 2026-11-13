@@ -94,10 +94,11 @@ class TestCompactGates:
 
 
 class TestCompactMission:
-    def test_returns_id_title_status_only(self):
+    def test_returns_id_title_status_and_stack(self):
         mission = {
             "id": 189,
             "deck_task_id": 42,
+            "deck_stack_id": 7,
             "project": "voy-rojo",
             "title": "Ship the thing",
             "description": "d" * 10000,
@@ -109,6 +110,7 @@ class TestCompactMission:
             "id": 189,
             "title": "Ship the thing",
             "status": "en_progreso",
+            "deck_stack_id": 7,
         }
 
     def test_drops_description_and_checklist_items(self):
@@ -121,7 +123,8 @@ class TestCompactMission:
                 "checklist_items": [{"id": 9}],
             }
         )
-        assert set(result) == {"id", "title", "status"}
+        assert set(result) == {"id", "title", "status", "deck_stack_id"}
+        assert result["deck_stack_id"] is None
 
 
 class TestCompactQuest:

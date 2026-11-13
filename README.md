@@ -295,17 +295,17 @@ mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP
 
 | Tool | Firma | Descripción |
 |------|-------|-------------|
-| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. **Flujo recomendado.** |
-| `end_turn(intento_id, status="success")` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates_detail` completo. Nunca deja el turno atascado. |
+| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user", full=False)` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. Devuelve el **delta del turno** (ids, gates compactos, conteo de quests pendientes), nunca la misión completa. `full=True` devuelve además la misión y su checklist. **Flujo recomendado.** |
+| `end_turn(intento_id, status="success", quest_done=None, full=False)` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates` compactos. Nunca deja el turno atascado ni devuelve el estado completo de la misión; `full=True` lo incluye si hace falta. |
 | `delete_intento(intento_id)` | Elimina un intento por ID (limpieza operacional) |
 
 ### 📋 Misiones / Deck Sync
 
 | Tool | Descripción |
 |------|-------------|
-| `sync_tasks(project)` | Sincroniza cards de Deck → tabla missions para un proyecto |
+| `sync_tasks(project, prune=False)` | Sincroniza cards de Deck → tabla missions y reporta deriva (`missing_in_deck`, `skipped`). `prune=true` poda sólo huérfanas demostradas sobre una lectura completa de Deck |
 | `sync_all()` | Sincroniza todos los proyectos mapeados |
-| `mission_list(project)` | Lista misiones (Deck tasks) de un proyecto |
+| `mission_list(project, include_description=False, limit=None, offset=0)` | Lista misiones (Deck tasks) de un proyecto. Compacta por defecto; `limit`/`offset` paginan y `total` es siempre el total real. Sin `limit` devuelve todas (compatibilidad) |
 | `mission_get(mission_id)` | Recupera una misión por ID |
 | `checklist_item_get(checklist_item_id)` | Recupera un checklist item por ID |
 
@@ -313,7 +313,7 @@ mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP
 
 | Tool | Descripción |
 |------|-------------|
-| `map_list()` | Lista proyectos configurados en `project_maps.json` |
+| `map_list(full=False)` | Lista proyectos configurados en `project_maps.json`. Compacto por defecto (`deck_board_id` + `collective_id`); `full=true` incluye `patterns` |
 | `map_add(project, deck_board_name, collective_name, ...)` | Agrega o actualiza un proyecto |
 | `map_remove(project)` | Elimina un proyecto |
 | `map_setup()` | Descubre boards/collectives disponibles para mapeo |

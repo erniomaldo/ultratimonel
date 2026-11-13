@@ -26,8 +26,12 @@ import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
+from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.tools import ToolResult
+from mcp.types import CallToolRequestParams, ListToolsRequest
 
 from . import compact
 from . import deck_bridge
@@ -56,6 +60,66 @@ logger = logging.getLogger(__name__)
 # ── Server setup ────────────────────────────────────────────────────────
 
 app = FastMCP("ultratimonel")
+
+
+class SingleChannelResultMiddleware(Middleware):
+    """Serve every tool result through exactly one channel: ``content[0].text``.
+
+    Why (card #218, quest 12): every tool here returns a JSON string, but
+    FastMCP 3.4.2 `Tool.convert_result` (`fastmcp/tools/base.py:285-340`)
+    serializes that same string twice — once as `content` and, because a
+    ``-> str`` return annotation is a non-object schema, again as
+    ``structuredContent={"result": <the same JSON, escaped>}`` plus
+    ``_meta.fastmcp.wrap_result``. The payload crosses the wire three times.
+
+    The JSON text channel is the single one because that is the only channel
+    the clients we ship read (`ultratimonel_client.py`,
+    `plugin_preflight.py`, `tests/test_integration.py` all do
+    ``json.loads(content[0]["text"])``). Dropping the text payload would
+    silently break the pre-flight gate plugin; dropping the structured copy
+    costs nothing because nothing we ship reads it.
+
+    This is a server-level concern, resolved once: the middleware applies to
+    all tools, present and future. `on_list_tools` removes the generated
+    `outputSchema` so the advertised contract matches the single-channel
+    response (MCP expects `structuredContent` when a tool declares one).
+    `on_call_tool` keeps the text content verbatim and drops the duplicated
+    `structuredContent` and the `wrap_result` marker.
+    """
+
+    async def on_list_tools(
+        self,
+        context: MiddlewareContext[ListToolsRequest],
+        call_next: CallNext[ListToolsRequest, list],
+    ) -> list:
+        tools = await call_next(context)
+        return [tool.model_copy(update={"output_schema": None}) for tool in tools]
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        result = await call_next(context)
+        # Keep text content and isError; drop the duplicated structured copy
+        # and the wrap marker. Any other meta is preserved untouched.
+        meta = dict(result.meta) if result.meta else None
+        if meta:
+            fastmcp_meta = dict(meta.get("fastmcp") or {})
+            fastmcp_meta.pop("wrap_result", None)
+            if fastmcp_meta:
+                meta["fastmcp"] = fastmcp_meta
+            else:
+                meta.pop("fastmcp", None)
+            meta = meta or None
+        return ToolResult(
+            content=result.content,
+            is_error=result.is_error,
+            meta=meta,
+        )
+
+
+app.add_middleware(SingleChannelResultMiddleware())
 
 # Persistence layer — shared across tools
 db_path = os.environ.get(
@@ -153,6 +217,68 @@ def _gates_from_intento_snapshot(intento: dict | None) -> list[dict]:
     if not isinstance(raw, list):
         return []
     return [g for g in raw if isinstance(g, dict)]
+
+
+def _pending_quest_count(mission_id: int) -> int:
+    """Count the mission's open quests, degrading to 0 when unreadable.
+
+    ``begin_turn`` reports the pending count as part of its turn delta. A
+    degraded replica must never abort the turn, so an unreadable checklist
+    yields 0 pending instead of raising.
+    """
+    if not mission_id:
+        return 0
+    try:
+        items = persistence.list_checklist_items(mission_id)
+        return sum(1 for item in items if isinstance(item, dict) and not item.get("done"))
+    except Exception as exc:
+        logger.warning(
+            "Pending quest count unavailable for mission #%s: %s", mission_id, exc
+        )
+        return 0
+
+
+def _turn_full_state(intento: dict) -> dict:
+    """Full mission snapshot for the ``full`` escape hatch (quest 11).
+
+    Default responses carry only the turn delta. A caller that needs the whole
+    mission state asks for it explicitly (``full=True``) instead of paying
+    for it on every turn. This is the compatibility path: nothing is removed
+    from reach, it is only no longer the default.
+    """
+    mission_id = intento.get("mission_id") or 0
+    state = {
+        "session_id": intento.get("session_id"),
+        "project": intento.get("project"),
+        "mission": None,
+        "checklist": [],
+    }
+    if not mission_id:
+        return state
+    try:
+        mission = persistence.get_mission(mission_id)
+    except Exception as exc:
+        logger.warning("Full-state mission lookup failed for #%s: %s", mission_id, exc)
+        return state
+    if not isinstance(mission, dict):
+        return state
+    state["mission"] = {
+        "id": mission.get("id"),
+        "title": mission.get("title", ""),
+        "status": mission.get("status", ""),
+        "description": mission.get("description", ""),
+        "checklist_total": mission.get("checklist_total", 0),
+        "checklist_done": mission.get("checklist_done", 0),
+        "deck_stack_id": mission.get("deck_stack_id"),
+    }
+    try:
+        items = persistence.list_checklist_items(mission_id)
+        state["checklist"] = [
+            compact.compact_quest(item) for item in items if isinstance(item, dict)
+        ]
+    except Exception as exc:
+        logger.warning("Full-state checklist lookup failed for #%s: %s", mission_id, exc)
+    return state
 
 
 def _validate_gates_for_completion(
@@ -577,16 +703,38 @@ def server(action: str) -> str:
 
 
 @app.tool()
-def map_list() -> str:
+def map_list(full: bool = False) -> str:
     """List all projects configured in project_maps.json.
 
+    Compact by default (card #218, quest 10): each project maps to
+    ``{deck_board_id, collective_id}`` only. The detection ``patterns`` — the
+    bulk of the payload — are omitted because they are only needed for
+    configuration, not for resolving a project's board. Pass ``full=True`` to
+    get the complete configured entry.
+
+    Args:
+        full: If True, returns the full payload including ``patterns``.
+            Defaults to False (compact).
+
     Returns:
-        JSON array of project entries with patterns, deck_board_id, collective_id.
+        JSON object keyed by project slug. Compact values keep
+        ``deck_board_id`` so callers can still resolve a project's board
+        without opting into the full payload.
     """
     from .context_extractor import get_project_maps
 
     maps = get_project_maps()
-    return json.dumps(maps, ensure_ascii=False, default=str)
+    if full:
+        return json.dumps(maps, ensure_ascii=False, default=str)
+
+    compact_maps = {
+        project: {
+            "deck_board_id": cfg.get("deck_board_id"),
+            "collective_id": cfg.get("collective_id"),
+        }
+        for project, cfg in maps.items()
+    }
+    return json.dumps(compact_maps, ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -847,18 +995,27 @@ def map_sync() -> str:
 
 
 @app.tool()
-def sync_tasks(project: str) -> str:
-    """Sync Deck cards from Nextcloud → missions table for a project.
+def sync_tasks(project: str, prune: bool = False) -> str:
+    """Sync Deck cards from Nextcloud → missions table and report drift.
 
     Fetches all stacks/cards from the project's mapped Deck board, extracts
     quests (markdown checkbox lines in the card description; ``done`` = ``[x]``),
     and upserts into the missions + checklist_items tables.
 
+    Always reports drift: missions in the replica whose card is missing from a
+    complete Deck read (``missing_in_deck``) and cards that were in Deck but not
+    refreshed (``skipped``, each with its cause). ``prune=True`` additionally
+    deletes the proven orphans. Pruning never happens over a failed, partial,
+    or unresolvable Deck read: a false orphan destroys real work.
+
     Args:
         project: Project slug (e.g. "voy-rojo").
+        prune: Delete replica missions proven absent from a complete Deck read.
+            Defaults to False (report drift only, delete nothing).
 
     Returns:
-        JSON with sync results (missions created/updated, errors).
+        JSON with ``synced``, ``pruned``, ``missing_in_deck``, ``skipped`` and
+        ``errors`` (plus counters and ``read_complete``).
     """
     from .context_extractor import get_project_maps
     from .mcp_client import call_mcp_tool, TOOL_NAMES
@@ -879,30 +1036,127 @@ def sync_tasks(project: str) -> str:
         timeout=15.0,
     )
     if stacks_data is None:
-        return json.dumps({"error": f"Cannot reach Deck: {err}"})
+        # Failed read: nothing is synced, nothing is pruned, and the failure is
+        # reported in the same shape as a successful run.
+        return json.dumps(
+            {
+                "project": project,
+                "board_id": board_id,
+                "synced": 0,
+                "pruned": [],
+                "missing_in_deck": [],
+                "skipped": [],
+                "errors": [f"Cannot reach Deck: {err}"],
+                "total_errors": 1,
+                "total_pruned": 0,
+                "total_missing_in_deck": 0,
+                "total_skipped": 0,
+                "prune_requested": prune,
+                "read_complete": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
-    stacks = (
-        stacks_data
-        if isinstance(stacks_data, list)
-        else stacks_data.get("stacks", stacks_data.get("result", []))
-    )
+    # A successful read is not the same as a COMPLETE read. Pruning deletes
+    # real work when a card is merely invisible because the read was partial,
+    # so every shape problem below marks the read incomplete and forbids
+    # pruning (requirement 4: a false orphan is worse than an extra card).
+    read_complete = True
+    read_issues: list[str] = []
+
+    if isinstance(stacks_data, list):
+        stacks = stacks_data
+    elif isinstance(stacks_data, dict):
+        if isinstance(stacks_data.get("stacks"), list):
+            stacks = stacks_data["stacks"]
+        elif isinstance(stacks_data.get("result"), list):
+            stacks = stacks_data["result"]
+        else:
+            read_complete = False
+            read_issues.append("Deck response has no 'stacks'/'result' list")
+            stacks = []
+    else:
+        read_complete = False
+        read_issues.append(
+            f"Deck response has unexpected shape: {type(stacks_data).__name__}"
+        )
+        stacks = []
 
     created = 0
     updated_count = 0
     errors = []
+    skipped: list[dict] = []
+    seen_card_ids: set[int] = set()
 
     for stack in stacks:
+        if not isinstance(stack, dict) or stack.get("id") is None:
+            read_complete = False
+            read_issues.append("Stack without id in Deck read")
+            continue
         stack_name = stack.get("title", "?")
-        cards = stack.get("cards", [])
+        cards = stack.get("cards") or []
+        if not isinstance(cards, list):
+            read_complete = False
+            read_issues.append(f"Stack {stack.get('id')}: 'cards' is not a list")
+            continue
         if not cards:
             continue
 
+        # Map stack title → mission status
+        status_map = {
+            "backlog": "pendiente",
+            "pendiente": "pendiente",
+            "to do": "pendiente",
+            "en progreso": "en_progreso",
+            "in progress": "en_progreso",
+            "doing": "en_progreso",
+            "done": "completada",
+            "hecho": "completada",
+            "completada": "completada",
+            "completado": "completada",
+        }
+        status = status_map.get(str(stack_name).lower().strip())
+
         for card in cards:
             try:
-                card_id = card.get("id")
-                if not card_id:
+                if not isinstance(card, dict) or not card.get("id"):
+                    read_complete = False
+                    read_issues.append("Card without id in Deck read")
+                    skipped.append(
+                        {
+                            "deck_task_id": None,
+                            "title": card.get("title") if isinstance(card, dict) else None,
+                            "reason": "card_unreadable",
+                        }
+                    )
                     continue
+                card_id = card.get("id")
+                # Membership is known as soon as the card id is: record it
+                # before any skip so a skipped card is never a false orphan.
+                seen_card_ids.add(card_id)
                 title = card.get("title", "Sin título")
+
+                if card.get("archived"):
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": "archived",
+                        }
+                    )
+                    continue
+
+                if status is None:
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": f"stack_unmapped: {stack_name}",
+                        }
+                    )
+                    continue
+
                 description = card.get("description", "")
 
                 # Get card detail for checklist info
@@ -916,6 +1170,23 @@ def sync_tasks(project: str) -> str:
                     },
                     timeout=8.0,
                 )
+
+                # A card we cannot read is a card we cannot refresh. Report it
+                # as skipped with its cause instead of silently keeping stale
+                # data, and treat the read as partial so nothing is pruned.
+                if detail_err or not isinstance(card_detail, dict):
+                    read_complete = False
+                    read_issues.append(
+                        f"Card {card_id}: detail unavailable ({detail_err or 'empty'})"
+                    )
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": f"card_read_failed: {detail_err or 'unavailable'}",
+                        }
+                    )
+                    continue
 
                 # Infer checklist_total from description parsing
                 # Deck stores checklist as "n/N" or markdown checkboxes - we count items
@@ -970,20 +1241,7 @@ def sync_tasks(project: str) -> str:
                         if done:
                             checklist_done += 1
 
-                # Map stack title → mission status
-                status_map = {
-                    "backlog": "pendiente",
-                    "pendiente": "pendiente",
-                    "to do": "pendiente",
-                    "en progreso": "en_progreso",
-                    "in progress": "en_progreso",
-                    "doing": "en_progreso",
-                    "done": "completada",
-                    "hecho": "completada",
-                    "completada": "completada",
-                    "completado": "completada",
-                }
-                status = status_map.get(stack_name.lower().strip(), "pendiente")
+                # Map stack title → mission status (computed per stack above).
 
                 # Upsert mission
                 mission_id = persistence.upsert_mission(
@@ -997,6 +1255,13 @@ def sync_tasks(project: str) -> str:
                 )
                 if mission_id == 0:
                     errors.append(f"Card {card_id}: upsert returned 0")
+                    skipped.append(
+                        {
+                            "deck_task_id": card_id,
+                            "title": title,
+                            "reason": "upsert_failed",
+                        }
+                    )
                     continue
 
                 # Upsert checklist items
@@ -1008,23 +1273,127 @@ def sync_tasks(project: str) -> str:
                         done=item_data["done"],
                     )
 
+                # The counters are recomputed from the replica rows, not from
+                # this Deck parse. A card whose description carries no quest
+                # lines (native Deck checklist, stale description read) leaves
+                # the existing rows untouched, so a parse of 0 MUST NOT zero
+                # counters that the rows say are not 0.
+                try:
+                    counters_ok = persistence.refresh_mission_checklist_counts(
+                        mission_id
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"Card {card_id}: checklist counters not refreshed: {exc}"
+                    )
+                    counters_ok = False
+                if counters_ok is False:
+                    errors.append(
+                        f"Card {card_id}: checklist counters not refreshed "
+                        "(mission row missing)"
+                    )
+
                 created += 1
 
             except Exception as exc:
                 errors.append(f"Card {card.get('id', '?')}: {exc}")
                 logger.exception("sync_tasks card error")
 
+    # ── Drift report (always computed, prune or not) ──────────────────────
+    # A mission is drift when the replica still holds it but a complete Deck
+    # read no longer knows its card. Without a complete read we cannot tell
+    # "not in Deck" from "I could not read it", so no orphan is ever inferred.
+    missing_in_deck: list[dict] = []
+    if read_complete:
+        for mission in persistence.list_missions(project):
+            deck_task_id = mission.get("deck_task_id")
+            if deck_task_id is None:
+                continue
+            if deck_task_id not in seen_card_ids:
+                missing_in_deck.append(
+                    {
+                        "mission_id": mission.get("id"),
+                        "deck_task_id": deck_task_id,
+                        "title": mission.get("title"),
+                    }
+                )
+    else:
+        errors.append(
+            "drift_undetermined: Deck read incomplete ("
+            + "; ".join(read_issues[:5])
+            + ")"
+        )
+
+    # ── Prune (explicit, and only over a complete read) ──────────────────
+    pruned: list[int] = []
+    if prune:
+        if not read_complete:
+            errors.append("prune_skipped: incomplete Deck read, nothing deleted")
+        else:
+            for entry in missing_in_deck:
+                mission_id = entry["mission_id"]
+                try:
+                    if persistence.prune_mission(mission_id):
+                        pruned.append(mission_id)
+                    else:
+                        errors.append(
+                            f"prune {mission_id}: mission row not found"
+                        )
+                except Exception as exc:
+                    errors.append(f"prune {mission_id}: {exc}")
+                    logger.exception("sync_tasks prune error")
+
     return json.dumps(
         {
             "project": project,
             "board_id": board_id,
             "synced": created,
+            "pruned": pruned,
+            "missing_in_deck": missing_in_deck,
+            "skipped": skipped,
             "errors": errors,
             "total_errors": len(errors),
+            "total_pruned": len(pruned),
+            "total_missing_in_deck": len(missing_in_deck),
+            "total_skipped": len(skipped),
+            "prune_requested": prune,
+            "read_complete": read_complete,
         },
         ensure_ascii=False,
         default=str,
     )
+
+
+def _normalize_stacks_payload(data: Any) -> list | None:
+    """Return the stacks list from a ``deck_get_stacks`` payload.
+
+    The nextcloud MCP is reached through the ``http-to-stdio`` proxy. When that
+    proxy hands the tool result back as text, ``mcp_client._parse_response``
+    returns the raw string (its documented contract: JSON content is decoded,
+    anything else is returned as text). A serialized stacks document therefore
+    reaches callers as ``str`` and reading it with ``.get`` raised
+    ``AttributeError: 'str' object has no attribute 'get'`` (card #218,
+    quest 20).
+
+    This decodes text payloads — including the double-encoded form the proxy
+    produced — before the ``stacks``/``result`` key is read, and returns
+    ``None`` for anything that is not a stacks document so callers fail closed
+    instead of guessing a stack.
+    """
+    for _ in range(3):
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            data = data.get("stacks", data.get("result", []))
+            continue
+        return None
+    return None
 
 
 def _resolve_stack_for_card(
@@ -1059,11 +1428,9 @@ def _resolve_stack_for_card(
     if data is None:
         return None, None, err or "unavailable"
 
-    stacks = (
-        data
-        if isinstance(data, list)
-        else data.get("stacks", data.get("result", []))
-    )
+    stacks = _normalize_stacks_payload(data)
+    if stacks is None:
+        return None, None, "unexpected Deck response shape"
 
     card_id = mission.get("deck_task_id")
     for stack in stacks:
@@ -1200,6 +1567,35 @@ def sync_task(mission_id: int) -> str:
         )
         quests_synced += 1
 
+    # Final authoritative counters: derived from the rows in the replica, so a
+    # partial quest refresh can never leave an optimistic counter behind.
+    try:
+        counters_ok = persistence.refresh_mission_checklist_counts(mission_id)
+    except Exception as exc:
+        logger.warning("sync_task: checklist counter refresh failed: %s", exc)
+        counters_ok = False
+    if counters_ok is False:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "replica_refresh_failed",
+                "mission_id": mission_id,
+                "deck_task_id": mission["deck_task_id"],
+                "replica_stale": True,
+                "reconcile_with": (
+                    f"mission_repair_checklist_counts(mission_id={mission_id})"
+                ),
+                "error": (
+                    "The mission's checklist rows were refreshed from Deck, but "
+                    "their counters could not be recomputed; the replica is "
+                    f"inconsistent. Run mission_repair_checklist_counts("
+                    f"mission_id={mission_id})."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     return json.dumps(
         {
             "mission_id": mission_id,
@@ -1262,50 +1658,96 @@ def sync_all() -> str:
 
 
 @app.tool()
-def mission_list(project: str, include_description: bool = False) -> str:
-    """List missions (Deck tasks) for a project.
+def mission_list(
+    project: str,
+    include_description: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> str:
+    """List missions (Deck tasks) for a project, optionally paginated.
 
     Compact by default (design D4): each mission is represented by
     ``{id, title, status}`` only — no description and no nested
     ``checklist_items``. Pass ``include_description=True`` to opt in to the full
     payload (e.g. the dashboard). There is no global ``verbose`` toggle.
 
+    Pagination (card #218, quest 10): with no ``limit`` every mission is
+    returned, preserving the original behavior. ``limit`` selects a page size
+    (must be a positive integer) and ``offset`` skips that many missions
+    (default 0). ``total`` is always the real number of missions for the
+    project, independent of the page size, so callers can page without a
+    second counting call. An ``offset`` past ``total`` returns an empty page
+    with the correct ``total``.
+
     Args:
         project: Project slug.
         include_description: If True, returns the full payload including
             description and nested checklist_items. Defaults to False (compact).
+        limit: Optional page size (positive integer). Defaults to None (all).
+        offset: Missions to skip before the page. Defaults to 0.
 
     Returns:
-        JSON with missions list.
+        JSON with missions list and the real ``total``.
     """
-    missions = persistence.list_missions(project)
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return json.dumps(
+                {
+                    "error": "limit must be a positive integer (>= 1)",
+                    "code": "invalid_limit",
+                },
+                ensure_ascii=False,
+            )
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return json.dumps(
+            {
+                "error": "offset must be a non-negative integer (>= 0)",
+                "code": "invalid_offset",
+            },
+            ensure_ascii=False,
+        )
+
+    all_missions = persistence.list_missions(project)
+    total = len(all_missions)
+
+    if limit is None:
+        page = all_missions[offset:] if offset else all_missions
+    else:
+        page = all_missions[offset : offset + limit]
 
     if include_description:
-        payload = {
-            "project": project,
-            "missions": missions,
-            "total": len(missions),
-        }
+        rendered = page
     else:
-        compact_missions = [compact.compact_mission(m) for m in missions]
-        payload = {
-            "project": project,
-            "missions": compact_missions,
-            "total": len(compact_missions),
-        }
+        rendered = [compact.compact_mission(m) for m in page]
+
+    payload = {
+        "project": project,
+        "missions": rendered,
+        "total": total,
+    }
 
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 @app.tool()
 def mission_get(mission_id: int) -> str:
-    """Retrieve a single mission by ID with minimal fields."""
+    """Retrieve a single mission by ID with minimal fields.
+
+    ``deck_stack_id`` is returned verbatim (``null`` when the replica has not
+    backfilled it yet) so a caller can resolve the Deck board+stack without an
+    extra lookup. It is never guessed or filled in here.
+    """
     mission = persistence.get_mission(mission_id)
     if not mission:
         return json.dumps({"error": f"Mission {mission_id} not found"})
     item_ids = [ci["id"] for ci in persistence.list_checklist_items(mission["id"])]
     return json.dumps(
-        {"id": mission["id"], "title": mission["title"], "checklist_item_ids": item_ids},
+        {
+            "id": mission["id"],
+            "title": mission["title"],
+            "checklist_item_ids": item_ids,
+            "deck_stack_id": mission.get("deck_stack_id"),
+        },
         ensure_ascii=False,
         default=str,
     )
@@ -1389,11 +1831,9 @@ def _fetch_stacks(board_id: int) -> tuple[list | None, str | None]:
     )
     if data is None:
         return None, err or "unavailable"
-    stacks = (
-        data
-        if isinstance(data, list)
-        else data.get("stacks", data.get("result", []))
-    )
+    stacks = _normalize_stacks_payload(data)
+    if stacks is None:
+        return None, "unexpected Deck response shape"
     return stacks, None
 
 
@@ -1424,22 +1864,128 @@ def _resolve_stack_id(
     return int(stacks[0]["id"]), None
 
 
-def _refresh_mission_replica(
+def _refresh_mission_replica_from_card(
     mission: dict,
-    title: str,
-    description: str,
-    status: str,
-) -> int:
-    """Refresh a mission row without disturbing its quest rows (replica only)."""
-    return persistence.upsert_mission(
-        deck_task_id=mission["deck_task_id"],
-        project=mission.get("project", ""),
-        title=title,
-        description=description,
-        status=status,
-        checklist_total=mission.get("checklist_total", 0) or 0,
-        checklist_done=mission.get("checklist_done", 0) or 0,
-    )
+    card: dict,
+    status: str | None = None,
+    *,
+    adopt_ids: dict[int, int] | None = None,
+) -> tuple[int, dict[int, int], str | None]:
+    """Refresh ONE mission's replica from an authoritative post-write card.
+
+    ``card`` is the payload the bridge produced from the single card read it
+    already performs for the write (``{"title", "description", "quests"}``):
+    exactly what Deck holds after the acknowledged write. That is the
+    mission-scoped refresh this operation needs — no project-wide sweep, no
+    second read and no per-quest Deck call (no N+1).
+
+    The mission row (title, description, quest counters) and every quest row
+    are refreshed from that payload, and replica quests Deck no longer has are
+    pruned.
+
+    ``adopt_ids`` maps an ``item_index`` to the id the server already composed
+    into that line's marker (``quest_add``). Those rows are written at the
+    exact id so the marker and the replica handle can never diverge.
+
+    Returns ``(mission_id, {item_index: replica_quest_id}, err)``. On success
+    ``err`` is ``None``; when the local refresh fails it returns the error
+    string so the caller can report "Deck written, replica stale" instead of a
+    clean success.
+    """
+    quests = card.get("quests") or []
+    title = card.get("title") or mission.get("title", "") or ""
+    description = card.get("description", "") or ""
+    checklist_total = len(quests)
+    checklist_done = sum(1 for quest in quests if quest.get("done"))
+    replicated_status = status or mission.get("status", "pendiente") or "pendiente"
+    forced_ids = adopt_ids or {}
+
+    try:
+        mission_id = int(mission.get("id") or 0)
+    except (TypeError, ValueError):
+        mission_id = 0
+
+    quest_ids: dict[int, int] = {}
+    try:
+        stored_id = persistence.upsert_mission(
+            deck_task_id=mission["deck_task_id"],
+            project=mission.get("project", ""),
+            title=title,
+            description=description,
+            status=replicated_status,
+            checklist_total=checklist_total,
+            checklist_done=checklist_done,
+        )
+        if not mission_id:
+            try:
+                mission_id = int(stored_id or 0)
+            except (TypeError, ValueError):
+                mission_id = 0
+        if not mission_id:
+            return 0, {}, "mission row not found after upsert"
+
+        persistence.delete_checklist_items_beyond(mission_id, checklist_total)
+        for idx, quest in enumerate(quests):
+            forced_id = forced_ids.get(idx)
+            if forced_id is not None:
+                quest_id = persistence.upsert_checklist_item_with_id(
+                    item_id=forced_id,
+                    mission_id=mission_id,
+                    item_index=idx,
+                    text=quest["text"],
+                    done=1 if quest["done"] else 0,
+                )
+            else:
+                quest_id = persistence.upsert_checklist_item(
+                    mission_id=mission_id,
+                    item_index=idx,
+                    text=quest["text"],
+                    done=1 if quest["done"] else 0,
+                )
+            quest_ids[idx] = quest_id
+
+        # Counters are derived from the rows that were just written, never from
+        # the parsed payload: one calculation point (persistence) and no
+        # optimistic counter survives a failed row write.
+        if persistence.refresh_mission_checklist_counts(mission_id) is False:
+            return mission_id, quest_ids, "mission row not found after refresh"
+    except Exception as exc:  # reported to the caller, never hidden
+        logger.warning("replica refresh from Deck card failed: %s", exc)
+        return mission_id, quest_ids, str(exc)
+
+    return mission_id, quest_ids, None
+
+
+def _deck_write_refresh_failure(
+    *,
+    deck_written_what: str,
+    mission_id: int,
+    refresh_error: str,
+    extra: dict | None = None,
+) -> str:
+    """Build the explicit fail-closed response for a stale replica.
+
+    The Deck write already happened, so this can never be reported as a clean
+    success: the payload says WHAT Deck holds and that the replica is behind,
+    so the caller can reconcile with ``sync_task``.
+    """
+    response = {
+        "status": "error",
+        "code": "replica_refresh_failed",
+        "deck_written": True,
+        "deck_written_what": deck_written_what,
+        "replica_refresh_error": refresh_error,
+        "replica_stale": True,
+        "reconcile_with": f"sync_task({mission_id})",
+        "error": (
+            f"{deck_written_what}. The local replica could not be refreshed "
+            f"({refresh_error}), so it is now stale; run "
+            f"sync_task({mission_id}) to reconcile."
+        ),
+    }
+    if extra:
+        response.update(extra)
+    return json.dumps(response, ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -1478,7 +2024,7 @@ def mission_create(project: str, title: str, description: str = "") -> str:
     )
     if card_id is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
@@ -1492,7 +2038,21 @@ def mission_create(project: str, title: str, description: str = "") -> str:
     )
     if not mission_id:
         return json.dumps(
-            {"error": "Failed to refresh local replica"},
+            {
+                "status": "error",
+                "code": "replica_refresh_failed",
+                "deck_written": True,
+                "deck_task_id": card_id,
+                "deck_written_what": f"Deck card {card_id} created",
+                "replica_refresh_error": "mission row not stored",
+                "replica_stale": True,
+                "reconcile_with": "sync_task(<mission_id>)",
+                "error": (
+                    f"Deck card {card_id} was created, but the local replica "
+                    "was not refreshed (mission row not stored). The replica "
+                    "is now stale; sync the mission before using its id."
+                ),
+            },
             ensure_ascii=False,
             default=str,
         )
@@ -1521,7 +2081,9 @@ def mission_update_title(mission_id: int, title: str) -> str:
         title: New mission title (Deck card title).
 
     Returns:
-        JSON {mission_id, title, status}.
+        JSON {mission_id, title, status}. When Deck accepted the title but the
+        replica refresh failed, returns an explicit error (``code:
+        replica_refresh_failed``, ``deck_written: true``).
     """
     mission = persistence.get_mission(mission_id)
     if not mission:
@@ -1543,20 +2105,29 @@ def mission_update_title(mission_id: int, title: str) -> str:
             default=str,
         )
 
-    ok, err = deck_bridge.update_title(
+    record, err = deck_bridge.update_title_record(
         board_id, stack_id, mission["deck_task_id"], title
     )
-    if not ok:
+    if record is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
 
     status = mission.get("status", "pendiente")
-    _refresh_mission_replica(
-        mission, title, mission.get("description", "") or "", status
+    _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record, status
     )
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} title updated to {title!r}"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={"mission_id": mission_id, "title": title},
+        )
     return json.dumps(
         {"mission_id": mission_id, "title": title, "status": status},
         ensure_ascii=False,
@@ -1569,15 +2140,21 @@ def mission_update_description(mission_id: int, description: str) -> str:
     """Update a mission's prose description without touching its quests (D3).
 
     The bridge preserves every quest line byte-identical and in its original
-    order. An unknown ``mission_id`` fails with a not-found error and performs
-    NO Deck call (Req 1).
+    order. The write starts from a fresh card read; when that read is
+    suspicious (no checkbox lines while the replica knows quests) the write is
+    refused instead of silently deleting the checklist. An unknown
+    ``mission_id`` fails with a not-found error and performs NO Deck call
+    (Req 1).
 
     Args:
         mission_id: Local mission id.
         description: New prose description (quest lines are ignored).
 
     Returns:
-        JSON {mission_id, status}.
+        JSON {mission_id, status}. When the Deck write succeeds but the replica
+        refresh fails, returns an explicit error (``code:
+        replica_refresh_failed``, ``deck_written: true``) naming what Deck holds
+        and how to reconcile — never a clean success with a stale replica.
     """
     mission = persistence.get_mission(mission_id)
     if not mission:
@@ -1599,22 +2176,64 @@ def mission_update_description(mission_id: int, description: str) -> str:
             default=str,
         )
 
-    ok, err = deck_bridge.update_description(
-        board_id, stack_id, mission["deck_task_id"], description
+    # The replica's quest rows are the only evidence that this mission has a
+    # checklist. Use both the row count and the denormalized counter so a stale
+    # read cannot be mistaken for a human deleting every quest.
+    replica_quests = persistence.list_checklist_items(mission_id) or []
+    expected_quests = max(
+        len(replica_quests),
+        int(mission.get("checklist_total") or 0),
     )
-    if not ok:
+
+    result, err = deck_bridge.write_description(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        description,
+        expected_quest_count=expected_quests,
+    )
+    if result is None:
+        if err == deck_bridge.ERR_EMPTY_DESCRIPTION:
+            detail = (
+                f"Deck card {mission['deck_task_id']} read returned an empty "
+                f"description while the replica has {expected_quests} quest(s); "
+                "refusing to overwrite the card. Re-read the card and retry."
+            )
+        elif err == deck_bridge.ERR_QUESTS_MISSING:
+            detail = (
+                f"Deck card {mission['deck_task_id']} read returned no quest "
+                f"lines while the replica has {expected_quests} quest(s); the "
+                "read looks stale. Refusing to overwrite the card."
+            )
+        else:
+            detail = f"Deck bridge unavailable: {err}"
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {
+                "error": detail,
+                "mission_id": mission_id,
+                "reason": err,
+                "deck_written": False,
+            },
             ensure_ascii=False,
             default=str,
         )
 
-    _refresh_mission_replica(
-        mission,
-        mission.get("title", "") or "",
-        description,
-        mission.get("status", "pendiente"),
+    # Refresh the replica from what Deck actually holds now: same prose, same
+    # quests, same order, same state. Report a refresh failure instead of
+    # hiding it; the Deck write already happened.
+    _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, result, mission.get("status", "pendiente")
     )
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} description updated"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={"mission_id": mission_id},
+        )
+
     return json.dumps(
         {"mission_id": mission_id, "status": "ok"},
         ensure_ascii=False,
@@ -1623,19 +2242,369 @@ def mission_update_description(mission_id: int, description: str) -> str:
 
 
 @app.tool()
-def quest_add(mission_id: int, title: str) -> str:
-    """Append a quest to a mission's Deck card (Deck-first), then the replica.
+def mission_repair_checklist_counts(
+    mission_id: int | None = None,
+    project: str | None = None,
+    confirm: bool = False,
+    reason: str = "",
+) -> str:
+    """Recompute a mission's (or a project's) checklist counters from its rows.
 
-    The quest is always written with ``done=false`` (design D2/D10). There is
-    no tool that marks a quest complete; only ``end_turn`` does that.
+    Replica-only repair for counters that were frozen by an earlier write path.
+    It reads nothing from Deck and writes ONLY ``missions.checklist_total`` and
+    ``missions.checklist_done`` — every other column is left untouched. It is
+    idempotent: running it twice changes nothing the second time.
+
+    This lives as its own tool instead of inside ``sync_task`` on purpose:
+    ``sync_task`` needs Deck to be reachable and rewrites the mission's title,
+    description and status from Deck, so it cannot repair an offline replica
+    and, worse, it depends on the very read that may have produced the wrong
+    counter. Repair must be a pure, offline recomputation of the rows.
+
+    Args:
+        mission_id: Repair exactly one mission. Mutually exclusive with
+            ``project``.
+        project: Repair every mission of one project. Mutually exclusive with
+            ``mission_id``.
+        confirm: Must be True; guards a bulk offline write.
+        reason: Non-empty justification for the repair.
+
+    Returns:
+        JSON {status, scope, checked, changed_count, changed} where ``changed``
+        lists only the missions that moved, each with ``before`` and ``after``.
+        ``status`` is ``unchanged`` when every counter already matched the rows.
+        Missing confirmation, an empty reason, an ambiguous scope or an unknown
+        mission all fail without writing anything.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to repair",
+                "code": "confirmation_required",
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": (
+                    "reason required: mission_repair_checklist_counts needs a "
+                    "non-empty reason"
+                ),
+                "code": "reason_required",
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if (mission_id is None) == (project is None):
+        return json.dumps(
+            {
+                "error": "pass exactly one of mission_id or project",
+                "code": "invalid_scope",
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    result = persistence.repair_checklist_counts(
+        mission_id=mission_id, project=project
+    )
+    if result is None:
+        return json.dumps(
+            {
+                "error": f"Mission {mission_id} not found",
+                "mission_id": mission_id,
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    changed = result["changed"]
+    return json.dumps(
+        {
+            "status": "ok" if changed else "unchanged",
+            "scope": (
+                {"mission_id": mission_id}
+                if mission_id is not None
+                else {"project": project}
+            ),
+            "checked": result["checked"],
+            "changed_count": len(changed),
+            "changed": changed,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def mission_delete(
+    mission_id: int,
+    confirm: bool = False,
+    reason: str = "",
+    requested_by: str = "hermes",
+) -> str:
+    """Delete ONE mission from the replica, with an audit trail. NEVER touches Deck.
+
+    This is a REPLICA-ONLY cleanup: the Deck card is not deleted, archived, or
+    moved. Everything the replica holds for the mission — the mission row, its
+    quests (``checklist_items``), ``intentos``, ``attempt_grants`` and
+    ``turn_bitacora`` rows — is removed in a single transaction, or not at all.
+
+    Deleting a mission is never a side effect of a typo: both ``confirm=True``
+    and a non-empty ``reason`` are required. When either is missing the call
+    fails validation and mutates nothing. An unknown ``mission_id`` fails with
+    an explicit error naming the id.
+
+    The deletion is recorded in the replica's ``mission_deletions`` audit ledger
+    (who, when, why, and the deleted ids), which survives the mission.
 
     Args:
         mission_id: Local mission id.
-        title: Quest text.
+        confirm: Must be True; guards against accidental deletion.
+        reason: Non-empty justification, stored in the audit ledger.
+        requested_by: Who requested the deletion (audit ``who``).
 
     Returns:
-        JSON {quest_id, mission_id, title, done}.
+        JSON {status, mission_id, deck_task_id, project, title, deleted, audit_id}
+        or a validation/not-found error object.
     """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to delete",
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": "reason required: mission_delete needs a non-empty reason",
+                "mission_id": mission_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    try:
+        result = persistence.delete_mission(
+            mission_id, reason=reason, requested_by=requested_by
+        )
+    except ValueError as exc:
+        return json.dumps(
+            {"error": str(exc), "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if result is None:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found", "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return json.dumps(
+        {
+            "status": "deleted",
+            "mission_id": result["mission_id"],
+            "deck_task_id": result["deck_task_id"],
+            "project": result["project"],
+            "title": result["title"],
+            "deleted": {
+                "quests": result["quests_deleted"],
+                "intentos": result["intentos_deleted"],
+                "attempt_grants": result["grants_deleted"],
+                "turn_bitacora": result["bitacora_deleted"],
+            },
+            "audit_id": result["audit_id"],
+            "replica_only": True,
+            "deck_untouched": True,
+            "note": "Replica only: the Deck card was NOT deleted, archived, or moved.",
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _quest_add_batch(
+    *,
+    mission: dict,
+    mission_id: int,
+    board_id: int,
+    stack_id: int,
+    clean_titles: list[str],
+) -> str:
+    """Append a validated quest batch: one Deck write, one replica refresh.
+
+    The ids are allocated read-only in one call and composed into every marker
+    before the Deck write, so a failed write leaves no phantom replica row.
+    A single ``refresh_error`` covers the whole batch: when Deck was written
+    but the replica could not follow, the caller gets ``deck_written: true``.
+    """
+    try:
+        first_id = persistence.next_checklist_item_id()
+    except Exception as exc:
+        return json.dumps(
+            {"error": f"Cannot allocate quest ids: {exc}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    new_ids = [first_id + index for index in range(len(clean_titles))]
+    entries = list(zip(clean_titles, new_ids))
+
+    record, err = deck_bridge.append_quests_record(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        entries,
+    )
+    if record is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    positions = record["positions"]
+    adopt_ids = dict(zip(positions, new_ids))
+    _replica_id, quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record, adopt_ids=adopt_ids
+    )
+    if refresh_error is None and any(
+        quest_ids.get(position) != quest_id
+        for position, quest_id in adopt_ids.items()
+    ):
+        refresh_error = "appended quest rows do not use the composed marker ids"
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest batch appended at "
+                f"positions {positions[0]}-{positions[-1]}"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={
+                "mission_id": mission_id,
+                "positions": positions,
+                "quest_ids": new_ids,
+            },
+        )
+
+    return json.dumps(
+        {
+            "mission_id": mission_id,
+            "quest_ids": new_ids,
+            "count": len(new_ids),
+            "identity": "marker",
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_add(
+    mission_id: int,
+    title: str | None = None,
+    quests: list[str] | None = None,
+) -> str:
+    """Append a quest, or a whole batch of quests, Deck-first, then the replica.
+
+    The quest (or every quest in the batch) is always written with
+    ``done=false`` (design D2/D10). There is no tool that marks a quest
+    complete; only ``end_turn`` does that.
+
+    ``title`` and ``quests`` are mutually exclusive. A batch is written with
+    ONE Deck description write and ONE replica refresh, so N quests never cost
+    N round-trips (card #218, quest 10). Every server-composed id is returned
+    in request order.
+
+    Args:
+        mission_id: Local mission id.
+        title: Quest text for the single-quest form (original signature).
+        quests: Batch of quest texts. Mutually exclusive with ``title``.
+
+    Returns:
+        Single form: JSON {quest_id, mission_id, title, done, identity}.
+        Batch form: JSON {mission_id, quest_ids, count, identity}, with
+        ``quest_ids`` in the same order the quests were requested. When Deck
+        accepted the write but the replica refresh failed, returns an explicit
+        error (``code: replica_refresh_failed``, ``deck_written: true``)
+        instead of a clean success.
+    """
+    if title is not None and quests is not None:
+        return json.dumps(
+            {
+                "error": "Pass either 'title' or 'quests', not both",
+                "code": "quest_add_ambiguous_input",
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if title is None and quests is None:
+        return json.dumps(
+            {
+                "error": "Pass either 'title' or 'quests'",
+                "code": "quest_add_missing_input",
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    clean_titles: list[str] = []
+    if quests is not None:
+        if not isinstance(quests, list) or not quests:
+            return json.dumps(
+                {
+                    "error": "Quest batch must be a non-empty list",
+                    "code": "quests_empty",
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        for raw in quests:
+            if not isinstance(raw, str):
+                return json.dumps(
+                    {
+                        "error": "Every quest must be a string",
+                        "code": "quest_text_invalid",
+                        "deck_written": False,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            clean = deck_bridge.sanitize_quest_text(raw)
+            if clean is None:
+                code = (
+                    "quest_text_multiline"
+                    if ("\n" in raw or "\r" in raw)
+                    else "quest_text_empty"
+                )
+                return json.dumps(
+                    {
+                        "error": "Quest text must be a single non-empty line",
+                        "code": code,
+                        "deck_written": False,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            clean_titles.append(clean)
+
     mission = persistence.get_mission(mission_id)
     if not mission:
         return json.dumps(
@@ -1656,35 +2625,84 @@ def quest_add(mission_id: int, title: str) -> str:
             default=str,
         )
 
-    position, err = deck_bridge.append_quest(
-        board_id, stack_id, mission["deck_task_id"], title
-    )
-    if position is None:
+    if quests is not None:
+        return _quest_add_batch(
+            mission=mission,
+            mission_id=mission_id,
+            board_id=board_id,
+            stack_id=stack_id,
+            clean_titles=clean_titles,
+        )
+
+    # The marker id is composed by the server (never by the model) and must be
+    # the same id the replica row will use. The id is allocated read-only, so
+    # a failed Deck write leaves the replica untouched.
+    clean_title = deck_bridge.sanitize_quest_text(title)
+    if clean_title is None:
+        raw_title = title or ""
+        code = (
+            "quest_text_multiline"
+            if ("\n" in raw_title or "\r" in raw_title)
+            else "quest_text_empty"
+        )
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {
+                "error": "Quest text must be a single non-empty line",
+                "code": code,
+                "deck_written": False,
+            },
             ensure_ascii=False,
             default=str,
         )
 
-    quest_id = persistence.upsert_checklist_item(
-        mission_id=mission_id,
-        item_index=position,
-        text=title,
-        done=0,
-    )
-    if not quest_id:
+    try:
+        new_quest_id = persistence.next_checklist_item_id()
+    except Exception as exc:
         return json.dumps(
-            {"error": "Failed to refresh local replica"},
+            {"error": f"Cannot allocate quest id: {exc}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
 
+    record, err = deck_bridge.append_quest_record(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        clean_title,
+        quest_id=new_quest_id,
+    )
+    if record is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    position = record["position"]
+    _replica_id, quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record, adopt_ids={position: new_quest_id}
+    )
+    if refresh_error is None and quest_ids.get(position) != new_quest_id:
+        refresh_error = "appended quest row does not use the composed marker id"
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest appended at "
+                f"position {position}"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={"mission_id": mission_id, "title": clean_title, "position": position},
+        )
+
+    quest_id = new_quest_id
     return json.dumps(
         {
             "quest_id": quest_id,
             "mission_id": mission_id,
-            "title": title,
+            "title": clean_title,
             "done": False,
+            "identity": "marker",
         },
         ensure_ascii=False,
         default=str,
@@ -1710,7 +2728,11 @@ def quest_update(
         position: Optional Deck checkbox position override.
 
     Returns:
-        JSON {quest_id, title, done}.
+        JSON {quest_id, title, done}. An empty or multi-line ``title`` is
+        rejected with ``deck_written: false`` before any Deck read or write.
+        When Deck accepted the rewrite but the replica refresh failed, returns
+        an explicit error (``code: replica_refresh_failed``, ``deck_written:
+        true``).
     """
     quest = persistence.get_checklist_item_by_id(quest_id)
     if not quest:
@@ -1728,6 +2750,31 @@ def quest_update(
             default=str,
         )
 
+    if title is not None:
+        # Validate the new text before any Deck read/write: an empty or
+        # multi-line title can never be a quest line, and no quest may be
+        # mutated when the request is invalid (D2/D10).
+        clean_title = deck_bridge.sanitize_quest_text(title)
+        if clean_title is None:
+            raw_title = title or ""
+            code = (
+                "quest_text_multiline"
+                if ("\n" in raw_title or "\r" in raw_title)
+                else "quest_text_empty"
+            )
+            return json.dumps(
+                {
+                    "error": "Quest text must be a single non-empty line",
+                    "code": code,
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        new_text = clean_title
+    else:
+        new_text = quest["text"]
+
     board_id, err = _resolve_board_id(mission.get("project", ""))
     if err:
         return json.dumps({"error": err}, ensure_ascii=False, default=str)
@@ -1741,26 +2788,580 @@ def quest_update(
         )
 
     deck_position = position if position is not None else quest["item_index"]
-    new_text = title if title is not None else quest["text"]
 
-    ok, err = deck_bridge.update_quest(
+    record, err = deck_bridge.update_quest_record(
         board_id, stack_id, mission["deck_task_id"], deck_position, new_text
     )
-    if not ok:
+    if record is None:
         return json.dumps(
-            {"error": f"Deck bridge unavailable: {err}"},
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
             ensure_ascii=False,
             default=str,
         )
 
-    persistence.upsert_checklist_item(
-        mission_id=mission["id"],
-        item_index=deck_position,
-        text=new_text,
-        done=0,
+    _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record
     )
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} rewritten"
+            ),
+            mission_id=mission["id"],
+            refresh_error=refresh_error,
+            extra={
+                "quest_id": quest_id,
+                "title": new_text,
+                "position": deck_position,
+            },
+        )
+
     return json.dumps(
         {"quest_id": quest_id, "title": new_text, "done": False},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _quest_pair(quest: dict) -> tuple[str, int]:
+    """The identity-sensitive pair used to prove quests are not renamed."""
+    return (quest["text"], 1 if quest.get("done") else 0)
+
+
+@app.tool()
+def quest_delete(
+    quest_id: int,
+    confirm: bool = False,
+    reason: str = "",
+    force: bool = False,
+    requested_by: str = "hermes",
+) -> str:
+    """Delete ONE quest from the Deck card and the replica, preserving ids.
+
+    The targeted quest line is removed from Deck and its replica row is
+    deleted; every surviving quest keeps its id, text and state and only its
+    ``item_index`` is recomputed. This never goes through the positional
+    upsert, which would rename the quests after the deleted one.
+
+    Both ``confirm=True`` and a non-empty ``reason`` are required and are
+    validated before any Deck read or write. A quest with traceability rows
+    (intentos, attempt grants, turn bitacora) is refused unless ``force=True``;
+    with ``force`` those rows are deleted in the same transaction and the audit
+    event in ``quest_deletions`` records the deleted ids.
+
+    Args:
+        quest_id: Local checklist-item (quest) id.
+        confirm: Must be True; guards against accidental deletion.
+        reason: Non-empty justification, stored in the audit ledger.
+        force: Delete even when the quest has traceability rows.
+        requested_by: Who requested the deletion (audit ``who``).
+
+    Returns:
+        JSON {status, quest_id, mission_id, text, deleted, deleted_ids,
+        audit_id} or an explicit error. When Deck was written but the replica
+        could not be refreshed, returns ``replica_refresh_failed`` with
+        ``deck_written: true``.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to delete",
+                "code": "confirmation_required",
+                "quest_id": quest_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": "reason required: quest_delete needs a non-empty reason",
+                "code": "reason_required",
+                "quest_id": quest_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    quest = persistence.get_checklist_item_by_id(quest_id)
+    if not quest:
+        return json.dumps(
+            {"error": f"Quest {quest_id} not found", "quest_id": quest_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    mission = persistence.get_mission(quest["mission_id"])
+    if not mission:
+        return json.dumps(
+            {
+                "error": f"Mission {quest['mission_id']} not found",
+                "quest_id": quest_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    history = persistence.quest_history_counts(quest_id)
+    if history and history.get("has_history") and not force:
+        return json.dumps(
+            {
+                "error": (
+                    "quest has traceability rows (intentos/grants/bitacora); "
+                    "pass force=true to delete it and its history"
+                ),
+                "code": "quest_has_history",
+                "quest_id": quest_id,
+                "mission_id": mission["id"],
+                "history": {
+                    "intentos": history["intentos"],
+                    "attempt_grants": history["grants"],
+                    "turn_bitacora": history["bitacora"],
+                },
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err, "deck_written": False}, ensure_ascii=False)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    deck_position = quest["item_index"]
+    record, err = deck_bridge.delete_quest_record_by_marker(
+        board_id, stack_id, mission["deck_task_id"], quest_id
+    )
+    if record is None:
+        if err == deck_bridge.ERR_LEGACY_IDENTITY:
+            return json.dumps(
+                {
+                    "error": (
+                        "Mission has no stable quest markers (legacy or mixed "
+                        "checklist); quest_delete requires marker identity. "
+                        "Run quest_migrate_identity(mission_id) first."
+                    ),
+                    "code": "legacy_identity",
+                    "quest_id": quest_id,
+                    "mission_id": mission["id"],
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Prove the identity invariant against the acknowledged card BEFORE touching
+    # the replica: the survivors, in order, must be exactly the quests Deck kept.
+    replica_before = persistence.list_checklist_items(mission["id"])
+    expected_pairs = [
+        _quest_pair(q) for q in replica_before if q["id"] != quest_id
+    ]
+    deck_pairs = [_quest_pair(q) for q in record.get("quests") or []]
+    if expected_pairs != deck_pairs:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} deleted"
+            ),
+            mission_id=mission["id"],
+            refresh_error=(
+                "replica and Deck disagree about the surviving quests; "
+                "the replica was not modified"
+            ),
+            extra={"quest_id": quest_id},
+        )
+
+    try:
+        result = persistence.delete_checklist_item(
+            quest_id,
+            force=force,
+            reason=reason,
+            requested_by=requested_by,
+            description=record.get("description"),
+        )
+    except Exception as exc:  # reported, never hidden
+        logger.warning("quest_delete replica update failed: %s", exc)
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} deleted"
+            ),
+            mission_id=mission["id"],
+            refresh_error=str(exc),
+            extra={"quest_id": quest_id},
+        )
+
+    if result is None or result.get("refused"):
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest at position "
+                f"{deck_position} deleted"
+            ),
+            mission_id=mission["id"],
+            refresh_error="replica quest row not found after the Deck write",
+            extra={"quest_id": quest_id},
+        )
+
+    return json.dumps(
+        {
+            "status": "deleted",
+            "quest_id": result["quest_id"],
+            "mission_id": result["mission_id"],
+            "text": result["text"],
+            "deleted": {
+                "intentos": result["intentos_deleted"],
+                "attempt_grants": result["grants_deleted"],
+                "turn_bitacora": result["bitacora_deleted"],
+            },
+            "deleted_ids": result["deleted_ids"],
+            "audit_id": result["audit_id"],
+            "forced": result["forced"],
+            "identity": "marker",
+            "deck_written": True,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_reorder(mission_id: int, ordered_ids: list[int]) -> str:
+    """Reorder a mission's whole checklist to exactly ``ordered_ids``.
+
+    ``ordered_ids`` must be exactly the mission's quest set: no duplicates,
+    nothing missing, nothing from another mission. Any difference fails before
+    any Deck or replica mutation. Ids move with their text and state — the pair
+    ``(id, text)`` is invariant; only the order changes.
+
+    One Deck read and one description write, then one replica transaction.
+
+    Args:
+        mission_id: Local mission id.
+        ordered_ids: Quest ids in the exact desired order.
+
+    Returns:
+        JSON {status, mission_id, ordered_ids, quests} or an explicit error.
+        When Deck was written but the replica could not be refreshed, returns
+        ``replica_refresh_failed`` with ``deck_written: true``.
+    """
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found", "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    quests = persistence.list_checklist_items(mission_id)
+    current_ids = [q["id"] for q in quests]
+    requested = list(ordered_ids or [])
+
+    duplicates = sorted({i for i in requested if requested.count(i) > 1})
+    missing = sorted(set(current_ids) - set(requested))
+    extra = sorted(set(requested) - set(current_ids))
+    if duplicates or missing or extra or len(requested) != len(current_ids):
+        return json.dumps(
+            {
+                "error": (
+                    "ordered_ids must be exactly the mission's quest set: "
+                    f"missing={missing}, extra={extra}, duplicates={duplicates}"
+                ),
+                "code": "quest_reorder_mismatch",
+                "mission_id": mission_id,
+                "missing": missing,
+                "extra": extra,
+                "duplicates": duplicates,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps({"error": err, "deck_written": False}, ensure_ascii=False)
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {"error": f"Cannot resolve Deck stack: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    by_id = {q["id"]: q for q in quests}
+
+    record, err = deck_bridge.reorder_quests_record_by_marker(
+        board_id, stack_id, mission["deck_task_id"], requested
+    )
+    if record is None:
+        if err == deck_bridge.ERR_LEGACY_IDENTITY:
+            return json.dumps(
+                {
+                    "error": (
+                        "Mission has no stable quest markers (legacy or mixed "
+                        "checklist); quest_reorder requires marker identity. "
+                        "Run quest_migrate_identity(mission_id) first."
+                    ),
+                    "code": "legacy_identity",
+                    "mission_id": mission_id,
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Same invariant as delete: the requested order must be the order Deck kept,
+    # otherwise the replica is stale and must not be rewritten over it.
+    expected_pairs = [_quest_pair(by_id[quest_id]) for quest_id in requested]
+    deck_pairs = [_quest_pair(q) for q in record.get("quests") or []]
+    if expected_pairs != deck_pairs:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests reordered"
+            ),
+            mission_id=mission_id,
+            refresh_error=(
+                "replica and Deck disagree about the reordered quests; "
+                "the replica was not modified"
+            ),
+            extra={"ordered_ids": requested},
+        )
+
+    try:
+        result = persistence.reorder_checklist_items(
+            mission_id, requested, description=record.get("description")
+        )
+    except Exception as exc:  # reported, never hidden
+        logger.warning("quest_reorder replica update failed: %s", exc)
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests reordered"
+            ),
+            mission_id=mission_id,
+            refresh_error=str(exc),
+            extra={"ordered_ids": requested},
+        )
+
+    if result is None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests reordered"
+            ),
+            mission_id=mission_id,
+            refresh_error="mission row not found after the Deck write",
+            extra={"ordered_ids": requested},
+        )
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "mission_id": mission_id,
+            "ordered_ids": result["ordered_ids"],
+            "quests": result["quests"],
+            "identity": "marker",
+            "deck_written": True,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_migrate_identity(
+    mission_id: int,
+    confirm: bool = False,
+    reason: str = "",
+    requested_by: str = "hermes",
+) -> str:
+    """Migrate ONE mission's existing quests to stable marker identity.
+
+    Explicit and versioned: it rewrites only the requested mission's Deck
+    description, adding a ``[](#q:{id})`` marker to each quest line while
+    preserving the id, text, order, bullet and done state of every quest. It
+    never generates new ids (that would rename exactly what it protects) and is
+    idempotent: a second run adds no marker and changes no id.
+
+    Both ``confirm=True`` and a non-empty ``reason`` are required and are
+    validated before any Deck read or write. The audit row is written to the
+    ``quest_identity_migrations`` ledger in the same transaction as the replica
+    description refresh.
+
+    Args:
+        mission_id: Local mission id (one mission, never a project sweep).
+        confirm: Must be True; guards against accidental rewrites.
+        reason: Non-empty justification, stored in the audit ledger.
+        requested_by: Who requested the migration (audit ``who``).
+
+    Returns:
+        JSON {status, mission_id, deck_written, migrated_ids, quest_ids,
+        audit_id, quests} or an explicit error. When Deck was written but the
+        replica could not be refreshed, returns ``replica_refresh_failed`` with
+        ``deck_written: true``.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to migrate",
+                "code": "confirmation_required",
+                "mission_id": mission_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": (
+                    "reason required: quest_migrate_identity needs a "
+                    "non-empty reason"
+                ),
+                "code": "reason_required",
+                "mission_id": mission_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    mission = persistence.get_mission(mission_id)
+    if not mission:
+        return json.dumps(
+            {"error": f"Mission {mission_id} not found", "mission_id": mission_id},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    board_id, err = _resolve_board_id(mission.get("project", ""))
+    if err:
+        return json.dumps(
+            {"error": err, "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    stack_id, err = _resolve_stack_id(board_id, mission)
+    if err:
+        return json.dumps(
+            {
+                "error": f"Cannot resolve Deck stack: {err}",
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    replica_quests = persistence.list_checklist_items(mission_id)
+    ids_by_position = [int(quest["id"]) for quest in replica_quests]
+
+    record, err = deck_bridge.migrate_description_to_markers(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        ids_by_position,
+    )
+    if record is None:
+        return json.dumps(
+            {
+                "error": f"Cannot migrate quest identity: {err}",
+                "code": err if isinstance(err, str) else "migration_failed",
+                "mission_id": mission_id,
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if record["status"] == "already_migrated":
+        return json.dumps(
+            {
+                "status": "already_migrated",
+                "mission_id": mission_id,
+                "deck_written": False,
+                "migrated_ids": [],
+                "quest_ids": record["quest_ids"],
+                "quests": [
+                    {
+                        "quest_id": quest["quest_id"],
+                        "text": quest["text"],
+                        "done": quest["done"],
+                    }
+                    for quest in record["quests"]
+                ],
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    try:
+        result = persistence.migrate_quest_markers(
+            mission_id,
+            description=record["description"],
+            reason=reason,
+            requested_by=requested_by,
+            quest_ids=record["quest_ids"],
+            migrated_ids=record["migrated_ids"],
+        )
+    except Exception as exc:  # reported, never hidden
+        logger.warning("quest_migrate_identity replica update failed: %s", exc)
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests migrated to markers"
+            ),
+            mission_id=mission_id,
+            refresh_error=str(exc),
+            extra={"migrated_ids": record["migrated_ids"]},
+        )
+
+    if result is None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quests migrated to markers"
+            ),
+            mission_id=mission_id,
+            refresh_error="mission row not found after the Deck write",
+            extra={"migrated_ids": record["migrated_ids"]},
+        )
+
+    return json.dumps(
+        {
+            "status": "migrated",
+            "mission_id": mission_id,
+            "deck_written": True,
+            "migrated_ids": result["migrated_ids"],
+            "quest_ids": result["quest_ids"],
+            "audit_id": result["audit_id"],
+            "quests": [
+                {
+                    "quest_id": quest["quest_id"],
+                    "text": quest["text"],
+                    "done": quest["done"],
+                }
+                for quest in record["quests"]
+            ],
+        },
         ensure_ascii=False,
         default=str,
     )
@@ -1775,6 +3376,7 @@ def begin_turn(
     message: str = "",
     sender: str = "user",
     checklist_item_id: int = 0,
+    full: bool = False,
 ) -> str:
     """Begin a new turn: execute gates fresh and create an intento.
 
@@ -1784,6 +3386,16 @@ def begin_turn(
     begin_turn EJECUTA INTERNAMENTE los 4 gates (1a/1b/1c/1e) de forma fresca,
     persistiendo los resultados en gate_state y capturándolos en el intento.
     Esto elimina la necesidad de llamar assert_gates manualmente antes del turno.
+
+    The default response is a TURN DELTA (card #218, quest 11): the ids the
+    caller must carry, the compact gate evidence (``{name, state, mandatory}``,
+    never ``result_data``), the gate summary, and the pending-quest count. It
+    never carries the mission payload, its description, or the full checklist —
+    those do not change per turn and would be paid on every call.
+
+    Pass ``full=True`` for the full state: today's payload plus the mission
+    row and its complete checklist. Nothing is unreachable, only not paid for by
+    default.
 
     Before ANY side effect (orphan cleanup AND gate execution), begin_turn
     resolves and validates the target quest (design D5). A quest that is already
@@ -1803,10 +3415,14 @@ def begin_turn(
         message:            The user's raw message / query (used for context extraction).
         sender:             Optional sender name (default: "user").
         checklist_item_id:  Backward-compatible trailing alias for ``quest_id``.
+        full:               If True, also return the full mission row and its
+                            complete checklist. Defaults to False (turn delta).
 
     Returns:
-        JSON string with intento_id, mission_id, quest_id, status, and real
-        fresh gate counts. On a done/unknown quest:
+        JSON string with intento_id, mission_id, quest_id, status, the compact
+        gate list, the real fresh gate counts, and ``pending_quests``. With
+        ``full=True`` it additionally carries ``mission`` and ``checklist``.
+        On a done/unknown quest:
         ``{"error", "code": "quest_done"|"missing_quest", "quest_id"}``.
     """
     # 0. Guard (D5): resolve/validate the target quest BEFORE any mutation.
@@ -1981,43 +3597,77 @@ def begin_turn(
     _set_active_intento(intento_id, session_id, resolved_project)
 
     gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
-    return json.dumps(
-        {
-            "status": "started",
-            "intento_id": intento_id,
-            "mission_id": mission_id,
-            "quest_id": resolved_quest_id or None,
-            "gates_captured": len(gate_results),
-            "gates_passed_so_far": gates_passed,
-            "overall": overall,
-            "context": {
-                "sender": context["sender"],
-                "topic": context["topic"],
-                "project": resolved_project,
-            },
+    # Turn delta (card #218, quest 11): ids + compact gate evidence + pending
+    # count. ``gates_captured`` / ``gates_passed_so_far`` / ``overall`` /
+    # ``context`` are kept verbatim so existing callers and tests keep working;
+    # nothing verbose was ever in this payload, so the delta IS the mission-free
+    # shape. Mission/checklist detail is opt-in through ``full``.
+    payload = {
+        "status": "started",
+        "intento_id": intento_id,
+        "mission_id": mission_id,
+        "quest_id": resolved_quest_id or None,
+        "gates_captured": len(gate_results),
+        "gates_passed_so_far": gates_passed,
+        "overall": overall,
+        "gates": compact.compact_gates(gate_dicts),
+        "pending_quests": _pending_quest_count(mission_id),
+        "context": {
+            "sender": context["sender"],
+            "topic": context["topic"],
+            "project": resolved_project,
         },
-        ensure_ascii=False,
-        default=str,
-    )
+    }
+    if full:
+        payload.update(
+            _turn_full_state(
+                {
+                    "session_id": session_id,
+                    "project": resolved_project,
+                    "mission_id": mission_id,
+                }
+            )
+        )
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
+def _complete_quest_for_intento(intento: dict) -> dict:
     """Flip the intento's quest to done in Deck, then refresh the replica (D6).
 
-    Unconditional quest closure: whenever a turn closes the intento's quest
-    becomes ``done=true``, regardless of the turn's success/fail. Deck stays the
-    source of truth, so the local replica is refreshed only after
-    ``deck_bridge.complete_quest`` acknowledges the write (D1). Failures are
-    logged and never raise — closing a turn must not be blocked by a bridge or
-    resolution problem (a later ``sync_task`` can recover).
+    Closes the intento's quest in Deck (``done=true``) and refreshes the local
+    replica in the SAME operation. ``end_turn`` calls this ONLY when the turn's
+    ``final_status`` is ``success``; an aborted, failed or partial turn leaves
+    the quest open. Deck stays the source of truth, so the local replica is
+    refreshed only after ``deck_bridge.complete_quest`` acknowledges the write
+    (D1).
 
-    Returns ``(quest_id, done)``; ``done`` is True only when both the Deck write
-    and the replica refresh succeeded.
+    The replica refresh is mission-scoped and never per-quest: the quest flag
+    is set and the mission's checklist counters are recomputed from the replica
+    rows.
+
+    Returns a dict with the resolution honestly separated:
+
+    * ``quest_id`` / ``done``: the quest and whether it is now closed.
+    * ``deck_written``: True only after Deck acknowledged the write.
+    * ``reason``: ``refreshed`` (both sides done), ``deck_write_failed`` /
+      ``stack_unresolved`` / ``board_unresolved`` / ``not_found`` /
+      ``lookup_failed`` / ``mission_mismatch`` / ``not_resolved`` (nothing was
+      written to Deck), or ``replica_refresh_failed`` (Deck WAS written and the
+      replica is now stale — a real failure of the operation).
+    * ``refresh_error``: the replica failure detail, else ``None``.
     """
+    result = {
+        "quest_id": intento.get("checklist_item_id") or None,
+        "done": False,
+        "deck_written": False,
+        "reason": "not_resolved",
+        "refresh_error": None,
+        "identity": None,
+    }
     mission_id = intento.get("mission_id") or 0
     quest_id = intento.get("checklist_item_id") or 0
     if not (mission_id and quest_id):
-        return None, False
+        return result
 
     try:
         mission = persistence.get_mission(mission_id)
@@ -2026,7 +3676,8 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
         logger.warning(
             "Quest closure lookup failed (intento=%s): %s", intento.get("id"), exc
         )
-        return quest_id, False
+        result["reason"] = "lookup_failed"
+        return result
 
     if not isinstance(mission, dict) or not isinstance(quest, dict):
         logger.warning(
@@ -2034,7 +3685,8 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
             mission_id,
             quest_id,
         )
-        return quest_id, False
+        result["reason"] = "not_found"
+        return result
 
     # Membership parity (W2): revalidate here too. begin_turn rejects a crossed
     # quest, but the deprecated record_intento tool can still create an intento
@@ -2046,12 +3698,14 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
             quest_id,
             mission_id,
         )
-        return quest_id, False
+        result["reason"] = "mission_mismatch"
+        return result
 
     board_id, err = _resolve_board_id(mission.get("project", ""))
     if err:
         logger.warning("Quest closure skipped (board): %s", err)
-        return quest_id, False
+        result["reason"] = "board_unresolved"
+        return result
 
     # W-g parity: resolve the stack that ACTUALLY holds the card (fail closed),
     # never guess the pending/first stack. When the card cannot be located the
@@ -2059,30 +3713,56 @@ def _complete_quest_for_intento(intento: dict) -> tuple[int | None, bool]:
     stack_id, _stack_title, err = _resolve_stack_for_card(board_id, mission)
     if err:
         logger.warning("Quest closure skipped (stack): %s", err)
-        return quest_id, False
+        result["reason"] = "stack_unresolved"
+        return result
 
-    ok, err = deck_bridge.complete_quest(
-        board_id, stack_id, mission["deck_task_id"], quest["item_index"]
+    closure, err = deck_bridge.complete_quest_identity(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        quest_id=quest_id,
+        item_index=quest["item_index"],
     )
-    if not ok:
-        logger.warning("Quest closure: Deck write failed for quest #%s: %s", quest_id, err)
-        return quest_id, False
+    if closure is None:
+        if err == deck_bridge.ERR_MARKER_NOT_FOUND:
+            result["reason"] = "marker_not_found"
+        elif err == deck_bridge.ERR_MARKER_DUPLICATE:
+            result["reason"] = "identity_mismatch"
+        else:
+            result["reason"] = "deck_write_failed"
+        logger.warning(
+            "Quest closure: Deck write failed for quest #%s: %s", quest_id, err
+        )
+        return result
 
+    # Deck acknowledged the write: from here on any local failure means the
+    # replica is behind Deck and the operation failed even though Deck changed.
+    result["deck_written"] = True
+    result["identity"] = closure["identity"]
     try:
-        persistence.set_quest_done(quest_id, True)
+        if persistence.set_quest_done(quest_id, True) is False:
+            raise RuntimeError("quest row not found in the replica")
+        if persistence.refresh_mission_checklist_counts(mission_id) is False:
+            raise RuntimeError("mission row not found in the replica")
     except Exception as exc:
         logger.warning(
             "Quest closure: replica refresh failed for quest #%s: %s", quest_id, exc
         )
-        return quest_id, False
+        result["reason"] = "replica_refresh_failed"
+        result["refresh_error"] = str(exc)
+        return result
 
-    return quest_id, True
+    result["done"] = True
+    result["reason"] = "refreshed"
+    return result
 
 
 @app.tool()
 def end_turn(
     intento_id: int,
     status: str = "success",
+    quest_done: bool | None = None,
+    full: bool = False,
 ) -> str:
     """End the current turn: validate gates, complete the intento, close the quest.
 
@@ -2095,29 +3775,82 @@ def end_turn(
 
     end_turn is the ONLY false→true quest transition path (design D6). It flips
     the intento's quest to ``done`` in Deck (``- [ ]`` → ``- [x]``) and refreshes
-    the replica. The transition is UNCONDITIONAL: the quest is consumed whenever
-    the turn closes, while the success/fail result lives on the intento.
+    the replica. The transition happens ONLY when ``final_status`` is
+    ``success``: an aborted, failed or partial turn leaves the quest open so the
+    dashboard can tell a completed quest from an abandoned turn.
 
     ``final_status`` derives from MANDATORY gates only (design D8): a
-    non-mandatory gate that is not PASS/SKIP never forces a fail.
+    non-mandatory gate that is not PASS/SKIP never forces a fail. When a
+    mandatory gate does not pass, ``final_status`` is ``fail`` regardless of the
+    requested ``status``; when all mandatory gates pass, ``final_status`` is the
+    requested ``status``.
 
     end_turn NEVER blocks permanently. When gates do not pass, it completes
     the intento with final_status="fail" and real gate detail, then clears
     the active turn state — always leaving the system in a recoverable state.
 
     The response is COMPACT (design D4): gates carry only
-    ``{name, state, mandatory}`` and no raw ``result_data``.
+    ``{name, state, mandatory}`` and no raw ``result_data``. It is also a TURN
+    DELTA (card #218, quest 11): it never carries the mission payload, its
+    description, or the full checklist, because those do not change with the
+    turn and would be paid on every call.
 
     Args:
         intento_id: Numeric intento ID returned by begin_turn().
-        status:     Final status hint ('success' or 'fail'). Used for logging;
-                    actual completion status derives from gate validation.
+        status:     Terminal status for the turn. Accepts ``success``,
+                    ``aborted``, ``failed`` or ``partial`` (case-insensitive).
+                    An unrecognized value is rejected with zero mutation.
+        quest_done: Explicit quest-closure intent. ``None`` (default) keeps the
+                    original behaviour: the quest is consumed only when
+                    ``final_status`` is ``success``. ``False`` never consumes the
+                    quest, even on a successful turn — this closes an empty turn
+                    without lying. ``True`` with a ``final_status`` other than
+                    ``success`` is rejected with zero mutation: there is no path
+                    to force a dishonest closure.
+        full:       If True, also return the full mission row and its complete
+                    checklist. Defaults to False (turn delta).
 
     Returns:
         JSON string with completion status, gates_passed count, compact gate
-        detail, and the closed quest_id/quest_done.
+        detail, and the quest_id/quest_done that reflect what actually happened.
+        ``quest_done_reason`` explains why the quest was (not) consumed:
+        ``refreshed``, ``vetoed``, ``not_success``, ``deck_write_failed``, etc.
+        When Deck accepted the closure but the replica refresh failed, the
+        response is an explicit error (``code: replica_refresh_failed``,
+        ``deck_written: true``) — never a clean closure over a stale replica.
     """
     global _active_intento
+
+    # 0a. Validate quest_done's type BEFORE any mutation.
+    if quest_done is not None and not isinstance(quest_done, bool):
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_quest_done",
+                "error": (
+                    f"Invalid quest_done {quest_done!r}. Expected true, false or None."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # 0b. Validate the requested terminal status BEFORE any mutation. An unknown
+    #    value must leave the intento, the quest and the active-turn state
+    #    untouched (no completion, no Deck write).
+    normalized_status = status.strip().lower() if isinstance(status, str) else ""
+    if normalized_status not in ("success", "aborted", "failed", "partial"):
+        return json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    f"Invalid status {status!r}. Expected one of: "
+                    "success, aborted, failed, partial."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     # 1. Resolve session_id + project from the DB (no delegation to orchestrator)
     intento = persistence.get_intento(intento_id)
@@ -2202,19 +3935,63 @@ def end_turn(
     ]
     has_mandatory_evidence = any(bool(g.get("mandatory")) for g in final_gates)
     if final_gates and has_mandatory_evidence and not mandatory_failed:
-        final_status = "success"
+        # Gates pass: the caller's requested terminal status wins.
+        final_status = normalized_status
     else:
+        # A mandatory gate did not pass: the gates own the verdict.
         final_status = "fail"
 
-    # 5b. Quest closure (D6): UNCONDITIONAL '- [ ]' -> '- [x]' in Deck, then
-    #     replica refresh, independent of final_status. Never blocks the close.
-    quest_id_closed, quest_done = _complete_quest_for_intento(intento)
+    # 5c. quest_done=True with a non-success verdict is a validation error with
+    #     zero mutation: an explicit closure must never override the gates, and
+    #     nothing above this point has written anything.
+    if quest_done is True and final_status != "success":
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_quest_done",
+                "error": (
+                    f"Cannot mark the quest done with final_status "
+                    f"{final_status!r}: only a successful turn closes the quest."
+                ),
+                "intento_id": intento_id,
+                "final_status": final_status,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # 5b. Quest closure (D6): only a genuinely successful turn consumes the
+    #     quest, and an explicit quest_done=False vetoes the closure even on
+    #     success. Aborted/failed/partial (and gate-fail) leave it open so the
+    #     dashboard can distinguish "quest done" from "turn abandoned".
+    if final_status == "success" and quest_done is not False:
+        closure = _complete_quest_for_intento(intento)
+    else:
+        closure = {
+            "quest_id": intento.get("checklist_item_id") or None,
+            "done": False,
+            "deck_written": False,
+            "reason": (
+                "vetoed"
+                if final_status == "success" and quest_done is False
+                else "not_success"
+            ),
+            "refresh_error": None,
+            "identity": None,
+        }
+
+    quest_id_closed = closure["quest_id"]
+    quest_is_done = closure["done"]
 
     # 6. Completar intento con detalle completo (NEVER blocks — always completes)
+    #    v7 widens intentos.status to the honest terminal vocabulary, so the
+    #    persisted state matches the verdict instead of collapsing aborted and
+    #    partial into 'fail'. Only the legacy 'failed' spelling is normalised.
+    persisted_status = "fail" if final_status == "failed" else final_status
     try:
         persistence.complete_intento_with_gates(
             intento_id=intento_id,
-            status=final_status,
+            status=persisted_status,
             gates_passed=gates_passed,
             gates_detail=final_gates,
         )
@@ -2233,16 +4010,156 @@ def end_turn(
     # 7. Limpiar estado de turno activo
     _clear_active_intento()
 
+    response = {
+        "status": "ok",
+        "intento_id": intento_id,
+        "final_status": final_status,
+        "gates_passed": gates_passed,
+        "gates_total": len(final_gates) if final_gates else 4,
+        "gates": compact.compact_gates(final_gates),
+        "quest_id": quest_id_closed,
+        "quest_done": quest_is_done,
+        "quest_done_reason": closure["reason"],
+        "identity": closure.get("identity"),
+        "deck_written": closure["deck_written"],
+    }
+
+    if full:
+        response.update(_turn_full_state(intento))
+
+    # Fail-closed (card #218, forum #1): when Deck WAS written but the replica
+    # refresh failed, the turn cannot be reported as a clean closure. The
+    # intento is still finalized above (never left running) and the response
+    # says exactly what Deck holds and that the replica is behind.
+    if closure["refresh_error"] is not None:
+        response.update(
+            {
+                "status": "error",
+                "code": "replica_refresh_failed",
+                "quest_done": False,
+                "replica_refresh_error": closure["refresh_error"],
+                "replica_stale": True,
+                "reconcile_with": f"sync_task({intento.get('mission_id')})",
+                "error": (
+                    "The quest was marked done in Deck, but the local replica "
+                    f"could not be refreshed ({closure['refresh_error']}). The "
+                    "turn is recorded, the replica is stale; run "
+                    f"sync_task({intento.get('mission_id')}) to reconcile."
+                ),
+            }
+        )
+        return json.dumps(response, ensure_ascii=False, default=str)
+
+    return json.dumps(
+        response,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def abort_turn(intento_id: int, reason: str) -> str:
+    """Abort an in-flight turn without touching the quest.
+
+    Finalises a ``running`` intento with the honest ``aborted`` status, stores
+    ``reason`` in the intento's existing ``summary`` column, and leaves the
+    quest, the gates and the attempt budget untouched. This is the companion of
+    ``end_turn(quest_done=False)`` for the interrupted case: an abandoned turn
+    is recorded as abandoned instead of being reported as a failure.
+
+    Only a ``running`` intento can be aborted. Any other state returns an
+    explicit error naming the current status and mutates nothing.
+
+    Args:
+        intento_id: Numeric intento ID returned by begin_turn().
+        reason:     Non-empty explanation of why the turn was aborted.
+
+    Returns:
+        JSON string with ``final_status``/``persisted_status`` = ``aborted``,
+        the untouched ``quest_id`` with ``quest_done`` false, and the stored
+        reason. Errors: ``invalid_reason``, ``intento_not_found`` or
+        ``intento_not_running``.
+    """
+    normalized_reason = reason.strip() if isinstance(reason, str) else ""
+    if not normalized_reason:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_reason",
+                "error": "A non-empty reason is required to abort a turn.",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    intento = persistence.get_intento(intento_id)
+    if intento is None:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "intento_not_found",
+                "error": f"Intento #{intento_id} not found in database.",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    current_status = intento.get("status")
+    if current_status != "running":
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "intento_not_running",
+                "error": (
+                    f"Intento #{intento_id} is not running "
+                    f"(current status: {current_status})."
+                ),
+                "intento_id": intento_id,
+                "current_status": current_status,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    gates_passed = intento.get("gates_passed") or 0
+    try:
+        persistence.complete_intento_with_summary(
+            intento_id=intento_id,
+            status="aborted",
+            gates_passed=gates_passed,
+            summary=normalized_reason,
+        )
+    except Exception as exc:
+        logger.error("Failed to abort intento #%d: %s", intento_id, exc)
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "abort_failed",
+                "error": f"Failed to persist the abort: {exc}",
+                "intento_id": intento_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Only the server-side turn bookkeeping is cleared; the quest and gates are
+    # deliberately untouched.
+    active = _get_active_intento()
+    if active is not None and active["intento_id"] == intento_id:
+        _clear_active_intento()
+
     return json.dumps(
         {
             "status": "ok",
             "intento_id": intento_id,
-            "final_status": final_status,
+            "final_status": "aborted",
+            "persisted_status": "aborted",
             "gates_passed": gates_passed,
-            "gates_total": len(final_gates) if final_gates else 4,
-            "gates": compact.compact_gates(final_gates),
-            "quest_id": quest_id_closed,
-            "quest_done": quest_done,
+            "quest_id": intento.get("checklist_item_id") or None,
+            "quest_done": False,
+            "reason": normalized_reason,
         },
         ensure_ascii=False,
         default=str,
@@ -2403,23 +4320,72 @@ def record_intento(
 
 @app.tool()
 def card_update_description(
-    card_id: int,
-    description: str,
-    board_id: int,
-    stack_id: int,
+    card_id: int | None = None,
+    description: str = "",
+    board_id: int | None = None,
+    stack_id: int | None = None,
+    mission_id: int | None = None,
 ) -> str:
     """Update only the description of a Deck card — NEVER changes the title.
 
+    With an explicit ``card_id``/``board_id``/``stack_id`` this behaves exactly
+    as before. When ``mission_id`` is supplied, the missing pieces are resolved
+    from the replica: the board from the project map and the stack from the
+    mission's replicated ``deck_stack_id``. A backfilled ``deck_stack_id``
+    avoids the ``deck_get_stacks`` lookup entirely; when it is ``NULL`` the
+    existing lookup fallback is used.
+
     Args:
-        card_id: Numeric card ID.
+        card_id: Numeric card ID (defaults to the mission's ``deck_task_id``).
         description: New description content (markdown).
-        board_id: Numeric board ID.
-        stack_id: Numeric stack ID.
+        board_id: Numeric board ID (defaults to the mission's board).
+        stack_id: Numeric stack ID (defaults to ``deck_stack_id``/lookup).
+        mission_id: Optional local mission id used to resolve the Deck target.
 
     Returns:
-        JSON string confirming update.
+        JSON string confirming update. When ``mission_id`` is supplied the
+        mission's replica is refreshed from the acknowledged write, so a stale
+        checklist can never survive the update; if that refresh fails the reply
+        is an explicit error (``code: replica_refresh_failed``,
+        ``deck_written: true``).
     """
     from .mcp_client import call_mcp_tool, TOOL_NAMES
+
+    mission = None
+    if mission_id is not None:
+        mission = persistence.get_mission(mission_id)
+        if not mission:
+            return json.dumps(
+                {"error": f"Mission {mission_id} not found"},
+                ensure_ascii=False,
+                default=str,
+            )
+        if board_id is None:
+            board_id, err = _resolve_board_id(mission.get("project", ""))
+            if err:
+                return json.dumps({"error": err}, ensure_ascii=False, default=str)
+        if stack_id is None:
+            stack_id, err = _resolve_stack_id(board_id, mission)
+            if err:
+                return json.dumps(
+                    {"error": f"Cannot resolve Deck stack: {err}"},
+                    ensure_ascii=False,
+                    default=str,
+                )
+        if card_id is None:
+            card_id = mission.get("deck_task_id")
+
+    if card_id is None or board_id is None or stack_id is None:
+        return json.dumps(
+            {
+                "error": (
+                    "card_id, board_id and stack_id are required unless a "
+                    "mission_id resolves them"
+                )
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     # Fetch current card detail to preserve the title
     card, err = call_mcp_tool(
@@ -2476,14 +4442,42 @@ def card_update_description(
         timeout=8.0,
     )
     if result is None:
-        return json.dumps({"error": f"Failed to update card: {update_err}"})
+        return json.dumps(
+            {"error": f"Failed to update card: {update_err}", "deck_written": False}
+        )
+
+    response = {
+        "status": "ok",
+        "card_id": card_id,
+        "title_preserved": current_title,
+    }
+
+    # The Deck write already happened: refresh THIS mission's replica from the
+    # acknowledged description so it can never keep a checklist Deck no longer
+    # has (or a stale prose). Only an explicitly resolved mission is refreshed;
+    # a raw card id carries no mission to refresh.
+    if mission is not None:
+        response["mission_id"] = mission_id
+        payload = {
+            "title": current_title,
+            "description": cleaned_description,
+            "quests": deck_bridge.extract_quests(cleaned_description),
+        }
+        _replica_id, _quest_ids, refresh_error = _refresh_mission_replica_from_card(
+            mission, payload, mission.get("status", "pendiente")
+        )
+        if refresh_error is not None:
+            return _deck_write_refresh_failure(
+                deck_written_what=(
+                    f"Deck card {card_id} description updated"
+                ),
+                mission_id=mission_id,
+                refresh_error=refresh_error,
+                extra={"mission_id": mission_id},
+            )
 
     return json.dumps(
-        {
-            "status": "ok",
-            "card_id": card_id,
-            "title_preserved": current_title,
-        },
+        response,
         ensure_ascii=False,
         default=str,
     )

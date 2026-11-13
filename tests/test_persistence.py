@@ -5,6 +5,7 @@ Unit tests for persistence.py — CRUD, upsert, mission lifecycle.
 import sys
 import os
 import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -639,7 +640,7 @@ class TestDbMigrationV5ToV6:
                 with p._conn() as conn:
                     assert conn.execute(
                         "SELECT MAX(version) FROM schema_version"
-                    ).fetchone()[0] == 6
+                    ).fetchone()[0] == SCHEMA_VERSION
                     item_cols = {c[1] for c in conn.execute(
                         "PRAGMA table_info(checklist_items)").fetchall()}
                     assert {"attempts_authorized", "attempts_used"} <= item_cols
@@ -739,3 +740,168 @@ class TestCompleteIntentoWithSummary:
         assert (it["status"], it["gates_passed"], it["summary"]) == ("success", 4, "done")
         assert it["closed_at"] is not None
         assert json.loads(it["evidence"])["summary_source"] == "caller"
+
+
+def _build_legacy_v6_db(db_path: str) -> None:
+    """Create a REAL v6 database: intentos.status CHECK allows only 3 states.
+
+    Mirrors the v6 table shape (summary/evidence/closed_at/gates_detail) so the
+    v6→v7 rebuild has to preserve every column and row.
+    """
+    import sqlite3
+
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE schema_version (
+            version     INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE intentos (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id        TEXT NOT NULL,
+            project           TEXT NOT NULL,
+            mission_id        INTEGER NOT NULL,
+            checklist_item_id INTEGER NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'running'
+                              CHECK(status IN ('running','success','fail')),
+            gates_passed      INTEGER NOT NULL DEFAULT 0,
+            gates_total       INTEGER NOT NULL DEFAULT 4,
+            started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at      TEXT,
+            summary           TEXT,
+            evidence          TEXT,
+            closed_at         TEXT,
+            gates_detail      TEXT
+        );
+        CREATE INDEX idx_intentos_checklist ON intentos(checklist_item_id);
+        CREATE INDEX idx_intentos_mission ON intentos(mission_id);
+        CREATE INDEX idx_intentos_session ON intentos(session_id);
+        INSERT INTO schema_version (version, description) VALUES (6, 'v6');
+        INSERT INTO intentos
+            (id, session_id, project, mission_id, checklist_item_id, status,
+             gates_passed, gates_detail, summary)
+        VALUES
+            (1, 'sess', 'p', 1, 10, 'success', 4,
+             '[{"name":"1a","state":"PASS","mandatory":1}]', 'closed ok'),
+            (2, 'sess', 'p', 1, 10, 'fail', 0, NULL, NULL);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+
+class TestDbMigrationV6ToV7:
+    """Quest #218: v6→v7 widens intentos.status to aborted/partial."""
+
+    def test_v6_to_v7_preserves_rows_and_accepts_honest_states(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            _build_legacy_v6_db(db_path)
+            Persistence(db_path=db_path).close()  # runs v6→v7→v8→v9
+
+            p = Persistence(db_path=db_path)
+            try:
+                with p._conn() as conn:
+                    assert conn.execute(
+                        "SELECT MAX(version) FROM schema_version"
+                    ).fetchone()[0] == 9
+
+                    # Every pre-existing row survives verbatim.
+                    rows = conn.execute(
+                        "SELECT id, status, gates_passed, summary, gates_detail"
+                        " FROM intentos ORDER BY id"
+                    ).fetchall()
+                    assert [r["id"] for r in rows] == [1, 2]
+                    assert [r["status"] for r in rows] == ["success", "fail"]
+                    assert rows[0]["gates_passed"] == 4
+                    assert rows[0]["summary"] == "closed ok"
+                    assert '"1a"' in rows[0]["gates_detail"]
+
+                    # Both honest terminal states are now accepted.
+                    iid = p.create_intento("sess", "p", 1, 10)
+                    p.complete_intento_with_gates(iid, "aborted", 0, [])
+                    p.complete_intento_with_summary(iid, "partial", 2, "half")
+                    assert p.get_intento(iid)["status"] == "partial"
+
+                    # The old three-state CHECK would have rejected these; a
+                    # bogus state is still rejected.
+                    with pytest.raises(Exception):
+                        conn.execute(
+                            "UPDATE intentos SET status = 'bogus' WHERE id = 1"
+                        )
+            finally:
+                p.close()
+        finally:
+            _cleanup_db(db_path)
+
+    def test_v6_to_v7_replay_is_idempotent(self):
+        from ultratimonel.persistence import _migrate_v6_to_v7
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            _build_legacy_v6_db(db_path)
+            p = Persistence(db_path=db_path)
+            try:
+                with p._conn() as conn:
+                    _migrate_v6_to_v7(conn)
+                    _migrate_v6_to_v7(conn)
+                    assert conn.execute(
+                        "SELECT COUNT(*) FROM schema_version WHERE version = 7"
+                    ).fetchone()[0] == 1
+                    assert conn.execute(
+                        "SELECT COUNT(*) FROM intentos"
+                    ).fetchone()[0] == 2
+                    # The rebuild left no backup table or duplicate indexes.
+                    tables = {r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()}
+                    assert "intentos_v6_backup" not in tables
+                    idx = {r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    ).fetchall()}
+                    assert {"idx_intentos_checklist", "idx_intentos_mission",
+                            "idx_intentos_session"} <= idx
+            finally:
+                p.close()
+        finally:
+            _cleanup_db(db_path)
+
+    def test_downgrade_v7_db_opens_under_v6_code_without_breaking(self):
+        """A v7 file must stay readable/usable by v6-era code (SCHEMA_AHEAD).
+
+        There is no separate v6 checkout in the suite, so the v6 runtime is
+        simulated by pinning ``SCHEMA_VERSION`` back to 6: the unknown newer
+        version then falls through every migration branch exactly as the v6
+        code would.
+        """
+        import ultratimonel.persistence as persistence_mod
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            _build_legacy_v6_db(db_path)
+            Persistence(db_path=db_path).close()  # upgrade to v9
+
+            with patch.object(persistence_mod, "SCHEMA_VERSION", 6), patch.object(
+                persistence_mod, "SCHEMA_DESCRIPTION", "v6"
+            ):
+                v6_runtime = persistence_mod.Persistence(db_path=db_path)
+                try:
+                    # Existing rows are readable and untouched.
+                    assert v6_runtime.get_intento(1)["status"] == "success"
+                    # A v6-era write still works against the widened table.
+                    iid = v6_runtime.create_intento("s6", "p", 1, 10)
+                    v6_runtime.complete_intento(iid, "fail", 0)
+                    assert v6_runtime.get_intento(iid)["status"] == "fail"
+                    with v6_runtime._conn() as conn:
+                        assert conn.execute(
+                            "SELECT MAX(version) FROM schema_version"
+                        ).fetchone()[0] == 9
+                finally:
+                    v6_runtime.close()
+        finally:
+            _cleanup_db(db_path)
