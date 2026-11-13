@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -1343,6 +1344,38 @@ def sync_tasks(project: str, prune: bool = False) -> str:
     )
 
 
+def _normalize_stacks_payload(data: Any) -> list | None:
+    """Return the stacks list from a ``deck_get_stacks`` payload.
+
+    The nextcloud MCP is reached through the ``http-to-stdio`` proxy. When that
+    proxy hands the tool result back as text, ``mcp_client._parse_response``
+    returns the raw string (its documented contract: JSON content is decoded,
+    anything else is returned as text). A serialized stacks document therefore
+    reaches callers as ``str`` and reading it with ``.get`` raised
+    ``AttributeError: 'str' object has no attribute 'get'`` (card #218,
+    quest 20).
+
+    This decodes text payloads — including the double-encoded form the proxy
+    produced — before the ``stacks``/``result`` key is read, and returns
+    ``None`` for anything that is not a stacks document so callers fail closed
+    instead of guessing a stack.
+    """
+    for _ in range(3):
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            data = data.get("stacks", data.get("result", []))
+            continue
+        return None
+    return None
+
+
 def _resolve_stack_for_card(
     board_id: int,
     mission: dict,
@@ -1375,11 +1408,9 @@ def _resolve_stack_for_card(
     if data is None:
         return None, None, err or "unavailable"
 
-    stacks = (
-        data
-        if isinstance(data, list)
-        else data.get("stacks", data.get("result", []))
-    )
+    stacks = _normalize_stacks_payload(data)
+    if stacks is None:
+        return None, None, "unexpected Deck response shape"
 
     card_id = mission.get("deck_task_id")
     for stack in stacks:
@@ -1751,11 +1782,9 @@ def _fetch_stacks(board_id: int) -> tuple[list | None, str | None]:
     )
     if data is None:
         return None, err or "unavailable"
-    stacks = (
-        data
-        if isinstance(data, list)
-        else data.get("stacks", data.get("result", []))
-    )
+    stacks = _normalize_stacks_payload(data)
+    if stacks is None:
+        return None, "unexpected Deck response shape"
     return stacks, None
 
 
@@ -2541,9 +2570,11 @@ def quest_update(
         position: Optional Deck checkbox position override.
 
     Returns:
-        JSON {quest_id, title, done}. When Deck accepted the rewrite but the
-        replica refresh failed, returns an explicit error (``code:
-        replica_refresh_failed``, ``deck_written: true``).
+        JSON {quest_id, title, done}. An empty or multi-line ``title`` is
+        rejected with ``deck_written: false`` before any Deck read or write.
+        When Deck accepted the rewrite but the replica refresh failed, returns
+        an explicit error (``code: replica_refresh_failed``, ``deck_written:
+        true``).
     """
     quest = persistence.get_checklist_item_by_id(quest_id)
     if not quest:
@@ -2561,6 +2592,31 @@ def quest_update(
             default=str,
         )
 
+    if title is not None:
+        # Validate the new text before any Deck read/write: an empty or
+        # multi-line title can never be a quest line, and no quest may be
+        # mutated when the request is invalid (D2/D10).
+        clean_title = deck_bridge.sanitize_quest_text(title)
+        if clean_title is None:
+            raw_title = title or ""
+            code = (
+                "quest_text_multiline"
+                if ("\n" in raw_title or "\r" in raw_title)
+                else "quest_text_empty"
+            )
+            return json.dumps(
+                {
+                    "error": "Quest text must be a single non-empty line",
+                    "code": code,
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        new_text = clean_title
+    else:
+        new_text = quest["text"]
+
     board_id, err = _resolve_board_id(mission.get("project", ""))
     if err:
         return json.dumps({"error": err}, ensure_ascii=False, default=str)
@@ -2574,7 +2630,6 @@ def quest_update(
         )
 
     deck_position = position if position is not None else quest["item_index"]
-    new_text = title if title is not None else quest["text"]
 
     record, err = deck_bridge.update_quest_record(
         board_id, stack_id, mission["deck_task_id"], deck_position, new_text
