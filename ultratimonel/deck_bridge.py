@@ -42,6 +42,7 @@ __all__ = [
     "clean_prose",
     "append_quest",
     "append_quest_record",
+    "append_quests_record",
     "update_quest",
     "update_quest_record",
     "delete_quest_record",
@@ -632,6 +633,65 @@ def append_quest_record(
         return None, werr
     return {
         "position": position,
+        "title": title,
+        "description": new_description,
+        "quests": extract_quests(new_description),
+    }, None
+
+
+def append_quests_record(
+    board_id: int,
+    stack_id: int,
+    card_id: int,
+    entries: list[tuple[str, int]],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Append several marked quest lines in ONE Deck read + ONE Deck write.
+
+    ``entries`` is a sequence of ``(text, quest_id)`` pairs. Every entry is
+    validated and sanitized before the card is read, so an invalid entry never
+    touches Deck. The server owns every ``quest_id``; they are composed into
+    the lines as ``[](#q:{id})`` markers.
+
+    Returns ``({"position", "positions", "title", "description", "quests"},
+    None)`` where ``positions`` are the 0-based quest indexes of the new lines,
+    in request order, and ``description`` is exactly what was written to Deck.
+    """
+    if not entries:
+        return None, "quest_text_empty"
+
+    composed: list[str] = []
+    for text, quest_id in entries:
+        clean = sanitize_quest_text(text)
+        if clean is None:
+            raw = text or ""
+            code = (
+                "quest_text_multiline"
+                if ("\n" in raw or "\r" in raw)
+                else "quest_text_empty"
+            )
+            return None, code
+        composed.append(compose_quest_line(clean, quest_id))
+
+    card, err = _read_card(board_id, stack_id, card_id)
+    if card is None:
+        return None, err
+
+    title = card.get("title", "") or ""
+    current = card.get("description", "") or ""
+    position = len(extract_quests(current))
+    block = "\n".join(composed)
+
+    if current.strip():
+        new_description = current.rstrip("\n") + "\n" + block
+    else:
+        new_description = block
+
+    ok, werr = _write_card(board_id, stack_id, card_id, title, new_description)
+    if ok is None:
+        return None, werr
+    return {
+        "position": position,
+        "positions": list(range(position, position + len(composed))),
         "title": title,
         "description": new_description,
         "quests": extract_quests(new_description),

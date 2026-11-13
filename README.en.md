@@ -308,7 +308,7 @@ kept for compatibility). Every tool is auto-discovered via the MCP protocol.
 |------|-------------|
 | `sync_tasks(project, prune=False)` | Syncs Deck cards → missions table and reports drift (`missing_in_deck`, `skipped`). `prune=true` deletes only proven orphans from a complete Deck read |
 | `sync_all()` | Syncs all mapped projects |
-| `mission_list(project)` | Lists missions (Deck tasks) for a project |
+| `mission_list(project, include_description=False, limit=None, offset=0)` | Lists missions (Deck tasks) for a project. Compact by default; `limit`/`offset` page through them and `total` is always the real total. Without `limit` it returns every mission (compatibility) |
 | `mission_get(mission_id)` | Retrieves a mission by ID |
 | `checklist_item_get(checklist_item_id)` | Retrieves a checklist item by ID |
 
@@ -316,7 +316,7 @@ kept for compatibility). Every tool is auto-discovered via the MCP protocol.
 
 | Tool | Description |
 |------|-------------|
-| `map_list()` | Lists projects configured in `project_maps.json` |
+| `map_list(full=False)` | Lists projects configured in `project_maps.json`. Compact by default (`deck_board_id` + `collective_id`); `full=true` includes `patterns` |
 | `map_add(project, deck_board_name, collective_name, ...)` | Adds or updates a project |
 | `map_remove(project)` | Removes a project |
 | `map_setup()` | Discovers available boards/collectives for mapping |

@@ -577,16 +577,38 @@ def server(action: str) -> str:
 
 
 @app.tool()
-def map_list() -> str:
+def map_list(full: bool = False) -> str:
     """List all projects configured in project_maps.json.
 
+    Compact by default (card #218, quest 10): each project maps to
+    ``{deck_board_id, collective_id}`` only. The detection ``patterns`` — the
+    bulk of the payload — are omitted because they are only needed for
+    configuration, not for resolving a project's board. Pass ``full=True`` to
+    get the complete configured entry.
+
+    Args:
+        full: If True, returns the full payload including ``patterns``.
+            Defaults to False (compact).
+
     Returns:
-        JSON array of project entries with patterns, deck_board_id, collective_id.
+        JSON object keyed by project slug. Compact values keep
+        ``deck_board_id`` so callers can still resolve a project's board
+        without opting into the full payload.
     """
     from .context_extractor import get_project_maps
 
     maps = get_project_maps()
-    return json.dumps(maps, ensure_ascii=False, default=str)
+    if full:
+        return json.dumps(maps, ensure_ascii=False, default=str)
+
+    compact_maps = {
+        project: {
+            "deck_board_id": cfg.get("deck_board_id"),
+            "collective_id": cfg.get("collective_id"),
+        }
+        for project, cfg in maps.items()
+    }
+    return json.dumps(compact_maps, ensure_ascii=False, default=str)
 
 
 @app.tool()
@@ -1431,37 +1453,73 @@ def sync_all() -> str:
 
 
 @app.tool()
-def mission_list(project: str, include_description: bool = False) -> str:
-    """List missions (Deck tasks) for a project.
+def mission_list(
+    project: str,
+    include_description: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> str:
+    """List missions (Deck tasks) for a project, optionally paginated.
 
     Compact by default (design D4): each mission is represented by
     ``{id, title, status}`` only — no description and no nested
     ``checklist_items``. Pass ``include_description=True`` to opt in to the full
     payload (e.g. the dashboard). There is no global ``verbose`` toggle.
 
+    Pagination (card #218, quest 10): with no ``limit`` every mission is
+    returned, preserving the original behavior. ``limit`` selects a page size
+    (must be a positive integer) and ``offset`` skips that many missions
+    (default 0). ``total`` is always the real number of missions for the
+    project, independent of the page size, so callers can page without a
+    second counting call. An ``offset`` past ``total`` returns an empty page
+    with the correct ``total``.
+
     Args:
         project: Project slug.
         include_description: If True, returns the full payload including
             description and nested checklist_items. Defaults to False (compact).
+        limit: Optional page size (positive integer). Defaults to None (all).
+        offset: Missions to skip before the page. Defaults to 0.
 
     Returns:
-        JSON with missions list.
+        JSON with missions list and the real ``total``.
     """
-    missions = persistence.list_missions(project)
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return json.dumps(
+                {
+                    "error": "limit must be a positive integer (>= 1)",
+                    "code": "invalid_limit",
+                },
+                ensure_ascii=False,
+            )
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return json.dumps(
+            {
+                "error": "offset must be a non-negative integer (>= 0)",
+                "code": "invalid_offset",
+            },
+            ensure_ascii=False,
+        )
+
+    all_missions = persistence.list_missions(project)
+    total = len(all_missions)
+
+    if limit is None:
+        page = all_missions[offset:] if offset else all_missions
+    else:
+        page = all_missions[offset : offset + limit]
 
     if include_description:
-        payload = {
-            "project": project,
-            "missions": missions,
-            "total": len(missions),
-        }
+        rendered = page
     else:
-        compact_missions = [compact.compact_mission(m) for m in missions]
-        payload = {
-            "project": project,
-            "missions": compact_missions,
-            "total": len(compact_missions),
-        }
+        rendered = [compact.compact_mission(m) for m in page]
+
+    payload = {
+        "project": project,
+        "missions": rendered,
+        "total": total,
+    }
 
     return json.dumps(payload, ensure_ascii=False, default=str)
 
@@ -2066,23 +2124,175 @@ def mission_delete(
     )
 
 
-@app.tool()
-def quest_add(mission_id: int, title: str) -> str:
-    """Append a quest to a mission's Deck card (Deck-first), then the replica.
+def _quest_add_batch(
+    *,
+    mission: dict,
+    mission_id: int,
+    board_id: int,
+    stack_id: int,
+    clean_titles: list[str],
+) -> str:
+    """Append a validated quest batch: one Deck write, one replica refresh.
 
-    The quest is always written with ``done=false`` (design D2/D10). There is
-    no tool that marks a quest complete; only ``end_turn`` does that.
+    The ids are allocated read-only in one call and composed into every marker
+    before the Deck write, so a failed write leaves no phantom replica row.
+    A single ``refresh_error`` covers the whole batch: when Deck was written
+    but the replica could not follow, the caller gets ``deck_written: true``.
+    """
+    try:
+        first_id = persistence.next_checklist_item_id()
+    except Exception as exc:
+        return json.dumps(
+            {"error": f"Cannot allocate quest ids: {exc}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    new_ids = [first_id + index for index in range(len(clean_titles))]
+    entries = list(zip(clean_titles, new_ids))
+
+    record, err = deck_bridge.append_quests_record(
+        board_id,
+        stack_id,
+        mission["deck_task_id"],
+        entries,
+    )
+    if record is None:
+        return json.dumps(
+            {"error": f"Deck bridge unavailable: {err}", "deck_written": False},
+            ensure_ascii=False,
+            default=str,
+        )
+
+    positions = record["positions"]
+    adopt_ids = dict(zip(positions, new_ids))
+    _replica_id, quest_ids, refresh_error = _refresh_mission_replica_from_card(
+        mission, record, adopt_ids=adopt_ids
+    )
+    if refresh_error is None and any(
+        quest_ids.get(position) != quest_id
+        for position, quest_id in adopt_ids.items()
+    ):
+        refresh_error = "appended quest rows do not use the composed marker ids"
+    if refresh_error is not None:
+        return _deck_write_refresh_failure(
+            deck_written_what=(
+                f"Deck card {mission['deck_task_id']} quest batch appended at "
+                f"positions {positions[0]}-{positions[-1]}"
+            ),
+            mission_id=mission_id,
+            refresh_error=refresh_error,
+            extra={
+                "mission_id": mission_id,
+                "positions": positions,
+                "quest_ids": new_ids,
+            },
+        )
+
+    return json.dumps(
+        {
+            "mission_id": mission_id,
+            "quest_ids": new_ids,
+            "count": len(new_ids),
+            "identity": "marker",
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def quest_add(
+    mission_id: int,
+    title: str | None = None,
+    quests: list[str] | None = None,
+) -> str:
+    """Append a quest, or a whole batch of quests, Deck-first, then the replica.
+
+    The quest (or every quest in the batch) is always written with
+    ``done=false`` (design D2/D10). There is no tool that marks a quest
+    complete; only ``end_turn`` does that.
+
+    ``title`` and ``quests`` are mutually exclusive. A batch is written with
+    ONE Deck description write and ONE replica refresh, so N quests never cost
+    N round-trips (card #218, quest 10). Every server-composed id is returned
+    in request order.
 
     Args:
         mission_id: Local mission id.
-        title: Quest text.
+        title: Quest text for the single-quest form (original signature).
+        quests: Batch of quest texts. Mutually exclusive with ``title``.
 
     Returns:
-        JSON {quest_id, mission_id, title, done}. When Deck accepted the append
-        but the replica refresh failed, returns an explicit error
-        (``code: replica_refresh_failed``, ``deck_written: true``) instead of a
-        clean success.
+        Single form: JSON {quest_id, mission_id, title, done, identity}.
+        Batch form: JSON {mission_id, quest_ids, count, identity}, with
+        ``quest_ids`` in the same order the quests were requested. When Deck
+        accepted the write but the replica refresh failed, returns an explicit
+        error (``code: replica_refresh_failed``, ``deck_written: true``)
+        instead of a clean success.
     """
+    if title is not None and quests is not None:
+        return json.dumps(
+            {
+                "error": "Pass either 'title' or 'quests', not both",
+                "code": "quest_add_ambiguous_input",
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    if title is None and quests is None:
+        return json.dumps(
+            {
+                "error": "Pass either 'title' or 'quests'",
+                "code": "quest_add_missing_input",
+                "deck_written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    clean_titles: list[str] = []
+    if quests is not None:
+        if not isinstance(quests, list) or not quests:
+            return json.dumps(
+                {
+                    "error": "Quest batch must be a non-empty list",
+                    "code": "quests_empty",
+                    "deck_written": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        for raw in quests:
+            if not isinstance(raw, str):
+                return json.dumps(
+                    {
+                        "error": "Every quest must be a string",
+                        "code": "quest_text_invalid",
+                        "deck_written": False,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            clean = deck_bridge.sanitize_quest_text(raw)
+            if clean is None:
+                code = (
+                    "quest_text_multiline"
+                    if ("\n" in raw or "\r" in raw)
+                    else "quest_text_empty"
+                )
+                return json.dumps(
+                    {
+                        "error": "Quest text must be a single non-empty line",
+                        "code": code,
+                        "deck_written": False,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            clean_titles.append(clean)
+
     mission = persistence.get_mission(mission_id)
     if not mission:
         return json.dumps(
@@ -2101,6 +2311,15 @@ def quest_add(mission_id: int, title: str) -> str:
             {"error": f"Cannot resolve Deck stack: {err}"},
             ensure_ascii=False,
             default=str,
+        )
+
+    if quests is not None:
+        return _quest_add_batch(
+            mission=mission,
+            mission_id=mission_id,
+            board_id=board_id,
+            stack_id=stack_id,
+            clean_titles=clean_titles,
         )
 
     # The marker id is composed by the server (never by the model) and must be
