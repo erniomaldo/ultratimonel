@@ -28,6 +28,9 @@ import sys
 from datetime import datetime, timezone
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.tools import ToolResult
+from mcp.types import CallToolRequestParams, ListToolsRequest
 
 from . import compact
 from . import deck_bridge
@@ -56,6 +59,66 @@ logger = logging.getLogger(__name__)
 # ── Server setup ────────────────────────────────────────────────────────
 
 app = FastMCP("ultratimonel")
+
+
+class SingleChannelResultMiddleware(Middleware):
+    """Serve every tool result through exactly one channel: ``content[0].text``.
+
+    Why (card #218, quest 12): every tool here returns a JSON string, but
+    FastMCP 3.4.2 `Tool.convert_result` (`fastmcp/tools/base.py:285-340`)
+    serializes that same string twice — once as `content` and, because a
+    ``-> str`` return annotation is a non-object schema, again as
+    ``structuredContent={"result": <the same JSON, escaped>}`` plus
+    ``_meta.fastmcp.wrap_result``. The payload crosses the wire three times.
+
+    The JSON text channel is the single one because that is the only channel
+    the clients we ship read (`ultratimonel_client.py`,
+    `plugin_preflight.py`, `tests/test_integration.py` all do
+    ``json.loads(content[0]["text"])``). Dropping the text payload would
+    silently break the pre-flight gate plugin; dropping the structured copy
+    costs nothing because nothing we ship reads it.
+
+    This is a server-level concern, resolved once: the middleware applies to
+    all tools, present and future. `on_list_tools` removes the generated
+    `outputSchema` so the advertised contract matches the single-channel
+    response (MCP expects `structuredContent` when a tool declares one).
+    `on_call_tool` keeps the text content verbatim and drops the duplicated
+    `structuredContent` and the `wrap_result` marker.
+    """
+
+    async def on_list_tools(
+        self,
+        context: MiddlewareContext[ListToolsRequest],
+        call_next: CallNext[ListToolsRequest, list],
+    ) -> list:
+        tools = await call_next(context)
+        return [tool.model_copy(update={"output_schema": None}) for tool in tools]
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        result = await call_next(context)
+        # Keep text content and isError; drop the duplicated structured copy
+        # and the wrap marker. Any other meta is preserved untouched.
+        meta = dict(result.meta) if result.meta else None
+        if meta:
+            fastmcp_meta = dict(meta.get("fastmcp") or {})
+            fastmcp_meta.pop("wrap_result", None)
+            if fastmcp_meta:
+                meta["fastmcp"] = fastmcp_meta
+            else:
+                meta.pop("fastmcp", None)
+            meta = meta or None
+        return ToolResult(
+            content=result.content,
+            is_error=result.is_error,
+            meta=meta,
+        )
+
+
+app.add_middleware(SingleChannelResultMiddleware())
 
 # Persistence layer — shared across tools
 db_path = os.environ.get(
