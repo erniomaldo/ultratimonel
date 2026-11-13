@@ -155,6 +155,68 @@ def _gates_from_intento_snapshot(intento: dict | None) -> list[dict]:
     return [g for g in raw if isinstance(g, dict)]
 
 
+def _pending_quest_count(mission_id: int) -> int:
+    """Count the mission's open quests, degrading to 0 when unreadable.
+
+    ``begin_turn`` reports the pending count as part of its turn delta. A
+    degraded replica must never abort the turn, so an unreadable checklist
+    yields 0 pending instead of raising.
+    """
+    if not mission_id:
+        return 0
+    try:
+        items = persistence.list_checklist_items(mission_id)
+        return sum(1 for item in items if isinstance(item, dict) and not item.get("done"))
+    except Exception as exc:
+        logger.warning(
+            "Pending quest count unavailable for mission #%s: %s", mission_id, exc
+        )
+        return 0
+
+
+def _turn_full_state(intento: dict) -> dict:
+    """Full mission snapshot for the ``full`` escape hatch (quest 11).
+
+    Default responses carry only the turn delta. A caller that needs the whole
+    mission state asks for it explicitly (``full=True``) instead of paying
+    for it on every turn. This is the compatibility path: nothing is removed
+    from reach, it is only no longer the default.
+    """
+    mission_id = intento.get("mission_id") or 0
+    state = {
+        "session_id": intento.get("session_id"),
+        "project": intento.get("project"),
+        "mission": None,
+        "checklist": [],
+    }
+    if not mission_id:
+        return state
+    try:
+        mission = persistence.get_mission(mission_id)
+    except Exception as exc:
+        logger.warning("Full-state mission lookup failed for #%s: %s", mission_id, exc)
+        return state
+    if not isinstance(mission, dict):
+        return state
+    state["mission"] = {
+        "id": mission.get("id"),
+        "title": mission.get("title", ""),
+        "status": mission.get("status", ""),
+        "description": mission.get("description", ""),
+        "checklist_total": mission.get("checklist_total", 0),
+        "checklist_done": mission.get("checklist_done", 0),
+        "deck_stack_id": mission.get("deck_stack_id"),
+    }
+    try:
+        items = persistence.list_checklist_items(mission_id)
+        state["checklist"] = [
+            compact.compact_quest(item) for item in items if isinstance(item, dict)
+        ]
+    except Exception as exc:
+        logger.warning("Full-state checklist lookup failed for #%s: %s", mission_id, exc)
+    return state
+
+
 def _validate_gates_for_completion(
     session_id: str, project: str
 ) -> tuple[bool, list[str]]:
@@ -3038,6 +3100,7 @@ def begin_turn(
     message: str = "",
     sender: str = "user",
     checklist_item_id: int = 0,
+    full: bool = False,
 ) -> str:
     """Begin a new turn: execute gates fresh and create an intento.
 
@@ -3047,6 +3110,16 @@ def begin_turn(
     begin_turn EJECUTA INTERNAMENTE los 4 gates (1a/1b/1c/1e) de forma fresca,
     persistiendo los resultados en gate_state y capturándolos en el intento.
     Esto elimina la necesidad de llamar assert_gates manualmente antes del turno.
+
+    The default response is a TURN DELTA (card #218, quest 11): the ids the
+    caller must carry, the compact gate evidence (``{name, state, mandatory}``,
+    never ``result_data``), the gate summary, and the pending-quest count. It
+    never carries the mission payload, its description, or the full checklist —
+    those do not change per turn and would be paid on every call.
+
+    Pass ``full=True`` for the full state: today's payload plus the mission
+    row and its complete checklist. Nothing is unreachable, only not paid for by
+    default.
 
     Before ANY side effect (orphan cleanup AND gate execution), begin_turn
     resolves and validates the target quest (design D5). A quest that is already
@@ -3066,10 +3139,14 @@ def begin_turn(
         message:            The user's raw message / query (used for context extraction).
         sender:             Optional sender name (default: "user").
         checklist_item_id:  Backward-compatible trailing alias for ``quest_id``.
+        full:               If True, also return the full mission row and its
+                            complete checklist. Defaults to False (turn delta).
 
     Returns:
-        JSON string with intento_id, mission_id, quest_id, status, and real
-        fresh gate counts. On a done/unknown quest:
+        JSON string with intento_id, mission_id, quest_id, status, the compact
+        gate list, the real fresh gate counts, and ``pending_quests``. With
+        ``full=True`` it additionally carries ``mission`` and ``checklist``.
+        On a done/unknown quest:
         ``{"error", "code": "quest_done"|"missing_quest", "quest_id"}``.
     """
     # 0. Guard (D5): resolve/validate the target quest BEFORE any mutation.
@@ -3244,24 +3321,38 @@ def begin_turn(
     _set_active_intento(intento_id, session_id, resolved_project)
 
     gates_passed = sum(1 for r in gate_results if r.state in (PASS, SKIP))
-    return json.dumps(
-        {
-            "status": "started",
-            "intento_id": intento_id,
-            "mission_id": mission_id,
-            "quest_id": resolved_quest_id or None,
-            "gates_captured": len(gate_results),
-            "gates_passed_so_far": gates_passed,
-            "overall": overall,
-            "context": {
-                "sender": context["sender"],
-                "topic": context["topic"],
-                "project": resolved_project,
-            },
+    # Turn delta (card #218, quest 11): ids + compact gate evidence + pending
+    # count. ``gates_captured`` / ``gates_passed_so_far`` / ``overall`` /
+    # ``context`` are kept verbatim so existing callers and tests keep working;
+    # nothing verbose was ever in this payload, so the delta IS the mission-free
+    # shape. Mission/checklist detail is opt-in through ``full``.
+    payload = {
+        "status": "started",
+        "intento_id": intento_id,
+        "mission_id": mission_id,
+        "quest_id": resolved_quest_id or None,
+        "gates_captured": len(gate_results),
+        "gates_passed_so_far": gates_passed,
+        "overall": overall,
+        "gates": compact.compact_gates(gate_dicts),
+        "pending_quests": _pending_quest_count(mission_id),
+        "context": {
+            "sender": context["sender"],
+            "topic": context["topic"],
+            "project": resolved_project,
         },
-        ensure_ascii=False,
-        default=str,
-    )
+    }
+    if full:
+        payload.update(
+            _turn_full_state(
+                {
+                    "session_id": session_id,
+                    "project": resolved_project,
+                    "mission_id": mission_id,
+                }
+            )
+        )
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def _complete_quest_for_intento(intento: dict) -> dict:
@@ -3395,6 +3486,7 @@ def end_turn(
     intento_id: int,
     status: str = "success",
     quest_done: bool | None = None,
+    full: bool = False,
 ) -> str:
     """End the current turn: validate gates, complete the intento, close the quest.
 
@@ -3422,7 +3514,10 @@ def end_turn(
     the active turn state — always leaving the system in a recoverable state.
 
     The response is COMPACT (design D4): gates carry only
-    ``{name, state, mandatory}`` and no raw ``result_data``.
+    ``{name, state, mandatory}`` and no raw ``result_data``. It is also a TURN
+    DELTA (card #218, quest 11): it never carries the mission payload, its
+    description, or the full checklist, because those do not change with the
+    turn and would be paid on every call.
 
     Args:
         intento_id: Numeric intento ID returned by begin_turn().
@@ -3436,6 +3531,8 @@ def end_turn(
                     without lying. ``True`` with a ``final_status`` other than
                     ``success`` is rejected with zero mutation: there is no path
                     to force a dishonest closure.
+        full:       If True, also return the full mission row and its complete
+                    checklist. Defaults to False (turn delta).
 
     Returns:
         JSON string with completion status, gates_passed count, compact gate
@@ -3650,6 +3747,9 @@ def end_turn(
         "identity": closure.get("identity"),
         "deck_written": closure["deck_written"],
     }
+
+    if full:
+        response.update(_turn_full_state(intento))
 
     # Fail-closed (card #218, forum #1): when Deck WAS written but the replica
     # refresh failed, the turn cannot be reported as a clean closure. The

@@ -298,8 +298,8 @@ kept for compatibility). Every tool is auto-discovered via the MCP protocol.
 
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Runs the 4 gates internally and creates the intento with a fresh snapshot. **Recommended flow.** |
-| `end_turn(intento_id, status="success")` | Always finishes: `final_status` "success" or "fail" with full `gates_detail`. Never leaves the turn stuck. |
+| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user", full=False)` | Runs the 4 gates internally and creates the intento with a fresh snapshot. Returns the **turn delta** (ids, compact gates, pending-quest count), never the whole mission. `full=True` also returns the mission and its checklist. **Recommended flow.** |
+| `end_turn(intento_id, status="success", quest_done=None, full=False)` | Always finishes: `final_status` "success" or "fail" with compact `gates`. Never leaves the turn stuck, and never returns the whole mission state; `full=True` includes it when needed. |
 | `delete_intento(intento_id)` | Deletes an intento by ID (operational cleanup) |
 
 ### 📋 Missions / Deck Sync

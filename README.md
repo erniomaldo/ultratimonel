@@ -295,8 +295,8 @@ mantenidas por compatibilidad). Cada tool se auto-descubre vía el protocolo MCP
 
 | Tool | Firma | Descripción |
 |------|-------|-------------|
-| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user")` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. **Flujo recomendado.** |
-| `end_turn(intento_id, status="success")` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates_detail` completo. Nunca deja el turno atascado. |
+| `begin_turn(session_id, project, mission_id, checklist_item_id, message="", sender="user", full=False)` | Ejecuta los 4 gates internamente y crea el intento con snapshot fresco. Devuelve el **delta del turno** (ids, gates compactos, conteo de quests pendientes), nunca la misión completa. `full=True` devuelve además la misión y su checklist. **Flujo recomendado.** |
+| `end_turn(intento_id, status="success", quest_done=None, full=False)` | Finaliza SIEMPRE: `final_status` "success" o "fail" con `gates` compactos. Nunca deja el turno atascado ni devuelve el estado completo de la misión; `full=True` lo incluye si hace falta. |
 | `delete_intento(intento_id)` | Elimina un intento por ID (limpieza operacional) |
 
 ### 📋 Misiones / Deck Sync
