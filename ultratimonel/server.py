@@ -1273,6 +1273,26 @@ def sync_tasks(project: str, prune: bool = False) -> str:
                         done=item_data["done"],
                     )
 
+                # The counters are recomputed from the replica rows, not from
+                # this Deck parse. A card whose description carries no quest
+                # lines (native Deck checklist, stale description read) leaves
+                # the existing rows untouched, so a parse of 0 MUST NOT zero
+                # counters that the rows say are not 0.
+                try:
+                    counters_ok = persistence.refresh_mission_checklist_counts(
+                        mission_id
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"Card {card_id}: checklist counters not refreshed: {exc}"
+                    )
+                    counters_ok = False
+                if counters_ok is False:
+                    errors.append(
+                        f"Card {card_id}: checklist counters not refreshed "
+                        "(mission row missing)"
+                    )
+
                 created += 1
 
             except Exception as exc:
@@ -1546,6 +1566,35 @@ def sync_task(mission_id: int) -> str:
             done=1 if quest["done"] else 0,
         )
         quests_synced += 1
+
+    # Final authoritative counters: derived from the rows in the replica, so a
+    # partial quest refresh can never leave an optimistic counter behind.
+    try:
+        counters_ok = persistence.refresh_mission_checklist_counts(mission_id)
+    except Exception as exc:
+        logger.warning("sync_task: checklist counter refresh failed: %s", exc)
+        counters_ok = False
+    if counters_ok is False:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "replica_refresh_failed",
+                "mission_id": mission_id,
+                "deck_task_id": mission["deck_task_id"],
+                "replica_stale": True,
+                "reconcile_with": (
+                    f"mission_repair_checklist_counts(mission_id={mission_id})"
+                ),
+                "error": (
+                    "The mission's checklist rows were refreshed from Deck, but "
+                    "their counters could not be recomputed; the replica is "
+                    f"inconsistent. Run mission_repair_checklist_counts("
+                    f"mission_id={mission_id})."
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
 
     return json.dumps(
         {
@@ -1894,6 +1943,12 @@ def _refresh_mission_replica_from_card(
                     done=1 if quest["done"] else 0,
                 )
             quest_ids[idx] = quest_id
+
+        # Counters are derived from the rows that were just written, never from
+        # the parsed payload: one calculation point (persistence) and no
+        # optimistic counter survives a failed row write.
+        if persistence.refresh_mission_checklist_counts(mission_id) is False:
+            return mission_id, quest_ids, "mission row not found after refresh"
     except Exception as exc:  # reported to the caller, never hidden
         logger.warning("replica refresh from Deck card failed: %s", exc)
         return mission_id, quest_ids, str(exc)
@@ -2181,6 +2236,109 @@ def mission_update_description(mission_id: int, description: str) -> str:
 
     return json.dumps(
         {"mission_id": mission_id, "status": "ok"},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@app.tool()
+def mission_repair_checklist_counts(
+    mission_id: int | None = None,
+    project: str | None = None,
+    confirm: bool = False,
+    reason: str = "",
+) -> str:
+    """Recompute a mission's (or a project's) checklist counters from its rows.
+
+    Replica-only repair for counters that were frozen by an earlier write path.
+    It reads nothing from Deck and writes ONLY ``missions.checklist_total`` and
+    ``missions.checklist_done`` — every other column is left untouched. It is
+    idempotent: running it twice changes nothing the second time.
+
+    This lives as its own tool instead of inside ``sync_task`` on purpose:
+    ``sync_task`` needs Deck to be reachable and rewrites the mission's title,
+    description and status from Deck, so it cannot repair an offline replica
+    and, worse, it depends on the very read that may have produced the wrong
+    counter. Repair must be a pure, offline recomputation of the rows.
+
+    Args:
+        mission_id: Repair exactly one mission. Mutually exclusive with
+            ``project``.
+        project: Repair every mission of one project. Mutually exclusive with
+            ``mission_id``.
+        confirm: Must be True; guards a bulk offline write.
+        reason: Non-empty justification for the repair.
+
+    Returns:
+        JSON {status, scope, checked, changed_count, changed} where ``changed``
+        lists only the missions that moved, each with ``before`` and ``after``.
+        ``status`` is ``unchanged`` when every counter already matched the rows.
+        Missing confirmation, an empty reason, an ambiguous scope or an unknown
+        mission all fail without writing anything.
+    """
+    if not confirm:
+        return json.dumps(
+            {
+                "error": "confirmation required: pass confirm=true to repair",
+                "code": "confirmation_required",
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if not (reason or "").strip():
+        return json.dumps(
+            {
+                "error": (
+                    "reason required: mission_repair_checklist_counts needs a "
+                    "non-empty reason"
+                ),
+                "code": "reason_required",
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if (mission_id is None) == (project is None):
+        return json.dumps(
+            {
+                "error": "pass exactly one of mission_id or project",
+                "code": "invalid_scope",
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    result = persistence.repair_checklist_counts(
+        mission_id=mission_id, project=project
+    )
+    if result is None:
+        return json.dumps(
+            {
+                "error": f"Mission {mission_id} not found",
+                "mission_id": mission_id,
+                "written": False,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    changed = result["changed"]
+    return json.dumps(
+        {
+            "status": "ok" if changed else "unchanged",
+            "scope": (
+                {"mission_id": mission_id}
+                if mission_id is not None
+                else {"project": project}
+            ),
+            "checked": result["checked"],
+            "changed_count": len(changed),
+            "changed": changed,
+        },
         ensure_ascii=False,
         default=str,
     )

@@ -1418,27 +1418,89 @@ class Persistence:
     def refresh_mission_checklist_counts(self, mission_id: int) -> bool:
         """Recompute a mission's checklist counters from its quest rows.
 
-        Mission-scoped replica refresh used by write operations that change
-        exactly one quest (``end_turn``): the quest row is already updated, so
-        ``missions.checklist_total``/``checklist_done`` must follow instead of
-        keeping stale counters. Returns True when the mission row exists.
+        This is THE single calculation point for ``checklist_total`` and
+        ``checklist_done``: every path that mutates a mission's checklist calls
+        it after the rows are in place, so the denormalized counters can never
+        be derived from a different source than ``checklist_items`` itself.
+
+        Returns True when the mission row exists.
         """
         with self._lock:
             with self._conn() as conn:
-                cursor = conn.execute(
-                    """UPDATE missions
-                           SET checklist_total = (
-                                   SELECT COUNT(*) FROM checklist_items
-                                   WHERE mission_id = ?
-                               ),
-                               checklist_done = (
-                                   SELECT COUNT(*) FROM checklist_items
-                                   WHERE mission_id = ? AND done = 1
-                               )
-                         WHERE id = ?""",
-                    (mission_id, mission_id, mission_id),
-                )
-                return cursor.rowcount > 0
+                return self._refresh_mission_row(conn, mission_id, None)
+
+    def repair_checklist_counts(
+        self,
+        *,
+        mission_id: Optional[int] = None,
+        project: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Recompute counters from the rows for one mission or a whole project.
+
+        Replica-only maintenance: it never reads Deck and never touches a column
+        other than ``checklist_total`` and ``checklist_done``. It is idempotent;
+        a mission with no checklist rows ends at ``0/0``.
+
+        Returns ``{"mission_id", "project", "checked", "changed"}`` where
+        ``changed`` lists only the missions whose counters actually moved.
+        Returns None when an explicit ``mission_id`` does not exist.
+        """
+        if (mission_id is None) == (project is None):
+            raise ValueError(
+                "repair_checklist_counts needs exactly one of mission_id or project"
+            )
+
+        with self._lock:
+            with self._conn() as conn:
+                if mission_id is not None:
+                    targets = conn.execute(
+                        "SELECT id, checklist_total, checklist_done"
+                        " FROM missions WHERE id = ?",
+                        (mission_id,),
+                    ).fetchall()
+                    if not targets:
+                        return None
+                else:
+                    targets = conn.execute(
+                        "SELECT id, checklist_total, checklist_done"
+                        " FROM missions WHERE project = ? ORDER BY id",
+                        (project,),
+                    ).fetchall()
+
+                changed: list[dict] = []
+                for target in targets:
+                    before = (
+                        target["checklist_total"],
+                        target["checklist_done"],
+                    )
+                    self._refresh_mission_row(conn, target["id"], None)
+                    after = conn.execute(
+                        "SELECT checklist_total, checklist_done"
+                        " FROM missions WHERE id = ?",
+                        (target["id"],),
+                    ).fetchone()
+                    after_pair = (after["checklist_total"], after["checklist_done"])
+                    if after_pair != before:
+                        changed.append(
+                            {
+                                "mission_id": target["id"],
+                                "before": {
+                                    "checklist_total": before[0],
+                                    "checklist_done": before[1],
+                                },
+                                "after": {
+                                    "checklist_total": after_pair[0],
+                                    "checklist_done": after_pair[1],
+                                },
+                            }
+                        )
+
+                return {
+                    "mission_id": mission_id,
+                    "project": project,
+                    "checked": len(targets),
+                    "changed": changed,
+                }
 
     def delete_checklist_items_beyond(self, mission_id: int, keep_count: int) -> int:
         """Delete replica checklist items whose ``item_index`` >= ``keep_count``.
@@ -1808,10 +1870,18 @@ class Persistence:
         conn,
         mission_id: int,
         description: Optional[str],
-    ) -> None:
-        """Recompute a mission's checklist counters (and description) in place."""
+    ) -> bool:
+        """Recompute a mission's checklist counters (and description) in place.
+
+        THE single arithmetic definition: ``checklist_total`` is the row count
+        of ``checklist_items`` for the mission and ``checklist_done`` counts the
+        rows with ``done = 1``. Every mutation path funnels through here so the
+        counters can never lag behind (or run ahead of) the rows.
+
+        Returns True when the mission row exists.
+        """
         if description is None:
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE missions
                        SET checklist_total = (
                                SELECT COUNT(*) FROM checklist_items
@@ -1821,11 +1891,11 @@ class Persistence:
                                SELECT COUNT(*) FROM checklist_items
                                WHERE mission_id = ? AND done = 1
                            )
-                     WHERE id = ?""",
+                 WHERE id = ?""",
                 (mission_id, mission_id, mission_id),
             )
-            return
-        conn.execute(
+            return cursor.rowcount > 0
+        cursor = conn.execute(
             """UPDATE missions
                    SET description = ?,
                        checklist_total = (
@@ -1839,6 +1909,7 @@ class Persistence:
                  WHERE id = ?""",
             (description, mission_id, mission_id, mission_id),
         )
+        return cursor.rowcount > 0
 
     # ── intentos ────────────────────────────────────────────────────────
 
